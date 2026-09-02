@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://obsidian-todo.local/schema/v1",
+  "title": "Obsidian Todo records",
+  "x-obsidian-todo-schema-version": 1,
+  "$defs": {
+    "date": {
+      "type": "string",
+      "format": "date",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^\\S(?:.*\\S)?$"
+    },
+    "project": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "$ref": "#/$defs/name" }
+      },
+      "additionalProperties": true
+    },
+    "task": {
+      "type": "object",
+      "required": ["name", "state", "projects", "tags"],
+      "properties": {
+        "name": { "$ref": "#/$defs/name" },
+        "state": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]*$"
+        },
+        "projects": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^\\[\\[[^|#^]+\\]\\]$"
+          }
+        },
+        "tags": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^#\\s,\\[\\]{}]+$"
+          }
+        },
+        "due_date": { "$ref": "#/$defs/date" },
+        "recurrence": { "type": "string", "minLength": 1 },
+        "recurrence_from": {
+          "enum": ["schedule", "completion"]
+        },
+        "last_completed_date": { "$ref": "#/$defs/date" }
+      },
+      "allOf": [
+        {
+          "if": { "required": ["recurrence"] },
+          "then": { "required": ["due_date", "recurrence_from"] },
+          "else": {
+            "not": {
+              "anyOf": [
+                { "required": ["recurrence_from"] },
+                { "required": ["last_completed_date"] }
+              ]
+            }
+          }
+        }
+      ],
+      "additionalProperties": true
+    }
+  }
+}

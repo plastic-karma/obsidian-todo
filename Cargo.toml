@@ -1,0 +1,37 @@
+[package]
+name = "obsidian-todo"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+description = "Local-first structured todo notes for Obsidian vaults"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "obsidian_todo"
+path = "src/lib.rs"
+
+[dependencies]
+chrono = { version = "0.4.38", default-features = false, features = ["clock", "serde"] }
+serde = { version = "1.0.216", features = ["derive"] }
+serde_json = { version = "1.0.133", features = ["preserve_order"] }
+serde_yaml_ng = "0.10.0"
+toml = "0.8.19"
+ulid = "1.1.4"
+
+[dev-dependencies]
+tempfile = "3.14.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

@@ -84,27 +84,40 @@ pub fn parse_document(bytes: &[u8]) -> Result<FrontMatterDocument> {
         )
     })?;
 
-    let yaml = std::str::from_utf8(&bytes[opening_end..closing_start]).map_err(|source| {
-        Error::validation(
-            "invalid_utf8",
-            format!("Front matter must be UTF-8: {source}"),
-        )
-    })?;
+    let yaml = &source[opening_end..closing_start];
     reject_unsafe_yaml_tokens(yaml)?;
-    let properties: Mapping = serde_yaml_ng::from_str(yaml).map_err(|source| {
+    let value: Value = serde_yaml_ng::from_str(yaml).map_err(|source| {
+        let message = source.to_string();
         let mut error = Error::validation(
-            if source.to_string().contains("duplicate entry") {
+            if message.contains("duplicate entry") {
                 "duplicate_yaml_key"
             } else {
                 "invalid_yaml_syntax"
             },
-            format!("Invalid YAML front matter: {source}"),
+            format!("Invalid YAML front matter: {message}"),
         );
         if let Some(location) = source.location() {
-            error = error.with_location(location.line(), location.column());
+            error = error.with_location(location.line().saturating_add(1), location.column());
         }
         error
     })?;
+    let properties = match value {
+        Value::Mapping(properties) => properties,
+        Value::Null
+            if yaml
+                .lines()
+                .all(|line| line.trim().is_empty() || line.trim_start().starts_with('#')) =>
+        {
+            Mapping::new()
+        }
+        _ => {
+            return Err(Error::validation(
+                "invalid_frontmatter_type",
+                "YAML front matter must be a property mapping",
+            )
+            .with_location(2, 1));
+        }
+    };
     validate_yaml_mapping(&properties, 0, &mut 0)?;
     Ok(FrontMatterDocument {
         properties,
@@ -178,6 +191,7 @@ pub fn parse_project(slug: &str, path: &Path, bytes: &[u8]) -> Result<Project> {
 }
 
 pub fn serialize_task(task: &Task, config: &Config) -> Result<Vec<u8>> {
+    reject_conflict_markers(&task.body)?;
     task.validate(config)?;
     reject_reserved_extras(&task.extra_properties, &CORE_TASK_KEYS)?;
     let mut projects = task.projects.iter().map(String::as_str).collect::<Vec<_>>();
@@ -189,7 +203,7 @@ pub fn serialize_task(task: &Task, config: &Config) -> Result<Vec<u8>> {
     output.push_str("---\nname: ");
     output.push_str(&quoted(&task.name)?);
     output.push_str("\nstate: ");
-    output.push_str(&task.state);
+    write_state(&mut output, &task.state)?;
     output.push_str("\nprojects:");
     write_string_list(
         &mut output,
@@ -217,6 +231,7 @@ pub fn serialize_task(task: &Task, config: &Config) -> Result<Vec<u8>> {
 
 pub fn serialize_project(project: &Project) -> Result<Vec<u8>> {
     validate_project_slug(&project.slug)?;
+    reject_conflict_markers(&project.body)?;
     validate_name(&project.name, "name")?;
     reject_reserved_extras(&project.extra_properties, &["name"])?;
     let mut output = String::with_capacity(project.body.len().saturating_add(128));
@@ -254,12 +269,55 @@ fn reject_conflict_markers(source: &str) -> Result<()> {
 }
 
 fn reject_unsafe_yaml_tokens(source: &str) -> Result<()> {
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    let mut block_scalar_indent = None;
+    let mut plain_scalar_indent = None;
+    let mut flow_depth = 0_usize;
+    let mut block_indents = Vec::with_capacity(MAX_YAML_DEPTH);
+
     for (line_index, line) in source.lines().enumerate() {
-        let mut single_quoted = false;
-        let mut double_quoted = false;
-        let mut escaped = false;
+        let quoted_continuation = single_quoted || double_quoted;
+        let indentation = line
+            .chars()
+            .take_while(|character| *character == ' ')
+            .count();
+        if let Some(parent_indent) = block_scalar_indent {
+            if line.trim().is_empty() || indentation > parent_indent {
+                continue;
+            }
+            block_scalar_indent = None;
+        }
+        let trimmed = line.trim_start();
+        let structural_indicator =
+            matches!(trimmed, "-" | "?") || trimmed.starts_with("- ") || trimmed.starts_with("? ");
+        let plain_continuation = if let Some(parent_indent) = plain_scalar_indent {
+            if !structural_indicator && (line.trim().is_empty() || indentation > parent_indent) {
+                true
+            } else {
+                plain_scalar_indent = None;
+                false
+            }
+        } else {
+            false
+        };
+        let starts_in_flow = flow_depth > 0;
+        if !quoted_continuation
+            && !plain_continuation
+            && !starts_in_flow
+            && !line.trim().is_empty()
+            && !line.trim_start().starts_with('#')
+        {
+            record_yaml_indent(&mut block_indents, indentation, line_index)?;
+        }
+
         let mut token_start = true;
-        for (column, character) in line.char_indices() {
+        let mut value_position = false;
+        let mut compact_depth = 0_usize;
+        let mut plain_scalar = plain_continuation;
+        let mut structural_line = false;
+        for (column, (byte_index, character)) in line.char_indices().enumerate() {
             if double_quoted {
                 if escaped {
                     escaped = false;
@@ -278,22 +336,166 @@ fn reject_unsafe_yaml_tokens(source: &str) -> Result<()> {
             }
             match character {
                 '#' if token_start => break,
-                '"' => double_quoted = true,
-                '\'' => single_quoted = true,
-                '&' | '*' | '!' if token_start => {
+                '"' if !plain_scalar => {
+                    double_quoted = true;
+                    value_position = false;
+                }
+                '\'' if !plain_scalar => {
+                    single_quoted = true;
+                    value_position = false;
+                }
+                '&' | '*' | '!' if token_start && !plain_scalar => {
                     return Err(Error::validation(
                         "unsafe_yaml_construct",
                         "YAML tags, anchors, and aliases are not supported",
                     )
-                    .with_location(line_index + 1, column + 1));
+                    .with_location(line_index + 2, column + 1));
+                }
+                ':' => {
+                    let next = line[byte_index + character.len_utf8()..].chars().next();
+                    let separates_value = next.is_none_or(|next| {
+                        next.is_whitespace()
+                            || (flow_depth > 0 && matches!(next, ',' | '[' | ']' | '{' | '}'))
+                    });
+                    if separates_value {
+                        structural_line = true;
+                        plain_scalar = false;
+                        value_position = true;
+                    }
+                }
+                '?' if token_start && !plain_scalar => {
+                    value_position = line[byte_index + character.len_utf8()..]
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_whitespace);
+                    if value_position {
+                        compact_depth = compact_depth.saturating_add(1);
+                        if compact_depth > MAX_YAML_DEPTH {
+                            return Err(Error::validation(
+                                "yaml_too_deep",
+                                "YAML front matter exceeds the supported nesting depth",
+                            )
+                            .with_location(line_index + 2, column + 1));
+                        }
+                    } else {
+                        plain_scalar = true;
+                    }
+                }
+                '-' if token_start && !plain_scalar => {
+                    value_position = line[byte_index + character.len_utf8()..]
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_whitespace);
+                    if value_position {
+                        compact_depth = compact_depth.saturating_add(1);
+                        if compact_depth > MAX_YAML_DEPTH {
+                            return Err(Error::validation(
+                                "yaml_too_deep",
+                                "YAML front matter exceeds the supported nesting depth",
+                            )
+                            .with_location(line_index + 2, column + 1));
+                        }
+                    } else {
+                        plain_scalar = true;
+                    }
+                }
+                '|' | '>'
+                    if value_position
+                        && is_block_scalar_suffix(&line[byte_index + character.len_utf8()..]) =>
+                {
+                    block_scalar_indent = Some(indentation);
+                    break;
+                }
+                '[' | '{' if !plain_scalar => {
+                    flow_depth = flow_depth.saturating_add(1);
+                    if flow_depth > MAX_YAML_DEPTH {
+                        return Err(Error::validation(
+                            "yaml_too_deep",
+                            "YAML front matter exceeds the supported nesting depth",
+                        )
+                        .with_location(line_index + 2, column + 1));
+                    }
+                    plain_scalar = false;
+                    value_position = true;
+                }
+                ',' if flow_depth > 0 => {
+                    plain_scalar = false;
+                    value_position = true;
+                }
+                ']' | '}' if flow_depth > 0 => {
+                    flow_depth -= 1;
+                    plain_scalar = false;
+                    value_position = false;
+                }
+                character if !character.is_whitespace() => {
+                    plain_scalar = true;
+                    value_position = false;
                 }
                 _ => {}
             }
             token_start = character.is_whitespace()
-                || matches!(character, ':' | ',' | '[' | ']' | '{' | '}' | '-');
+                || matches!(character, ':' | ',' | '[' | ']' | '{' | '}' | '-' | '?');
         }
+        if plain_continuation && structural_line && !starts_in_flow {
+            record_yaml_indent(&mut block_indents, indentation, line_index)?;
+        }
+        if plain_scalar && (!plain_continuation || structural_line) {
+            plain_scalar_indent = Some(indentation);
+        } else if structural_line {
+            plain_scalar_indent = None;
+        }
+        escaped = false;
     }
     Ok(())
+}
+
+fn record_yaml_indent(
+    block_indents: &mut Vec<usize>,
+    indentation: usize,
+    line_index: usize,
+) -> Result<()> {
+    while block_indents
+        .last()
+        .is_some_and(|parent| indentation <= *parent)
+    {
+        block_indents.pop();
+    }
+    block_indents.push(indentation);
+    if block_indents.len() > MAX_YAML_DEPTH {
+        return Err(Error::validation(
+            "yaml_too_deep",
+            "YAML front matter exceeds the supported nesting depth",
+        )
+        .with_location(line_index + 2, indentation + 1));
+    }
+    Ok(())
+}
+
+fn is_block_scalar_suffix(suffix: &str) -> bool {
+    let suffix = suffix.trim();
+    let modifiers = if let Some(comment) = suffix.find('#') {
+        if comment != 0
+            && !suffix[..comment]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
+        {
+            return false;
+        }
+        suffix[..comment].trim()
+    } else {
+        suffix
+    };
+    let mut indentation = false;
+    let mut chomping = false;
+    for modifier in modifiers.chars() {
+        match modifier {
+            '1'..='9' if !indentation => indentation = true,
+            '+' | '-' if !chomping => chomping = true,
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn validate_yaml_value(value: &Value, depth: usize, nodes: &mut usize) -> Result<()> {
@@ -310,6 +512,12 @@ fn validate_yaml_value(value: &Value, depth: usize, nodes: &mut usize) -> Result
             Ok(())
         }
         Value::Mapping(values) => validate_yaml_mapping_entries(values, depth, nodes),
+        Value::Number(number) if number.as_f64().is_some_and(|number| !number.is_finite()) => {
+            Err(Error::validation(
+                "invalid_yaml_number",
+                "YAML numbers must have a finite JSON representation",
+            ))
+        }
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => Ok(()),
     }
 }
@@ -460,6 +668,15 @@ fn reject_reserved_extras(properties: &Mapping, reserved: &[&str]) -> Result<()>
     }
     validate_yaml_mapping(properties, 0, &mut 0)
 }
+fn write_state(output: &mut String, state: &str) -> Result<()> {
+    const YAML_KEYWORDS: [&str; 9] = ["null", "true", "false", "yes", "no", "on", "off", "y", "n"];
+    if state.as_bytes().first().is_some_and(u8::is_ascii_digit) || YAML_KEYWORDS.contains(&state) {
+        output.push_str(&quoted(state)?);
+    } else {
+        output.push_str(state);
+    }
+    Ok(())
+}
 
 fn quoted(value: &str) -> Result<String> {
     serde_json::to_string(value).map_err(|source| {
@@ -559,6 +776,26 @@ mod tests {
         }
     }
     #[test]
+    fn distinguishes_yaml_syntax_from_frontmatter_type_errors() {
+        assert!(parse_document(b"---\n# empty properties\n---\n")
+            .expect("empty mapping")
+            .properties
+            .is_empty());
+        assert_eq!(
+            parse_document(b"---\n- item\n---\n")
+                .expect_err("sequence root")
+                .code(),
+            "invalid_frontmatter_type"
+        );
+        assert_eq!(
+            parse_document(b"---\nvalues: [\n---\n")
+                .expect_err("malformed YAML")
+                .code(),
+            "invalid_yaml_syntax"
+        );
+    }
+
+    #[test]
     fn crlf_input_serializes_lf_front_matter_and_preserves_body_bytes() {
         let parsed =
             task("---\r\nname: Task\r\nstate: open\r\nprojects: []\r\ntags: []\r\n---\r\nbody\r\n");
@@ -587,10 +824,135 @@ mod tests {
             "---\nplugin: !thing value\n---\n",
             "---\nplugin: &anchor value\n---\n",
             "---\nplugin: *anchor\n---\n",
+            "---\nplugin:\n  - key: value\n    other: &anchor payload\n    alias: *anchor\n---\n",
+            "---\n? &anchor key\n: value\n---\n",
             "---\n'<<': { key: value }\n---\n",
         ] {
             assert!(parse_document(source.as_bytes()).is_err(), "{source}");
         }
+        let tagged =
+            parse_document(b"---\nplugin: !thing value\n---\n").expect_err("custom YAML tag");
+        assert_eq!((tagged.line(), tagged.column()), (Some(2), Some(9)));
+        let compact = parse_document(b"---\nplugin: {key:[&anchor value]}\n---\n")
+            .expect_err("compact flow anchor");
+        assert_eq!(compact.code(), "unsafe_yaml_construct");
+    }
+
+    #[test]
+    fn block_and_multiline_quoted_scalars_do_not_trigger_token_rejection() {
+        let source = b"---\nname: Safe\nliteral: |-\n  !not-a-tag\n  &not-an-anchor\nfolded: >-\n  *not-an-alias\nquoted: \"line one\n  !still-text\"\nplain: first line\n  !still-plain-text\n---\n";
+        let project =
+            parse_project("safe", Path::new("Projects/safe.md"), source).expect("safe scalars");
+        let serialized = serialize_project(&project).expect("serialize safe scalars");
+        let reparsed = parse_project("safe", Path::new("Projects/safe.md"), &serialized)
+            .expect("reparse safe scalars");
+        assert_eq!(reparsed.extra_properties, project.extra_properties);
+    }
+
+    #[test]
+    fn non_finite_yaml_numbers_are_rejected_for_json_compatibility() {
+        for number in [".nan", ".inf", "-.inf"] {
+            let source = format!("---\nname: Safe\nplugin: {number}\n---\n");
+            assert_eq!(
+                parse_document(source.as_bytes())
+                    .expect_err("non-finite number")
+                    .code(),
+                "invalid_yaml_number"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_ambiguous_state_ids_round_trip_as_strings() {
+        for state in ["0", "true", "null"] {
+            let mut config = config();
+            config.states.push(crate::config::State {
+                id: state.to_owned(),
+                name: state.to_owned(),
+                terminal: false,
+            });
+            let source = format!(
+                "---\nname: Task\nstate: {}\nprojects: []\ntags: []\n---\n",
+                serde_json::to_string(state).expect("quote state")
+            );
+            let task = parse_task(
+                ID,
+                Path::new("Tasks/example.md"),
+                source.as_bytes(),
+                &config,
+            )
+            .expect("parse");
+            let serialized = serialize_task(&task, &config).expect("serialize");
+            assert_eq!(
+                parse_task(ID, Path::new("Tasks/example.md"), &serialized, &config)
+                    .expect("reparse")
+                    .state,
+                state
+            );
+        }
+    }
+
+    #[test]
+    fn writers_refuse_new_conflict_markers() {
+        let mut parsed = task("---\nname: Task\nstate: open\nprojects: []\ntags: []\n---\n");
+        parsed.body = "<<<<<<< ours\ntext\n=======\nother\n>>>>>>> theirs\n".to_owned();
+        let error = serialize_task(&parsed, &config()).expect_err("conflicted body");
+        assert_eq!(error.code(), "unresolved_conflict");
+        assert_eq!(error.exit_code(), 6);
+
+        for marker in ["<<<<<<<", "|||||||", "=======", ">>>>>>>"] {
+            let source = format!("---\nname: Safe\n---\n{marker}\n");
+            assert_eq!(
+                parse_document(source.as_bytes())
+                    .expect_err("conflict marker")
+                    .code(),
+                "unresolved_conflict"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_depth_and_node_counts_are_bounded() {
+        let deeply_nested = format!(
+            "---\nplugin: {}null{}\n---\n",
+            "[".repeat(MAX_YAML_DEPTH + 1),
+            "]".repeat(MAX_YAML_DEPTH + 1)
+        );
+        assert_eq!(
+            parse_document(deeply_nested.as_bytes())
+                .expect_err("excessive depth")
+                .code(),
+            "yaml_too_deep"
+        );
+
+        let mut deeply_indented = String::from("---\n");
+        for depth in 0..=MAX_YAML_DEPTH {
+            deeply_indented.push_str(&"  ".repeat(depth));
+            deeply_indented.push_str("key:\n");
+        }
+        deeply_indented.push_str("---\n");
+        assert_eq!(
+            parse_document(deeply_indented.as_bytes())
+                .expect_err("excessive block depth")
+                .code(),
+            "yaml_too_deep"
+        );
+
+        let mut many_nodes = String::with_capacity(MAX_YAML_NODES * 5 + 32);
+        many_nodes.push_str("---\nplugin: [");
+        for index in 0..MAX_YAML_NODES {
+            if index != 0 {
+                many_nodes.push(',');
+            }
+            many_nodes.push_str("null");
+        }
+        many_nodes.push_str("]\n---\n");
+        assert_eq!(
+            parse_document(many_nodes.as_bytes())
+                .expect_err("excessive nodes")
+                .code(),
+            "yaml_too_complex"
+        );
     }
     #[test]
     fn project_links_reject_every_noncanonical_form() {

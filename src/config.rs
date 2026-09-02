@@ -9,6 +9,15 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const CONFIG_PATH: &str = ".todo/config.toml";
 pub const SCHEMA_PATH: &str = ".todo/schema.json";
 pub const EMBEDDED_SCHEMA: &str = include_str!("../assets/schema.json");
+pub(crate) fn source_location(source: &str, byte_offset: usize) -> (usize, usize) {
+    let prefix = source.get(..byte_offset).unwrap_or(source);
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit('\n')
+        .next()
+        .map_or(1, |line| line.chars().count() + 1);
+    (line, column)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,27 +78,45 @@ impl Config {
     }
 
     pub fn parse(source: &str) -> Result<Self> {
-        let config: Self = toml::from_str(source).map_err(|source| {
+        let value: toml::Value = toml::from_str(source).map_err(|parse_error| {
+            let mut error = Error::validation(
+                "invalid_config",
+                format!("Invalid configuration: {parse_error}"),
+            )
+            .with_path(CONFIG_PATH);
+            if let Some(span) = parse_error.span() {
+                let (line, column) = source_location(source, span.start);
+                error = error.with_location(line, column);
+            }
+            error
+        })?;
+        if let Some(version) = value
+            .get("schema_version")
+            .and_then(toml::Value::as_integer)
+        {
+            if version != i64::from(SCHEMA_VERSION) {
+                return Err(Error::unsupported(
+                    "unsupported_schema",
+                    format!(
+                        "Schema version {version} is unsupported; this client requires version {SCHEMA_VERSION}"
+                    ),
+                )
+                .with_path(CONFIG_PATH)
+                .with_field("schema_version"));
+            }
+        }
+        let config: Self = value.try_into().map_err(|source| {
             Error::validation("invalid_config", format!("Invalid configuration: {source}"))
                 .with_path(CONFIG_PATH)
         })?;
         let issues = config.validation_issues();
         if let Some(issue) = issues.first() {
-            let kind = if config.schema_version != SCHEMA_VERSION {
-                Error::unsupported(
-                    "unsupported_schema",
-                    format!(
-                        "Schema version {} is unsupported; this client requires version {SCHEMA_VERSION}",
-                        config.schema_version
-                    ),
-                )
-            } else {
-                Error::validation(issue_code(issue), issue.message.clone())
-            };
+            let error =
+                Error::validation(issue_code(issue), issue.message.clone()).with_path(CONFIG_PATH);
             return Err(if let Some(field) = &issue.field {
-                kind.with_path(CONFIG_PATH).with_field(field)
+                error.with_field(field)
             } else {
-                kind.with_path(CONFIG_PATH)
+                error
             });
         }
         Ok(config)
@@ -130,20 +157,34 @@ impl Config {
             ("tasks_directory", self.tasks_directory.as_str()),
             ("projects_directory", self.projects_directory.as_str()),
         ] {
-            if let Err(message) = validate_managed_directory(value) {
-                issues.push(
+            match validate_managed_directory(value) {
+                Err(message) => issues.push(
                     ValidationIssue::error("invalid_managed_path", message)
                         .at_path(CONFIG_PATH)
                         .at_field(field),
-                );
+                ),
+                Ok(()) if field == "projects_directory" && validate_link_prefix(value).is_err() => {
+                    issues.push(
+                        ValidationIssue::error(
+                            "invalid_managed_path",
+                            "Projects directory cannot contain Obsidian link control syntax",
+                        )
+                        .at_path(CONFIG_PATH)
+                        .at_field(field),
+                    );
+                }
+                Ok(()) => {}
             }
         }
 
-        if self.tasks_directory == self.projects_directory {
+        if managed_paths_overlap(
+            Path::new(&self.tasks_directory),
+            Path::new(&self.projects_directory),
+        ) {
             issues.push(
                 ValidationIssue::error(
                     "managed_paths_not_distinct",
-                    "Tasks and projects directories must be distinct",
+                    "Tasks and projects directories must be distinct and non-overlapping",
                 )
                 .at_path(CONFIG_PATH),
             );
@@ -288,6 +329,10 @@ pub fn managed_path(value: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(value))
 }
 
+pub(crate) fn managed_paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
 pub fn validate_managed_directory(value: &str) -> std::result::Result<(), String> {
     if value.is_empty() {
         return Err("Managed directory cannot be empty".to_owned());
@@ -334,12 +379,11 @@ pub fn validate_link_prefix(value: &str) -> std::result::Result<(), String> {
     if value.starts_with('/') || value.ends_with('/') || value.contains('\\') {
         return Err("Obsidian link prefix must be a relative '/'-separated path".to_owned());
     }
+    if value.chars().any(char::is_control) {
+        return Err("Obsidian link prefix must not contain control characters".to_owned());
+    }
     if value.split('/').any(|part| {
-        part.is_empty()
-            || matches!(part, "." | "..")
-            || part.contains("[[")
-            || part.contains("]]")
-            || part.contains(['|', '#', '^'])
+        part.is_empty() || matches!(part, "." | "..") || part.contains(['[', ']', '|', '#', '^'])
     }) {
         return Err("Obsidian link prefix contains an invalid path component".to_owned());
     }
@@ -444,6 +488,14 @@ mod tests {
             assert!(validate_managed_directory(invalid).is_err(), "{invalid}");
         }
         assert!(validate_managed_directory("Areas/Todos").is_ok());
+        assert!(managed_paths_overlap(
+            Path::new("Data"),
+            Path::new("Data/Projects")
+        ));
+        assert!(!managed_paths_overlap(
+            Path::new("Data/Tasks"),
+            Path::new("Data/Projects")
+        ));
     }
     #[test]
     fn every_unsupported_schema_version_uses_exit_seven() {
@@ -456,6 +508,17 @@ mod tests {
             assert_eq!(error.exit_code(), 7);
         }
     }
+    #[test]
+    fn newer_schema_wins_over_unknown_future_fields() {
+        let source = Config::defaults("Todo".to_owned())
+            .to_toml()
+            .expect("serialize")
+            .replacen("schema_version = 1", "schema_version = 2", 1)
+            + "\nfuture_field = true\n";
+        let error = Config::parse(&source).expect_err("future schema");
+        assert_eq!(error.code(), "unsupported_schema");
+        assert_eq!(error.exit_code(), 7);
+    }
 
     #[test]
     fn unknown_config_keys_are_rejected() {
@@ -465,6 +528,25 @@ mod tests {
         source.push_str("typo = true\n");
         let error = Config::parse(&source).expect_err("unknown key must fail");
         assert_eq!(error.code(), "invalid_config");
+    }
+
+    #[test]
+    fn configuration_syntax_errors_include_a_source_location() {
+        let error =
+            Config::parse("schema_version = 1\nstates = [").expect_err("invalid configuration");
+        assert!(error.line().is_some());
+        assert!(error.column().is_some());
+    }
+
+    #[test]
+    fn project_paths_cannot_inject_wikilink_control_syntax() {
+        let mut config = Config::defaults("Todo".to_owned());
+        config.projects_directory = "Pro#jects".to_owned();
+        assert!(config
+            .validation_issues()
+            .iter()
+            .any(|issue| issue.field.as_deref() == Some("projects_directory")));
+        assert!(validate_link_prefix("Todo\nElsewhere").is_err());
     }
 
     #[test]

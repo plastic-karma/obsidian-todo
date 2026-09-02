@@ -200,12 +200,16 @@ impl RecurrenceRule {
             RecurrenceMode::Schedule => (current_due, current_due.max(completed_on)),
             RecurrenceMode::Completion => (completed_on, completed_on),
         };
-        match self.frequency {
+        let next = match self.frequency {
             Frequency::Daily => self.next_daily(anchor, threshold),
             Frequency::Weekly => self.next_weekly(anchor, threshold),
             Frequency::Monthly => self.next_monthly(anchor, threshold),
             Frequency::Yearly => self.next_yearly(anchor, threshold),
+        }?;
+        if !is_supported_date(next) {
+            return Err(date_overflow());
         }
+        Ok(next)
     }
 
     fn next_daily(&self, anchor: NaiveDate, threshold: NaiveDate) -> Result<NaiveDate> {
@@ -480,6 +484,23 @@ fn no_occurrence() -> Error {
     .with_field("recurrence")
 }
 
+#[must_use]
+pub fn is_supported_date(date: NaiveDate) -> bool {
+    (0..=9_999).contains(&date.year())
+}
+
+pub fn validate_date_value(date: NaiveDate, field: &str) -> Result<()> {
+    if is_supported_date(date) {
+        Ok(())
+    } else {
+        Err(Error::validation(
+            "invalid_date",
+            format!("{field} must have a four-digit year"),
+        )
+        .with_field(field))
+    }
+}
+
 pub fn parse_date(value: &str, field: &str) -> Result<NaiveDate> {
     let bytes = value.as_bytes();
     if bytes.len() != 10
@@ -717,6 +738,23 @@ mod tests {
         assert_eq!(
             date("2024-02-29"),
             NaiveDate::from_ymd_opt(2024, 2, 29).unwrap()
+        );
+    }
+    #[test]
+    fn recurrence_never_produces_an_unserializable_five_digit_year() {
+        let due = date("9999-12-31");
+        let error = RecurrenceRule::parse("FREQ=DAILY")
+            .expect("daily")
+            .next_due(due, due, RecurrenceMode::Schedule)
+            .expect_err("year 10000 cannot be stored as YYYY-MM-DD");
+        assert_eq!(error.code(), "recurrence_date_overflow");
+
+        let year_10000 = NaiveDate::from_ymd_opt(10_000, 1, 1).expect("chrono date");
+        assert_eq!(
+            validate_date_value(year_10000, "due_date")
+                .expect_err("four-digit domain")
+                .code(),
+            "invalid_date"
         );
     }
 }

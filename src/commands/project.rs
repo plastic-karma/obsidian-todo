@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 
 use serde::Serialize;
 use serde_yaml_ng::Mapping;
 
 use crate::error::{Error, Result};
 use crate::frontmatter::serialize_project;
-use crate::model::{normalize_body, validate_name, validate_project_slug, Project};
+use crate::model::{
+    normalize_body, relative_path_string, validate_name, validate_project_slug, Project,
+};
 use crate::store::Store;
 
 #[derive(Debug, Clone)]
@@ -32,7 +33,7 @@ pub struct ProjectSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectView {
     pub slug: String,
-    pub path: PathBuf,
+    pub path: String,
     pub name: String,
     pub body: String,
     pub extra_properties: serde_json::Value,
@@ -50,7 +51,7 @@ impl ProjectView {
             })?;
         Ok(Self {
             slug: project.slug.clone(),
-            path: project.path.clone(),
+            path: relative_path_string(&project.path),
             name: project.name.clone(),
             body: project.body.clone(),
             extra_properties,

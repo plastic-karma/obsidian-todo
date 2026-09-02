@@ -8,23 +8,29 @@ use chrono::NaiveDate;
 use clap::{error::ErrorKind as ClapErrorKind, Args, Parser, Subcommand};
 use serde_json::json;
 
-use crate::commands::init::{initialize, InitOptions};
-use crate::commands::project::{self, CreateProject, EditProject, ProjectSummary, ProjectView};
-use crate::commands::task::{self, AddTask, EditTask, TaskFilter, TaskView};
-use crate::discovery::{discover, DiscoveryOptions};
-use crate::error::{Error, Result};
-use crate::frontmatter::MAX_RECORD_BYTES;
-use crate::model::{Clock, SystemClock, Task};
-use crate::output::{write_error, write_success, ColorChoice, CommandOutput, OutputFormat};
-use crate::recurrence::{parse_date, RecurrenceMode, RecurrenceRule};
-use crate::store::Store;
-use crate::validate::validate_store;
+use obsidian_todo::commands::init::{initialize, InitOptions};
+use obsidian_todo::commands::project::{
+    self, CreateProject, EditProject, ProjectSummary, ProjectView,
+};
+use obsidian_todo::commands::task::{self, AddTask, EditTask, TaskFilter, TaskView};
+use obsidian_todo::discovery::{discover, DiscoveryOptions};
+use obsidian_todo::error::{Error, Result, ValidationSummary};
+use obsidian_todo::frontmatter::MAX_RECORD_BYTES;
+use obsidian_todo::model::{Clock, SystemClock, Task};
+use obsidian_todo::recurrence::{parse_date, RecurrenceMode, RecurrenceRule};
+use obsidian_todo::store::Store;
+use obsidian_todo::validate::validate_store;
+
+use crate::output::{
+    human_issue, json_path, write_error, write_success, ColorChoice, CommandOutput, OutputFormat,
+};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "otodo",
     version,
     about = "Manage structured todo notes in an Obsidian vault",
+    color = clap::ColorChoice::Never,
     after_help = "Normal operations read and write only the selected todo store and never invoke Git. Sparse checkout limits visible files but is not a credential or confidentiality boundary.\n\nExamples:\n  otodo init Todo --vault-root .\n  otodo --root Todo project create work --name Work\n  otodo --root Todo add \"Review plan\" --project work --tag review\n  otodo --root Todo list --format json\n  otodo --root Todo validate"
 )]
 pub struct Cli {
@@ -51,6 +57,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Initialize a self-contained todo store inside an existing vault
+    #[command(after_help = "Example:\n  otodo init Todo --vault-root .")]
     Init {
         /// Store path to create, relative to the current directory unless absolute
         store_path: PathBuf,
@@ -69,21 +76,29 @@ pub enum Command {
     },
 
     /// Print the resolved todo store root and managed paths
+    #[command(after_help = "Example:\n  otodo --root Todo root")]
     Root,
 
     /// Create a task
+    #[command(
+        after_help = "Example:\n  otodo --root Todo add \"Review plan\" --project work --tag review"
+    )]
     Add(AddArguments),
 
     /// List tasks with composable filters
+    #[command(after_help = "Example:\n  otodo --root Todo list --state active --format json")]
     List(ListArguments),
 
     /// Show one task by full ID or unambiguous prefix
+    #[command(after_help = "Example:\n  otodo --root Todo show 01K4B0")]
     Show { id_or_prefix: String },
 
     /// Atomically edit one task
+    #[command(after_help = "Example:\n  otodo --root Todo edit 01K4B0 --state active")]
     Edit(EditArguments),
 
     /// Complete an occurrence or one-off task
+    #[command(after_help = "Example:\n  otodo --root Todo complete 01K4B0 --on 2026-09-09")]
     Complete {
         id_or_prefix: String,
         /// Completion date; defaults to --today or the local date
@@ -92,15 +107,21 @@ pub enum Command {
     },
 
     /// End a recurring series in the done state
+    #[command(after_help = "Example:\n  otodo --root Todo finish-series 01K4B0")]
     FinishSeries { id_or_prefix: String },
 
     /// Move a nonterminal task to the cancelled state
+    #[command(after_help = "Example:\n  otodo --root Todo cancel 01K4B0")]
     Cancel { id_or_prefix: String },
 
     /// Move a terminal task back to the configured default state
+    #[command(after_help = "Example:\n  otodo --root Todo reopen 01K4B0")]
     Reopen { id_or_prefix: String },
 
     /// Intentionally and permanently delete a task
+    #[command(
+        after_help = "Example:\n  otodo --root Todo delete 01K4B0ZSBZZV25T1K0D3TA8JHR --yes"
+    )]
     Delete {
         /// Full 26-character task ID; prefixes are not accepted
         full_id: String,
@@ -110,12 +131,14 @@ pub enum Command {
     },
 
     /// Manage first-class projects
+    #[command(after_help = "Example:\n  otodo --root Todo project list")]
     Project {
         #[command(subcommand)]
         command: ProjectCommand,
     },
 
     /// Inspect the complete store and report every discoverable problem
+    #[command(after_help = "Example:\n  otodo --root Todo validate")]
     Validate,
 }
 
@@ -208,6 +231,7 @@ pub struct BodyArguments {
 #[derive(Debug, Subcommand)]
 pub enum ProjectCommand {
     /// Create a project with a stable slug
+    #[command(after_help = "Example:\n  otodo --root Todo project create work --name Work")]
     Create {
         slug: String,
         #[arg(long)]
@@ -216,10 +240,15 @@ pub enum ProjectCommand {
         body: BodyArguments,
     },
     /// List projects and current task reference counts
+    #[command(after_help = "Example:\n  otodo --root Todo project list")]
     List,
     /// Show a project by exact slug
+    #[command(after_help = "Example:\n  otodo --root Todo project show work")]
     Show { slug: String },
     /// Edit a project's display name or body without changing its slug
+    #[command(
+        after_help = "Example:\n  otodo --root Todo project edit work --name \"Office Work\""
+    )]
     Edit {
         slug: String,
         #[arg(long)]
@@ -228,6 +257,7 @@ pub enum ProjectCommand {
         body: BodyArguments,
     },
     /// Delete an unreferenced project
+    #[command(after_help = "Example:\n  otodo --root Todo project delete work --yes")]
     Delete {
         slug: String,
         #[arg(long)]
@@ -238,7 +268,11 @@ pub enum ProjectCommand {
 pub fn run() -> u8 {
     let arguments = env::args_os().collect::<Vec<_>>();
     let format = requested_format(&arguments);
-    match Cli::try_parse_from(&arguments) {
+    run_with_arguments(&arguments, format)
+}
+
+fn run_with_arguments(arguments: &[OsString], format: OutputFormat) -> u8 {
+    match Cli::try_parse_from(arguments) {
         Ok(cli) => {
             let selected_format = cli.format;
             match execute(&cli, &SystemClock) {
@@ -302,25 +336,43 @@ pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<CommandOutput> {
             json!({
                 "version": 1,
                 "dry_run": plan.dry_run,
-                "vault_root": plan.vault_root,
-                "root": plan.store_root,
-                "directories": plan.directories,
-                "files": plan.files,
+                "vault_root": json_path(&plan.vault_root),
+                "root": json_path(&plan.store_root),
+                "directories": plan.directories.iter().map(|path| json_path(path)).collect::<Vec<_>>(),
+                "files": plan.files.iter().map(|path| json_path(path)).collect::<Vec<_>>(),
                 "obsidian_link_prefix": plan.obsidian_link_prefix,
             }),
         ));
     }
 
-    let root = discover_root(cli, &current_directory)?;
+    let root = if matches!(cli.command, Command::Validate) {
+        validation_root(cli, &current_directory)?
+    } else {
+        discover_root(cli, &current_directory)?
+    };
     if matches!(cli.command, Command::Validate) {
         let report = validate_store(&root);
         if !report.valid {
-            return Err(Error::from_issues(report.issues));
+            let summary = ValidationSummary {
+                valid: report.valid,
+                errors: report.errors,
+                warnings: report.warnings,
+                tasks: report.tasks,
+                projects: report.projects,
+            };
+            return Err(Error::from_issues(report.issues).with_validation_summary(summary));
         }
-        let human = format!(
+        let mut human = format!(
             "Valid todo store: {} task(s), {} project(s), {} warning(s)",
             report.tasks, report.projects, report.warnings
         );
+        for issue in &report.issues {
+            human.push_str("\n  ");
+            human.push_str(&human_issue(issue));
+            if let Some(suggestion) = &issue.suggestion {
+                human.push_str(&format!("\n    fix: {suggestion}"));
+            }
+        }
         return Ok(CommandOutput::new(
             human,
             json!({
@@ -344,10 +396,10 @@ pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<CommandOutput> {
                 root.display().to_string(),
                 json!({
                     "version": 1,
-                    "root": paths.root,
-                    "config": paths.config,
-                    "tasks": paths.tasks,
-                    "projects": paths.projects,
+                    "root": json_path(&paths.root),
+                    "config": json_path(&paths.config),
+                    "tasks": json_path(&paths.tasks),
+                    "projects": json_path(&paths.projects),
                 }),
             ))
         }
@@ -486,6 +538,39 @@ pub fn discover_root(cli: &Cli, current_directory: &Path) -> Result<PathBuf> {
         current_directory,
     })
 }
+fn validation_root(cli: &Cli, current_directory: &Path) -> Result<PathBuf> {
+    let (supplied, source_name) = if let Some(root) = &cli.root {
+        (root.clone(), "--root")
+    } else if let Some(root) = env::var_os("OBSIDIAN_TODO_ROOT") {
+        if root.is_empty() {
+            return Err(Error::usage(
+                "invalid_root",
+                "OBSIDIAN_TODO_ROOT cannot be empty",
+            ));
+        }
+        (PathBuf::from(root), "OBSIDIAN_TODO_ROOT")
+    } else {
+        return discover_root(cli, current_directory);
+    };
+    let candidate = if supplied.is_absolute() {
+        supplied
+    } else {
+        current_directory.join(supplied)
+    };
+    match fs::symlink_metadata(&candidate) {
+        Ok(_) => Ok(candidate),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Err(Error::not_found(
+            "store_not_found",
+            format!("{source_name} does not identify an existing path"),
+        )
+        .with_path(candidate)),
+        Err(source) => Err(Error::io(
+            "inspect the requested validation root",
+            &candidate,
+            &source,
+        )),
+    }
+}
 
 fn execute_project(store: &Store, command: &ProjectCommand) -> Result<CommandOutput> {
     match command {
@@ -596,7 +681,7 @@ fn human_task_details(store: &Store, task: &Task) -> Result<String> {
     Ok(format!(
         "id: {}\npath: {}\nname: {}\nstate: {}\nterminal: {}\nprojects: {}\ntags: {}\ndue_date: {}\nrecurrence: {}\nrecurrence_from: {}\nlast_completed_date: {}\nextra_properties: {}\nbody:\n{}",
         view.id,
-        view.path.display(),
+        view.path,
         view.name,
         view.state,
         view.terminal,
@@ -611,7 +696,7 @@ fn human_task_details(store: &Store, task: &Task) -> Result<String> {
     ))
 }
 
-fn project_output(project: &crate::model::Project, human: String) -> Result<CommandOutput> {
+fn project_output(project: &obsidian_todo::model::Project, human: String) -> Result<CommandOutput> {
     let view = ProjectView::from_project(project)?;
     Ok(CommandOutput::new(
         human,
@@ -672,23 +757,31 @@ fn parse_cli_date(value: &str) -> std::result::Result<NaiveDate, String> {
 }
 
 fn requested_format(arguments: &[OsString]) -> OutputFormat {
-    arguments
-        .windows(2)
-        .find_map(|pair| (pair[0] == "--format").then(|| pair[1].to_str()).flatten())
-        .or_else(|| {
-            arguments.iter().find_map(|argument| {
-                argument
-                    .to_str()
-                    .and_then(|value| value.strip_prefix("--format="))
-            })
-        })
-        .map_or(OutputFormat::Human, |value| {
-            if value.eq_ignore_ascii_case("json") {
-                OutputFormat::Json
-            } else {
-                OutputFormat::Human
+    let mut requested = OutputFormat::Human;
+    let mut arguments = arguments.iter().skip(1);
+    while let Some(argument) = arguments.next() {
+        if argument == "--" {
+            break;
+        }
+        if argument == "--format" {
+            if arguments
+                .next()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("json"))
+            {
+                requested = OutputFormat::Json;
             }
-        })
+            continue;
+        }
+        if argument
+            .to_str()
+            .and_then(|value| value.strip_prefix("--format="))
+            .is_some_and(|value| value.eq_ignore_ascii_case("json"))
+        {
+            requested = OutputFormat::Json;
+        }
+    }
+    requested
 }
 
 #[cfg(test)]
@@ -704,6 +797,17 @@ mod tests {
         assert_eq!(
             requested_format(&["otodo".into(), "root".into(), "--format=json".into()]),
             OutputFormat::Json
+        );
+
+        assert_eq!(
+            requested_format(&[
+                "otodo".into(),
+                "add".into(),
+                "--".into(),
+                "--format".into(),
+                "json".into(),
+            ]),
+            OutputFormat::Human
         );
     }
 
@@ -732,6 +836,10 @@ mod tests {
         ] {
             let error = Cli::try_parse_from(arguments).expect_err("help exits through clap");
             assert_eq!(error.kind(), ClapErrorKind::DisplayHelp);
+            assert!(
+                error.to_string().contains("Example"),
+                "command help lacks an example: {error}"
+            );
         }
     }
 
@@ -751,5 +859,12 @@ mod tests {
         ] {
             assert!(help.contains(required), "missing {required:?}:\n{help}");
         }
+    }
+    #[test]
+    fn body_reader_stops_at_record_size_limit() {
+        let error = read_bounded_body(std::io::repeat(b'x'), Path::new("-"), "test input")
+            .expect_err("oversized body");
+        assert_eq!(error.code(), "body_too_large");
+        assert_eq!(error.path(), Some(Path::new("-")));
     }
 }

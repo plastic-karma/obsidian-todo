@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 
 use tempfile::NamedTempFile;
 
-use crate::config::{Config, CONFIG_PATH, EMBEDDED_SCHEMA, SCHEMA_PATH};
+use crate::config::{validate_link_prefix, Config, CONFIG_PATH, EMBEDDED_SCHEMA, SCHEMA_PATH};
 use crate::error::{Error, Result};
 
 #[derive(Debug, Clone)]
@@ -75,6 +75,7 @@ pub fn initialize(options: &InitOptions<'_>) -> Result<InitPlan> {
     sync_directory(&metadata_directory)?;
     sync_directory(&store)?;
     validate_initialized_layout(&plan, &config)?;
+    crate::validate::validate_store(&plan.store_root).into_result()?;
     Ok(plan)
 }
 
@@ -241,10 +242,10 @@ fn inspect_existing_layout(store: &Path, adopt: bool) -> Result<()> {
             )
             .with_path(entry.path()));
         }
-        let metadata = entry.metadata().map_err(|source| {
+        let file_type = entry.file_type().map_err(|source| {
             Error::io("inspect an existing layout entry", &entry.path(), &source)
         })?;
-        if !metadata.is_dir() || entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+        if file_type.is_symlink() || !file_type.is_dir() {
             return Err(Error::validation(
                 "store_contains_unmanaged_content",
                 "The adopted layout may contain only real directories",
@@ -279,7 +280,7 @@ fn relative_link_prefix(store: &Path, vault: &Path) -> Result<String> {
             "Store path must resolve inside the vault root",
         )
     })?;
-    relative
+    let prefix = relative
         .components()
         .map(|component| match component {
             Component::Normal(value) => value.to_str().map(ToOwned::to_owned).ok_or_else(|| {
@@ -293,8 +294,11 @@ fn relative_link_prefix(store: &Path, vault: &Path) -> Result<String> {
                 "Store path must be normalized",
             )),
         })
-        .collect::<Result<Vec<_>>>()
-        .map(|parts| parts.join("/"))
+        .collect::<Result<Vec<_>>>()?
+        .join("/");
+    validate_link_prefix(&prefix)
+        .map_err(|message| Error::validation("invalid_link_prefix", message).with_path(store))?;
+    Ok(prefix)
 }
 
 fn create_new_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -333,54 +337,11 @@ fn sync_directory(path: &Path) -> Result<()> {
 }
 
 fn validate_initialized_layout(plan: &InitPlan, config: &Config) -> Result<()> {
-    for directory in &plan.directories {
-        let metadata = fs::symlink_metadata(directory)
-            .map_err(|source| Error::io("validate an initialized directory", directory, &source))?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(Error::validation(
-                "invalid_initialized_layout",
-                "Initialized managed paths must be real directories",
-            )
-            .with_path(directory));
-        }
-    }
-    let written = fs::read_to_string(plan.store_root.join(CONFIG_PATH)).map_err(|source| {
-        Error::io(
-            "read the initialized configuration",
-            &plan.store_root.join(CONFIG_PATH),
-            &source,
-        )
-    })?;
-    let parsed = Config::parse(&written)?;
-    if &parsed != config {
+    let store = crate::store::Store::open(&plan.store_root)?;
+    if store.config() != config {
         return Err(Error::validation(
             "initialized_config_mismatch",
             "Initialized configuration did not round-trip",
-        ));
-    }
-    let schema: serde_json::Value = serde_json::from_slice(
-        &fs::read(plan.store_root.join(SCHEMA_PATH)).map_err(|source| {
-            Error::io(
-                "read the initialized schema",
-                &plan.store_root.join(SCHEMA_PATH),
-                &source,
-            )
-        })?,
-    )
-    .map_err(|source| {
-        Error::validation(
-            "invalid_schema_file",
-            format!("Initialized schema is invalid JSON: {source}"),
-        )
-    })?;
-    if schema
-        .get("x-obsidian-todo-schema-version")
-        .and_then(serde_json::Value::as_u64)
-        != Some(u64::from(config.schema_version))
-    {
-        return Err(Error::validation(
-            "schema_version_mismatch",
-            "Initialized schema version does not match configuration",
         ));
     }
     Ok(())
@@ -457,6 +418,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_store_paths_that_cannot_form_safe_wikilinks() {
+        let temp = TempDir::new().expect("temp");
+        let store = temp.path().join("Bad#Todo");
+        let error = initialize(&InitOptions {
+            store_path: &store,
+            vault_root: Some(temp.path()),
+            current_directory: temp.path(),
+            adopt_empty_layout: false,
+            dry_run: false,
+        })
+        .expect_err("unsafe link path");
+        assert_eq!(error.code(), "invalid_link_prefix");
+        assert!(!store.exists());
+    }
+
+    #[test]
     fn adopts_only_empty_default_layout() {
         let temp = TempDir::new().expect("temp");
         let store = temp.path().join("Todo");
@@ -472,5 +449,47 @@ mod tests {
         })
         .expect("adopt empty layout");
         assert!(store.join(CONFIG_PATH).is_file());
+    }
+
+    #[test]
+    fn adopts_a_partial_empty_default_layout() {
+        let temp = TempDir::new().expect("temp");
+        let store = temp.path().join("Todo");
+        fs::create_dir_all(store.join("Tasks")).expect("partial layout");
+        initialize(&InitOptions {
+            store_path: &store,
+            vault_root: Some(temp.path()),
+            current_directory: temp.path(),
+            adopt_empty_layout: true,
+            dry_run: false,
+        })
+        .expect("adopt partial empty layout");
+        assert!(store.join(".todo").is_dir());
+        assert!(store.join("Projects").is_dir());
+        assert!(store.join(CONFIG_PATH).is_file());
+    }
+
+    #[test]
+    fn adoption_rejects_nonempty_managed_directories_without_modifying_them() {
+        let temp = TempDir::new().expect("temp");
+        let store = temp.path().join("Todo");
+        let existing = store.join("Tasks/existing.md");
+        fs::create_dir_all(existing.parent().expect("parent")).expect("tasks directory");
+        fs::write(&existing, b"existing\n").expect("existing content");
+
+        let error = initialize(&InitOptions {
+            store_path: &store,
+            vault_root: Some(temp.path()),
+            current_directory: temp.path(),
+            adopt_empty_layout: true,
+            dry_run: false,
+        })
+        .expect_err("nonempty managed directory");
+        assert_eq!(error.code(), "managed_directory_not_empty");
+        assert_eq!(
+            fs::read(existing).expect("preserved content"),
+            b"existing\n"
+        );
+        assert!(!store.join(CONFIG_PATH).exists());
     }
 }

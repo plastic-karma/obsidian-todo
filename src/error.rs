@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -34,6 +34,7 @@ impl ErrorKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ValidationIssue {
     pub code: String,
+    #[serde(serialize_with = "serialize_optional_path")]
     pub path: Option<PathBuf>,
     pub line: Option<usize>,
     pub column: Option<usize>,
@@ -48,6 +49,32 @@ pub struct ValidationIssue {
 pub enum IssueSeverity {
     Error,
     Warning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ValidationSummary {
+    pub valid: bool,
+    pub errors: usize,
+    pub warnings: usize,
+    pub tasks: usize,
+    pub projects: usize,
+}
+fn serialize_optional_path<S>(
+    path: &Option<PathBuf>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match path {
+        Some(path) => {
+            let rendered = path
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            serializer.serialize_some(&rendered)
+        }
+        None => serializer.serialize_none(),
+    }
 }
 
 impl ValidationIssue {
@@ -114,6 +141,7 @@ struct ErrorDetails {
     line: Option<usize>,
     column: Option<usize>,
     issues: Vec<ValidationIssue>,
+    validation: Option<ValidationSummary>,
 }
 
 impl Error {
@@ -129,6 +157,7 @@ impl Error {
                 line: None,
                 column: None,
                 issues: Vec::new(),
+                validation: None,
             }),
         }
     }
@@ -188,7 +217,20 @@ impl Error {
         let kind = if issues.iter().any(|issue| {
             matches!(
                 issue.code.as_str(),
-                "unsupported_schema" | "unsupported_recurrence"
+                "validation_lock_failed"
+                    | "file_unreadable"
+                    | "project_scan_failed"
+                    | "task_scan_failed"
+                    | "managed_path_unreadable"
+                    | "metadata_scan_failed"
+                    | "store_scan_failed"
+            )
+        }) {
+            ErrorKind::Io
+        } else if issues.iter().any(|issue| {
+            matches!(
+                issue.code.as_str(),
+                "unsupported_schema" | "schema_version_mismatch" | "unsupported_recurrence"
             )
         }) {
             ErrorKind::Unsupported
@@ -203,6 +245,12 @@ impl Error {
         let mut error = Self::new(kind, "validation_failed", message);
         error.details.issues = issues;
         error
+    }
+
+    #[must_use]
+    pub fn with_validation_summary(mut self, summary: ValidationSummary) -> Self {
+        self.details.validation = Some(summary);
+        self
     }
 
     #[must_use]
@@ -260,6 +308,11 @@ impl Error {
     }
 
     #[must_use]
+    pub const fn validation_summary(&self) -> Option<ValidationSummary> {
+        self.details.validation
+    }
+
+    #[must_use]
     pub fn issues(&self) -> &[ValidationIssue] {
         &self.details.issues
     }
@@ -289,9 +342,12 @@ mod tests {
     fn aggregate_validation_preserves_specialized_exit_classes() {
         for (code, exit) in [
             ("invalid_name", 5),
+            ("file_unreadable", 8),
             ("unresolved_conflict", 6),
             ("unsupported_schema", 7),
+            ("schema_version_mismatch", 7),
             ("unsupported_recurrence", 7),
+            ("invalid_embedded_schema", 5),
         ] {
             let error = Error::from_issues(vec![ValidationIssue::error(code, "problem")]);
             assert_eq!(error.code(), "validation_failed");

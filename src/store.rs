@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use walkdir::WalkDir;
 
-use crate::config::{Config, CONFIG_PATH, SCHEMA_PATH};
+use crate::config::{managed_paths_overlap, Config, CONFIG_PATH, EMBEDDED_SCHEMA, SCHEMA_PATH};
 use crate::error::{Error, ErrorKind, Result};
 use crate::frontmatter::{parse_project, parse_task, MAX_RECORD_BYTES};
 use crate::model::{validate_id_prefix, validate_project_slug, validate_task_id, Project, Task};
@@ -37,6 +37,7 @@ pub(crate) struct FileSnapshot {
     relative_path: PathBuf,
     bytes: Vec<u8>,
     hash: [u8; 32],
+    length: u64,
     permissions: Permissions,
 }
 
@@ -85,15 +86,19 @@ impl Store {
         let projects_path = config.projects_path()?;
         validate_managed_directory_on_disk(&root, &tasks_path)?;
         validate_managed_directory_on_disk(&root, &projects_path)?;
-        if fs::canonicalize(root.join(&tasks_path))
-            .and_then(|tasks| {
-                fs::canonicalize(root.join(&projects_path)).map(|projects| tasks == projects)
-            })
-            .map_err(|source| Error::io("compare the managed directories", &root, &source))?
+        let tasks_absolute = fs::canonicalize(root.join(&tasks_path))
+            .map_err(|source| Error::io("resolve the tasks directory", &root, &source))?;
+        let projects_absolute = fs::canonicalize(root.join(&projects_path))
+            .map_err(|source| Error::io("resolve the projects directory", &root, &source))?;
+        let metadata_absolute = fs::canonicalize(root.join(".todo"))
+            .map_err(|source| Error::io("resolve the metadata directory", &root, &source))?;
+        if managed_paths_overlap(&tasks_absolute, &projects_absolute)
+            || managed_paths_overlap(&tasks_absolute, &metadata_absolute)
+            || managed_paths_overlap(&projects_absolute, &metadata_absolute)
         {
             return Err(Error::validation(
                 "managed_paths_not_distinct",
-                "Tasks and projects directories must be distinct",
+                "Managed directories must be distinct from .todo and from one another",
             ));
         }
         validate_schema(&root, config.schema_version)?;
@@ -154,12 +159,11 @@ impl Store {
         let mut seen = HashMap::<String, PathBuf>::with_capacity(candidates.len());
         let mut tasks = Vec::with_capacity(candidates.len());
         for (id, relative) in candidates {
-            let normalized = id.to_ascii_uppercase();
-            if let Some(first) = seen.insert(normalized.clone(), relative.clone()) {
+            if let Some(first) = seen.insert(id.clone(), relative.clone()) {
                 return Err(Error::validation(
                     "duplicate_task_id",
                     format!(
-                        "Task ID {normalized} appears at {} and {}",
+                        "Task ID {id} appears at {} and {}",
                         first.display(),
                         relative.display()
                     ),
@@ -177,11 +181,10 @@ impl Store {
         let candidates = self.task_candidates()?;
         let mut ids = HashSet::with_capacity(candidates.len());
         for (id, relative) in candidates {
-            let normalized = id.to_ascii_uppercase();
-            if !ids.insert(normalized.clone()) {
+            if !ids.insert(id.clone()) {
                 return Err(Error::validation(
                     "duplicate_task_id",
-                    format!("Task ID {normalized} appears more than once"),
+                    format!("Task ID {id} appears more than once"),
                 )
                 .with_path(relative));
             }
@@ -205,9 +208,22 @@ impl Store {
     pub(crate) fn resolve_task_unlocked(&self, id_or_prefix: &str) -> Result<StoredTask> {
         let prefix = validate_id_prefix(id_or_prefix)?;
         let candidates = self.task_candidates()?;
+        let mut seen = HashMap::<&str, &Path>::with_capacity(candidates.len());
+        for (id, relative) in &candidates {
+            if let Some(first) = seen.insert(id, relative) {
+                return Err(Error::validation(
+                    "duplicate_task_id",
+                    format!(
+                        "Task ID {id} appears at {} and {}",
+                        first.display(),
+                        relative.display()
+                    ),
+                ));
+            }
+        }
         let matches = candidates
             .into_iter()
-            .filter(|(id, _)| id.to_ascii_uppercase().starts_with(&prefix))
+            .filter(|(id, _)| id.starts_with(&prefix))
             .collect::<Vec<_>>();
         match matches.as_slice() {
             [] => Err(Error::not_found(
@@ -222,10 +238,7 @@ impl Store {
                 Ok(StoredTask { task, snapshot })
             }
             _ => {
-                let mut ids = matches
-                    .iter()
-                    .map(|(id, _)| id.to_ascii_uppercase())
-                    .collect::<Vec<_>>();
+                let mut ids = matches.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
                 ids.sort();
                 Err(Error::new(
                     ErrorKind::Ambiguous,
@@ -239,12 +252,31 @@ impl Store {
     pub(crate) fn load_project_unlocked(&self, slug: &str) -> Result<StoredProject> {
         validate_project_slug(slug)?;
         let relative = self.config.projects_path()?.join(format!("{slug}.md"));
-        if !self.root.join(&relative).exists() {
-            return Err(Error::not_found(
-                "project_not_found",
-                format!("Project {slug:?} does not exist"),
+        let path = self.root.join(&relative);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::not_found(
+                    "project_not_found",
+                    format!("Project {slug:?} does not exist"),
+                )
+                .with_path(relative));
+            }
+            Err(source) => return Err(Error::io("inspect a project record", &path, &source)),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(Error::validation(
+                "record_symlink",
+                "Project records must not be symlinks",
             )
-            .with_path(relative));
+            .with_path(&relative));
+        }
+        if !metadata.is_file() {
+            return Err(Error::validation(
+                "invalid_record_file",
+                "Project record must be a regular file",
+            )
+            .with_path(&relative));
         }
         let mut snapshot = self.read_snapshot(&relative, MAX_RECORD_BYTES as u64, "project")?;
         let source = snapshot.take_bytes();
@@ -284,6 +316,12 @@ impl Store {
         let mut temporary = NamedTempFile::new_in(parent).map_err(|source| {
             Error::io("create an atomic-write temporary file", parent, &source)
         })?;
+        temporary.write_all(bytes).map_err(|source| {
+            Error::io("write an atomic replacement", temporary.path(), &source)
+        })?;
+        temporary.as_file_mut().flush().map_err(|source| {
+            Error::io("flush an atomic replacement", temporary.path(), &source)
+        })?;
         temporary
             .as_file_mut()
             .set_permissions(snapshot.permissions.clone())
@@ -294,12 +332,6 @@ impl Store {
                     &source,
                 )
             })?;
-        temporary.write_all(bytes).map_err(|source| {
-            Error::io("write an atomic replacement", temporary.path(), &source)
-        })?;
-        temporary.as_file_mut().flush().map_err(|source| {
-            Error::io("flush an atomic replacement", temporary.path(), &source)
-        })?;
         temporary.as_file_mut().sync_all().map_err(|source| {
             Error::io(
                 "synchronize an atomic replacement",
@@ -396,12 +428,14 @@ impl Store {
         let absolute = self.root.join(&tasks_directory);
         let mut candidates = Vec::new();
         for entry in WalkDir::new(&absolute)
+            .sort_by_file_name()
             .follow_links(false)
             .into_iter()
             .filter_entry(|entry| entry.depth() == 0 || !is_hidden_name(entry.file_name()))
         {
             let entry = entry.map_err(|source| {
-                Error::validation(
+                Error::new(
+                    ErrorKind::Io,
                     "task_scan_failed",
                     format!("Could not scan the tasks directory: {source}"),
                 )
@@ -444,10 +478,9 @@ impl Store {
                 .ok_or_else(|| {
                     Error::validation("invalid_task_path", "Task filename must be valid UTF-8")
                         .with_path(&relative)
-                })?
-                .to_owned();
-            validate_task_id(&id).map_err(|error| error_with_path(error, &relative))?;
-            candidates.push((id, relative));
+                })?;
+            validate_task_id(id).map_err(|error| error_with_path(error, &relative))?;
+            candidates.push((id.to_ascii_uppercase(), relative));
         }
         candidates.sort_by(|left, right| left.1.cmp(&right.1));
         Ok(candidates)
@@ -459,13 +492,15 @@ impl Store {
         let absolute = self.root.join(&projects_directory);
         let mut candidates = Vec::new();
         for entry in WalkDir::new(&absolute)
+            .sort_by_file_name()
             .min_depth(1)
             .follow_links(false)
             .into_iter()
             .filter_entry(|entry| entry.depth() == 0 || !is_hidden_name(entry.file_name()))
         {
             let entry = entry.map_err(|source| {
-                Error::validation(
+                Error::new(
+                    ErrorKind::Io,
                     "project_scan_failed",
                     format!("Could not scan the projects directory: {source}"),
                 )
@@ -583,29 +618,42 @@ impl Store {
             .with_path(relative));
         }
         let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-        file.read_to_end(&mut bytes)
+        Read::by_ref(&mut file)
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut bytes)
             .map_err(|source| Error::io(&format!("read the {description}"), &path, &source))?;
+        if exceeds_limit(bytes.len(), limit) {
+            return Err(Error::validation(
+                "record_too_large",
+                format!("The {description} exceeds the {limit}-byte limit"),
+            )
+            .with_path(relative));
+        }
         let hash = content_hash(&bytes);
         Ok(FileSnapshot {
             path,
             relative_path: relative.to_path_buf(),
             bytes,
             hash,
+            length: metadata.len(),
             permissions: metadata.permissions(),
         })
     }
 
     fn ensure_unchanged(&self, snapshot: &FileSnapshot) -> Result<()> {
-        let mut file = open_regular_nofollow(&snapshot.path, &snapshot.relative_path)?;
-        let mut current = Vec::new();
-        file.read_to_end(&mut current).map_err(|source| {
-            Error::io(
-                "rehash a record before replacement",
-                &snapshot.path,
-                &source,
-            )
-        })?;
-        if content_hash(&current) != snapshot.hash {
+        let file = open_regular_nofollow(&snapshot.path, &snapshot.relative_path)?;
+        let mut current =
+            Vec::with_capacity(usize::try_from(snapshot.length).unwrap_or(MAX_RECORD_BYTES));
+        file.take((MAX_RECORD_BYTES + 1) as u64)
+            .read_to_end(&mut current)
+            .map_err(|source| {
+                Error::io(
+                    "rehash a record before replacement",
+                    &snapshot.path,
+                    &source,
+                )
+            })?;
+        if current.len() > MAX_RECORD_BYTES || content_hash(&current) != snapshot.hash {
             return Err(Error::new(
                 ErrorKind::Concurrent,
                 "concurrent_modification",
@@ -620,9 +668,20 @@ impl Store {
         let path = self.root.join(CONFIG_PATH);
         let mut options = open_options_nofollow();
         options.read(true);
-        options
+        let file = options
             .open(&path)
-            .map_err(|source| Error::io("open the store configuration lock", &path, &source))
+            .map_err(|source| Error::io("open the store configuration lock", &path, &source))?;
+        let metadata = file
+            .metadata()
+            .map_err(|source| Error::io("inspect the store configuration lock", &path, &source))?;
+        if !metadata.is_file() {
+            return Err(Error::validation(
+                "invalid_store_file",
+                "Store configuration lock must remain a regular file",
+            )
+            .with_path(CONFIG_PATH));
+        }
+        Ok(file)
     }
 }
 
@@ -648,7 +707,7 @@ fn open_options_nofollow() -> OpenOptions {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     options
 }
@@ -762,9 +821,25 @@ fn read_bounded(path: &Path, limit: u64, description: &str) -> Result<Vec<u8>> {
         .with_path(path));
     }
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    file.read_to_end(&mut bytes)
+    Read::by_ref(&mut file)
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
         .map_err(|source| Error::io(&format!("read the {description}"), path, &source))?;
+    if exceeds_limit(bytes.len(), limit) {
+        return Err(Error::validation(
+            "file_too_large",
+            format!("The {description} exceeds the {limit}-byte limit"),
+        )
+        .with_path(path));
+    }
     Ok(bytes)
+}
+
+fn exceeds_limit(length: usize, limit: u64) -> bool {
+    match u64::try_from(length) {
+        Ok(length) => length > limit,
+        Err(_) => true,
+    }
 }
 
 fn validate_schema(root: &Path, expected_version: u32) -> Result<()> {
@@ -777,12 +852,19 @@ fn validate_schema(root: &Path, expected_version: u32) -> Result<()> {
             format!("schema.json is invalid JSON: {source}"),
         )
         .with_path(SCHEMA_PATH)
+        .with_location(source.line(), source.column())
+    })?;
+    let embedded: serde_json::Value = serde_json::from_str(EMBEDDED_SCHEMA).map_err(|source| {
+        Error::validation(
+            "invalid_embedded_schema",
+            format!("The schema embedded in this build is invalid JSON: {source}"),
+        )
     })?;
     let version = schema
         .get("x-obsidian-todo-schema-version")
         .and_then(serde_json::Value::as_u64);
-    if version != Some(u64::from(expected_version)) {
-        return Err(Error::validation(
+    if version != Some(u64::from(expected_version)) || schema != embedded {
+        return Err(Error::unsupported(
             "schema_version_mismatch",
             "schema.json does not match the configured schema version",
         )
@@ -849,6 +931,20 @@ mod tests {
         assert!(store.paths().tasks.ends_with("Tasks"));
     }
 
+    #[test]
+    fn rejects_schema_that_only_claims_the_supported_version() {
+        let temp = initialized();
+        let root = temp.path().join("Todo");
+        fs::write(
+            root.join(SCHEMA_PATH),
+            r#"{"x-obsidian-todo-schema-version":1}"#,
+        )
+        .expect("tamper with schema");
+        let error = Store::open(root).expect_err("incomplete schema must fail");
+        assert_eq!(error.code(), "schema_version_mismatch");
+        assert_eq!(error.exit_code(), 7);
+    }
+
     #[cfg(unix)]
     #[test]
     fn rejects_managed_directory_symlink() {
@@ -888,6 +984,87 @@ mod tests {
         assert_eq!(task_entries.len(), 1, "temporary file was not removed");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn record_symlinks_are_never_followed() {
+        use std::os::unix::fs::symlink;
+
+        let temp = initialized();
+        let root = temp.path().join("Todo");
+        let outside = temp.path().join("outside-task.md");
+        fs::write(&outside, task_record("Outside")).expect("outside task");
+        symlink(&outside, root.join(format!("Tasks/{FIRST_ID}.md"))).expect("record symlink");
+        let store = Store::open(root).expect("open");
+        let error = store.get_task(FIRST_ID).expect_err("symlink must fail");
+        assert_eq!(error.code(), "record_symlink");
+        assert_eq!(
+            fs::read(outside).expect("outside content"),
+            task_record("Outside")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_project_record_symlinks_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let temp = initialized();
+        let root = temp.path().join("Todo");
+        symlink(
+            temp.path().join("missing-project.md"),
+            root.join("Projects/work.md"),
+        )
+        .expect("project symlink");
+        let store = Store::open(root).expect("open");
+        let error = store.get_project("work").expect_err("symlink must fail");
+        assert_eq!(error.code(), "record_symlink");
+    }
+
+    #[test]
+    fn lowercase_task_basenames_resolve_case_insensitively() {
+        let temp = initialized();
+        let root = temp.path().join("Todo");
+        let lowercase = FIRST_ID.to_ascii_lowercase();
+        fs::write(
+            root.join(format!("Tasks/{lowercase}.md")),
+            task_record("Lowercase"),
+        )
+        .expect("lowercase task");
+        let store = Store::open(root).expect("open");
+        let task = store.get_task(&FIRST_ID[..6]).expect("resolve task");
+        assert_eq!(task.id, FIRST_ID);
+        assert!(task.path.ends_with(format!("{lowercase}.md")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replacement_preserves_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = initialized();
+        let root = temp.path().join("Todo");
+        let store = Store::open(&root).expect("open");
+        let relative = store
+            .create_task(FIRST_ID, &task_record("Original"))
+            .expect("create");
+        let absolute = root.join(&relative);
+        fs::set_permissions(&absolute, fs::Permissions::from_mode(0o640)).expect("set permissions");
+        let snapshot = store
+            .read_snapshot(&relative, MAX_RECORD_BYTES as u64, "task")
+            .expect("snapshot");
+        store
+            .replace(&snapshot, &task_record("Replacement"))
+            .expect("replace");
+        assert_eq!(
+            fs::metadata(absolute)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
+
     #[test]
     fn resolves_unique_absent_and_ambiguous_task_prefixes() {
         let temp = initialized();
@@ -915,6 +1092,18 @@ mod tests {
             .expect_err("ambiguous prefix");
         assert_eq!(ambiguous.code(), "ambiguous_task_id");
         assert_eq!(ambiguous.exit_code(), 4);
+        fs::create_dir(store.root().join("Tasks/nested")).expect("nested tasks");
+        fs::write(
+            store
+                .root()
+                .join(format!("Tasks/nested/{}.md", FIRST_ID.to_ascii_lowercase())),
+            task_record("Duplicate"),
+        )
+        .expect("duplicate task");
+        let duplicate = store
+            .resolve_task_unlocked(&DISTINCT_ID[..6])
+            .expect_err("duplicate identity invalidates resolution");
+        assert_eq!(duplicate.code(), "duplicate_task_id");
     }
 
     #[cfg(unix)]

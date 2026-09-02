@@ -68,7 +68,14 @@ pub fn discover(options: &DiscoveryOptions<'_>) -> Result<PathBuf> {
 
 #[must_use]
 pub fn is_store(path: &Path) -> bool {
-    path.join(CONFIG_PATH).is_file()
+    let metadata_directory = fs::symlink_metadata(path.join(".todo"));
+    if !metadata_directory
+        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+    {
+        return false;
+    }
+    fs::symlink_metadata(path.join(CONFIG_PATH))
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
 }
 
 fn require_store(root: &Path, current: &Path, source_name: &str) -> Result<PathBuf> {
@@ -77,7 +84,7 @@ fn require_store(root: &Path, current: &Path, source_name: &str) -> Result<PathB
     } else {
         current.join(root)
     };
-    let canonical = fs::canonicalize(&candidate).map_err(|source| {
+    let metadata = fs::symlink_metadata(&candidate).map_err(|source| {
         if source.kind() == std::io::ErrorKind::NotFound {
             Error::not_found(
                 "store_not_found",
@@ -85,9 +92,18 @@ fn require_store(root: &Path, current: &Path, source_name: &str) -> Result<PathB
             )
             .with_path(&candidate)
         } else {
-            Error::io("resolve the todo store", &candidate, &source)
+            Error::io("inspect the todo store", &candidate, &source)
         }
     })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::validation(
+            "invalid_store_root",
+            format!("{source_name} must identify a real directory, not a symlink"),
+        )
+        .with_path(candidate));
+    }
+    let canonical = fs::canonicalize(&candidate)
+        .map_err(|source| Error::io("resolve the todo store", &candidate, &source))?;
     if !is_store(&canonical) {
         return Err(Error::not_found(
             "store_not_found",
@@ -121,6 +137,8 @@ fn direct_child_stores(current: &Path) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     use tempfile::TempDir;
 
@@ -162,6 +180,23 @@ mod tests {
         })
         .expect("discover");
         assert_eq!(result, nested_store.canonicalize().expect("canonical"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_root_symlink_is_rejected() {
+        let temp = TempDir::new().expect("temp");
+        let real = temp.path().join("real");
+        marker(&real);
+        let linked = temp.path().join("linked");
+        symlink(&real, &linked).expect("store symlink");
+        let error = discover(&DiscoveryOptions {
+            explicit_root: Some(&linked),
+            environment_root: None,
+            current_directory: temp.path(),
+        })
+        .expect_err("root symlink");
+        assert_eq!(error.code(), "invalid_store_root");
     }
 
     #[test]

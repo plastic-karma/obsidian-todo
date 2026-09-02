@@ -1,3 +1,6 @@
+mod cli;
+mod output;
+
 fn main() {
-    std::process::exit(i32::from(obsidian_todo::cli::run()));
+    std::process::exit(i32::from(cli::run()));
 }

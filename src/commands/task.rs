@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
 
 use chrono::NaiveDate;
 use serde::Serialize;
@@ -9,7 +8,8 @@ use ulid::Ulid;
 use crate::error::{Error, Result};
 use crate::frontmatter::serialize_task;
 use crate::model::{
-    normalize_body, validate_name, validate_tag, validate_unique_projects, Clock, Task,
+    normalize_body, relative_path_string, validate_name, validate_project_slug, validate_tag,
+    validate_unique_projects, Clock, Task,
 };
 use crate::recurrence::{RecurrenceMode, RecurrenceRule};
 use crate::store::Store;
@@ -59,7 +59,7 @@ pub struct TaskFilter {
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskView {
     pub id: String,
-    pub path: PathBuf,
+    pub path: String,
     pub name: String,
     pub state: String,
     pub terminal: bool,
@@ -82,14 +82,18 @@ impl TaskView {
             )
             .with_path(&task.path)
         })?;
+        let mut projects = task.projects.clone();
+        projects.sort_unstable();
+        let mut tags = task.tags.clone();
+        tags.sort_unstable();
         Ok(Self {
             id: task.id.clone(),
-            path: task.path.clone(),
+            path: relative_path_string(&task.path),
             name: task.name.clone(),
             state: task.state.clone(),
             terminal: task.terminal(store.config()),
-            projects: task.projects.clone(),
-            tags: task.tags.clone(),
+            projects,
+            tags,
             due_date: task
                 .due_date
                 .map(|date| date.format("%Y-%m-%d").to_string()),
@@ -155,7 +159,7 @@ pub fn list(store: &Store, filter: &TaskFilter, today: NaiveDate) -> Result<Vec<
     validate_filter(store, filter)?;
     store.with_shared_lock(|| {
         let known_projects = known_projects(store)?;
-        ensure_requested_projects(&filter.projects, &known_projects)?;
+        ensure_known_projects(&filter.projects, &known_projects)?;
         let mut tasks = store
             .load_all_tasks_unlocked()?
             .into_iter()
@@ -472,7 +476,10 @@ fn validate_filter(store: &Store, filter: &TaskFilter) -> Result<()> {
     for tag in &filter.tags {
         validate_tag(tag)?;
     }
-    validate_unique_projects(&filter.projects)
+    for project in &filter.projects {
+        validate_project_slug(project)?;
+    }
+    Ok(())
 }
 
 fn matches_filter(task: &Task, filter: &TaskFilter, store: &Store, today: NaiveDate) -> bool {
@@ -519,9 +526,13 @@ fn known_projects(store: &Store) -> Result<HashSet<String>> {
 
 fn ensure_requested_projects(projects: &[String], known: &HashSet<String>) -> Result<()> {
     validate_unique_projects(projects)?;
+    ensure_known_projects(projects, known)
+}
+
+fn ensure_known_projects(projects: &[String], known: &HashSet<String>) -> Result<()> {
     for project in projects {
         if !known.contains(project) {
-            return Err(Error::validation(
+            return Err(Error::not_found(
                 "project_not_found",
                 format!("Project {project:?} does not exist"),
             )
@@ -587,10 +598,13 @@ fn replace_task(store: &Store, snapshot: crate::store::FileSnapshot, task: Task)
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use tempfile::TempDir;
 
     use crate::commands::init::{initialize, InitOptions};
     use crate::commands::project::{create as create_project, CreateProject};
+    use crate::config::{Config, CONFIG_PATH};
     use crate::model::FixedClock;
     use crate::recurrence::parse_date;
 
@@ -679,6 +693,16 @@ mod tests {
         .expect("list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, first.id);
+        let duplicate_filter = list(
+            &store,
+            &TaskFilter {
+                projects: vec!["work".to_owned(), "work".to_owned()],
+                ..TaskFilter::default()
+            },
+            date("2026-09-02"),
+        )
+        .expect("duplicate project filters");
+        assert_eq!(duplicate_filter.len(), 1);
         let all = list(&store, &TaskFilter::default(), date("2026-09-02")).expect("list all");
         assert_eq!(all[0].id, first.id, "dated tasks sort first");
         assert_eq!(all[1].id, second.id);
@@ -727,6 +751,45 @@ mod tests {
         let reopened = reopen(&store, &relative.id).expect("reopen");
         assert_eq!(reopened.state, "open");
         assert_eq!(reopened.due_date, Some(date("2026-09-12")));
+    }
+
+    #[test]
+    fn complete_requires_a_done_state_for_recurring_tasks() {
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path().join("Todo");
+        initialize(&InitOptions {
+            store_path: &root,
+            vault_root: Some(temp.path()),
+            current_directory: temp.path(),
+            adopt_empty_layout: false,
+            dry_run: false,
+        })
+        .expect("initialize");
+        let mut config = Config::defaults("Todo".to_owned());
+        config.states.retain(|state| state.id != "done");
+        fs::write(
+            root.join(CONFIG_PATH),
+            config.to_toml().expect("serialize config"),
+        )
+        .expect("write config");
+        let store = Store::open(root).expect("open");
+        let mut request = minimal("Recurring");
+        request.due_date = Some(date("2026-09-07"));
+        request.recurrence = Some(RecurrenceRule::parse("FREQ=DAILY").expect("daily recurrence"));
+        request.recurrence_from = Some(RecurrenceMode::Schedule);
+        let task = add(&store, &request).expect("add");
+
+        let error = complete(
+            &store,
+            &task.id,
+            Some(date("2026-09-07")),
+            &FixedClock::new(date("2026-01-01")),
+        )
+        .expect_err("missing done state");
+        assert_eq!(error.code(), "required_terminal_state_missing");
+        let unchanged = show(&store, &task.id).expect("unchanged task");
+        assert_eq!(unchanged.state, "open");
+        assert_eq!(unchanged.due_date, Some(date("2026-09-07")));
     }
 
     #[test]

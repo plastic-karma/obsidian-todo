@@ -36,12 +36,14 @@ fn recurrence_benchmarks(criterion: &mut Criterion) {
     });
 
     let monthly = RecurrenceRule::parse("FREQ=MONTHLY;BYMONTHDAY=29,30,31").expect("monthly rule");
+    let monthly_due = date("2026-01-31");
+    let monthly_far_late = date("2046-02-28");
     group.bench_function("monthly_sparse_days", |bencher| {
         bencher.iter(|| {
             monthly
                 .next_due(
-                    black_box(date("2026-01-31")),
-                    black_box(date("2046-02-28")),
+                    black_box(monthly_due),
+                    black_box(monthly_far_late),
                     RecurrenceMode::Schedule,
                 )
                 .expect("next monthly date")

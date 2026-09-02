@@ -32,6 +32,24 @@ fn initialize(vault: &Path) -> PathBuf {
         .stderr("");
     vault.join("Todo")
 }
+fn human_success(cwd: &Path, arguments: &[&str]) -> String {
+    let output = command()
+        .current_dir(cwd)
+        .args(arguments)
+        .output()
+        .expect("run human command");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert!(!output.stdout.is_empty());
+    assert!(!output.stdout.contains(&0x1b));
+    String::from_utf8(output.stdout).expect("UTF-8 human output")
+}
 
 fn json_success(cwd: &Path, arguments: &[&str]) -> Value {
     let output = command()
@@ -130,6 +148,91 @@ fn initialization_is_contained_and_minimal_task_is_exact_markdown() {
         fs::read(vault.path().join(".obsidian/community-plugins.json")).expect("Obsidian config"),
         obsidian_before
     );
+}
+
+#[test]
+fn every_command_emits_human_success_only_on_stdout() {
+    let vault = fake_vault();
+    human_success(
+        vault.path(),
+        &["init", "Todo", "--vault-root", ".", "--color", "auto"],
+    );
+    human_success(vault.path(), &["--root", "Todo", "root"]);
+    human_success(
+        vault.path(),
+        &[
+            "--root", "Todo", "project", "create", "work", "--name", "Work",
+        ],
+    );
+    human_success(vault.path(), &["--root", "Todo", "project", "list"]);
+    human_success(vault.path(), &["--root", "Todo", "project", "show", "work"]);
+    human_success(
+        vault.path(),
+        &[
+            "--root", "Todo", "project", "edit", "work", "--name", "Office",
+        ],
+    );
+
+    let added = human_success(vault.path(), &["--root", "Todo", "add", "Human task"]);
+    let id = added
+        .split_whitespace()
+        .next()
+        .expect("human add task ID")
+        .to_owned();
+    assert_eq!(id.len(), 26);
+    human_success(vault.path(), &["--root", "Todo", "list"]);
+    human_success(vault.path(), &["--root", "Todo", "show", &id]);
+    human_success(
+        vault.path(),
+        &["--root", "Todo", "edit", &id, "--state", "active"],
+    );
+    human_success(
+        vault.path(),
+        &["--root", "Todo", "complete", &id, "--on", "2026-09-02"],
+    );
+    human_success(vault.path(), &["--root", "Todo", "reopen", &id]);
+    human_success(vault.path(), &["--root", "Todo", "cancel", &id]);
+    human_success(vault.path(), &["--root", "Todo", "reopen", &id]);
+    human_success(vault.path(), &["--root", "Todo", "delete", &id, "--yes"]);
+
+    let recurring = human_success(
+        vault.path(),
+        &[
+            "--root",
+            "Todo",
+            "add",
+            "Recurring",
+            "--due-date",
+            "2026-09-02",
+            "--recurrence",
+            "FREQ=DAILY",
+            "--recurrence-from",
+            "schedule",
+        ],
+    );
+    let recurring_id = recurring
+        .split_whitespace()
+        .next()
+        .expect("human recurring task ID")
+        .to_owned();
+    human_success(
+        vault.path(),
+        &["--root", "Todo", "finish-series", &recurring_id],
+    );
+    human_success(
+        vault.path(),
+        &["--root", "Todo", "project", "delete", "work", "--yes"],
+    );
+    human_success(vault.path(), &["--root", "Todo", "validate"]);
+    let failure = command()
+        .current_dir(vault.path())
+        .args(["--root", "Todo", "show", "01A000"])
+        .output()
+        .expect("run human failure");
+    assert_eq!(failure.status.code(), Some(3));
+    assert!(failure.stdout.is_empty());
+    assert!(!failure.stderr.is_empty());
+    assert!(!failure.stderr.contains(&0x1b));
 }
 
 #[test]
@@ -319,10 +422,24 @@ fn sparse_store_supports_body_sources_and_all_normal_commands_without_git() {
     let vault = fake_vault();
     let original = initialize(vault.path());
     let sparse = TempDir::new().expect("sparse parent");
+    let unrelated = sparse.path().join("unrelated.md");
+    fs::write(&unrelated, b"outside the copied store\r\n").expect("unrelated sparse note");
+    let unrelated_before = fs::read(&unrelated).expect("unrelated sparse note");
     let root = sparse.path().join("OnlyTodo");
     copy_directory(&original, &root);
     assert!(!sparse.path().join(".git").exists());
     assert!(!sparse.path().join(".obsidian").exists());
+    let dry_run = json_success_without_path(
+        sparse.path(),
+        &["init", "DryTodo", "--vault-root", ".", "--dry-run"],
+        None,
+    );
+    assert_eq!(dry_run["dry_run"], true);
+    assert!(!sparse.path().join("DryTodo").exists());
+    let resolved = json_success_without_path(sparse.path(), &["--root", "OnlyTodo", "root"], None);
+    assert!(resolved["root"]
+        .as_str()
+        .is_some_and(|path| path.ends_with("/OnlyTodo")));
 
     let body_file = sparse.path().join("body.md");
     fs::write(&body_file, b"from file\r\n").expect("body file");
@@ -384,6 +501,9 @@ fn sparse_store_supports_body_sources_and_all_normal_commands_without_git() {
         &["--root", "OnlyTodo", "complete", &id, "--on", "2026-09-02"],
         None,
     );
+    json_success_without_path(sparse.path(), &["--root", "OnlyTodo", "reopen", &id], None);
+    json_success_without_path(sparse.path(), &["--root", "OnlyTodo", "cancel", &id], None);
+    json_success_without_path(sparse.path(), &["--root", "OnlyTodo", "reopen", &id], None);
     json_success_without_path(
         sparse.path(),
         &["--root", "OnlyTodo", "project", "list"],
@@ -413,6 +533,28 @@ fn sparse_store_supports_body_sources_and_all_normal_commands_without_git() {
         ],
         None,
     );
+    let recurring = json_success_without_path(
+        sparse.path(),
+        &[
+            "--root",
+            "OnlyTodo",
+            "add",
+            "Recurring",
+            "--due-date",
+            "2026-09-01",
+            "--recurrence",
+            "FREQ=DAILY",
+            "--recurrence-from",
+            "schedule",
+        ],
+        None,
+    );
+    let recurring_id = task_id(&recurring).to_owned();
+    json_success_without_path(
+        sparse.path(),
+        &["--root", "OnlyTodo", "finish-series", &recurring_id],
+        None,
+    );
     json_success_without_path(
         sparse.path(),
         &["--root", "OnlyTodo", "project", "delete", "work", "--yes"],
@@ -435,7 +577,29 @@ fn sparse_store_supports_body_sources_and_all_normal_commands_without_git() {
         &["--root", "OnlyTodo", "show", &survivor_id],
         None,
     );
+    let hidden_record = root.join("Tasks/.editor.md");
+    fs::write(
+        &hidden_record,
+        b"---\nname: Hidden\nstate: open\nprojects: []\ntags: []\n---\n",
+    )
+    .expect("hidden editor record");
+    let warning_output = command()
+        .current_dir(sparse.path())
+        .env("PATH", "/definitely/no/executables")
+        .args(["--root", "OnlyTodo", "validate"])
+        .output()
+        .expect("human validation");
+    assert!(warning_output.status.success());
+    assert!(warning_output.stderr.is_empty());
+    let warning_stdout = String::from_utf8(warning_output.stdout).expect("UTF-8 warning output");
+    assert!(warning_stdout.contains("warning[unexpected_file]"));
+    assert!(warning_stdout.contains("Tasks/.editor.md"));
+    fs::remove_file(hidden_record).expect("remove hidden editor record");
     json_success_without_path(sparse.path(), &["--root", "OnlyTodo", "validate"], None);
+    assert_eq!(
+        fs::read(unrelated).expect("unrelated sparse note"),
+        unrelated_before
+    );
 }
 
 #[test]
@@ -472,7 +636,7 @@ fn errors_have_stable_exit_codes_json_shape_and_leave_no_temporary_files() {
             "--project",
             "does-not-exist",
         ],
-        5,
+        3,
         "project_not_found",
     );
     let first_id = "01K4B0ZSBZZV25T1K0D3TA8JHR";
@@ -532,6 +696,13 @@ fn errors_have_stable_exit_codes_json_shape_and_leave_no_temporary_files() {
         6,
         "validation_failed",
     );
+    assert_eq!(validation["error"]["validation"]["valid"], false);
+    assert!(validation["error"]["validation"]["errors"]
+        .as_u64()
+        .is_some_and(|count| count >= 2));
+    assert!(validation["error"]["validation"]["warnings"].is_number());
+    assert!(validation["error"]["validation"]["tasks"].is_number());
+    assert!(validation["error"]["validation"]["projects"].is_number());
     assert!(validation["error"]["issues"]
         .as_array()
         .expect("issues")
@@ -611,10 +782,22 @@ fn every_cli_command_family_has_a_representative_failure_exit() {
         3,
         "store_not_found",
     );
+    fs::create_dir(vault.path().join("Broken")).expect("broken store candidate");
+    let broken = json_failure(
+        vault.path(),
+        &["--root", "Broken", "validate"],
+        5,
+        "validation_failed",
+    );
+    assert!(broken["error"]["issues"]
+        .as_array()
+        .expect("validation issues")
+        .iter()
+        .any(|issue| issue["code"] == "metadata_directory_missing"));
     json_failure(
         vault.path(),
         &["--root", "Todo", "add", "Missing", "--project", "missing"],
-        5,
+        3,
         "project_not_found",
     );
     json_failure(
@@ -870,7 +1053,10 @@ fn json_success_without_path(cwd: &Path, arguments: &[&str], stdin: Option<&str>
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stderr.is_empty());
-    serde_json::from_slice(&output.stdout).expect("JSON output")
+    assert!(!output.stdout.contains(&0x1b));
+    let value: Value = serde_json::from_slice(&output.stdout).expect("JSON output");
+    assert_eq!(value["version"], 1);
+    value
 }
 
 fn copy_directory(source: &Path, destination: &Path) {

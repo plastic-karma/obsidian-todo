@@ -7,7 +7,7 @@ use ulid::Ulid;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::recurrence::{parse_date, RecurrenceMode, RecurrenceRule};
+use crate::recurrence::{parse_date, validate_date_value, RecurrenceMode, RecurrenceRule};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Task {
@@ -81,6 +81,12 @@ impl Task {
             validate_project_slug(project)?;
         }
         validate_tags(&self.tags)?;
+        if let Some(due_date) = self.due_date {
+            validate_date_value(due_date, "due_date")?;
+        }
+        if let Some(last_completed_date) = self.last_completed_date {
+            validate_date_value(last_completed_date, "last_completed_date")?;
+        }
         match (&self.recurrence, self.recurrence_from) {
             (Some(rule), Some(_)) => {
                 let due = self.due_date.ok_or_else(|| {
@@ -282,12 +288,15 @@ pub fn date_from_yaml(value: &serde_yaml_ng::Value, field: &str) -> Result<Naive
     parse_date(value, field)
 }
 
-#[must_use]
 pub fn relative_path_string(path: &Path) -> String {
-    path.components()
-        .filter_map(|component| component.as_os_str().to_str())
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut output = String::new();
+    for component in path.components() {
+        if !output.is_empty() {
+            output.push('/');
+        }
+        output.push_str(&component.as_os_str().to_string_lossy());
+    }
+    output
 }
 
 #[cfg(test)]
@@ -322,6 +331,7 @@ mod tests {
             assert!(validate_project_slug(slug).is_err(), "{slug}");
         }
         assert!(validate_task_id("01K4B0ZSBZZV25T1K0D3TA8JHR").is_ok());
+        assert!(validate_task_id("01k4b0zsbzzv25t1k0d3ta8jhr").is_ok());
         assert!(validate_task_id("81K4B0ZSBZZV25T1K0D3TA8JHR").is_err());
         assert!(validate_task_id("01K4B0ZSBZZV25T1K0D3TA8JRI").is_err());
     }

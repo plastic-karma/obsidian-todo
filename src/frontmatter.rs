@@ -105,7 +105,7 @@ pub fn parse_document(bytes: &[u8]) -> Result<FrontMatterDocument> {
         }
         error
     })?;
-    validate_yaml_value(&Value::Mapping(properties.clone()), 0, &mut 0)?;
+    validate_yaml_mapping(&properties, 0, &mut 0)?;
     Ok(FrontMatterDocument {
         properties,
         body: source[body_start..].to_owned(),
@@ -180,10 +180,10 @@ pub fn parse_project(slug: &str, path: &Path, bytes: &[u8]) -> Result<Project> {
 pub fn serialize_task(task: &Task, config: &Config) -> Result<Vec<u8>> {
     task.validate(config)?;
     reject_reserved_extras(&task.extra_properties, &CORE_TASK_KEYS)?;
-    let mut projects = task.projects.clone();
-    projects.sort();
-    let mut tags = task.tags.clone();
-    tags.sort();
+    let mut projects = task.projects.iter().map(String::as_str).collect::<Vec<_>>();
+    projects.sort_unstable();
+    let mut tags = task.tags.iter().map(String::as_str).collect::<Vec<_>>();
+    tags.sort_unstable();
 
     let mut output = String::with_capacity(task.body.len().saturating_add(512));
     output.push_str("---\nname: ");
@@ -196,7 +196,7 @@ pub fn serialize_task(task: &Task, config: &Config) -> Result<Vec<u8>> {
         projects.iter().map(|slug| config.project_link(slug)),
     )?;
     output.push_str("tags:");
-    write_string_list(&mut output, tags.iter().cloned())?;
+    write_string_list(&mut output, tags)?;
     if let Some(date) = task.due_date {
         writeln!(output, "due_date: {}", date.format("%Y-%m-%d")).map_err(fmt_error)?;
     }
@@ -297,6 +297,48 @@ fn reject_unsafe_yaml_tokens(source: &str) -> Result<()> {
 }
 
 fn validate_yaml_value(value: &Value, depth: usize, nodes: &mut usize) -> Result<()> {
+    count_yaml_node(depth, nodes)?;
+    match value {
+        Value::Tagged(_) => Err(Error::validation(
+            "unsafe_yaml_construct",
+            "YAML custom tags are not supported",
+        )),
+        Value::Sequence(values) => {
+            for value in values {
+                validate_yaml_value(value, depth + 1, nodes)?;
+            }
+            Ok(())
+        }
+        Value::Mapping(values) => validate_yaml_mapping_entries(values, depth, nodes),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => Ok(()),
+    }
+}
+
+fn validate_yaml_mapping(values: &Mapping, depth: usize, nodes: &mut usize) -> Result<()> {
+    count_yaml_node(depth, nodes)?;
+    validate_yaml_mapping_entries(values, depth, nodes)
+}
+
+fn validate_yaml_mapping_entries(values: &Mapping, depth: usize, nodes: &mut usize) -> Result<()> {
+    for (key, value) in values {
+        let Some(key) = key.as_str() else {
+            return Err(Error::validation(
+                "unsupported_yaml_key",
+                "YAML mapping keys must be strings",
+            ));
+        };
+        if key == "<<" {
+            return Err(Error::validation(
+                "unsafe_yaml_construct",
+                "YAML merge keys are not supported",
+            ));
+        }
+        validate_yaml_value(value, depth + 1, nodes)?;
+    }
+    Ok(())
+}
+
+fn count_yaml_node(depth: usize, nodes: &mut usize) -> Result<()> {
     *nodes = nodes.saturating_add(1);
     if *nodes > MAX_YAML_NODES {
         return Err(Error::validation(
@@ -310,37 +352,7 @@ fn validate_yaml_value(value: &Value, depth: usize, nodes: &mut usize) -> Result
             "YAML front matter exceeds the supported nesting depth",
         ));
     }
-    match value {
-        Value::Tagged(_) => Err(Error::validation(
-            "unsafe_yaml_construct",
-            "YAML custom tags are not supported",
-        )),
-        Value::Sequence(values) => {
-            for value in values {
-                validate_yaml_value(value, depth + 1, nodes)?;
-            }
-            Ok(())
-        }
-        Value::Mapping(values) => {
-            for (key, value) in values {
-                let Some(key) = key.as_str() else {
-                    return Err(Error::validation(
-                        "unsupported_yaml_key",
-                        "YAML mapping keys must be strings",
-                    ));
-                };
-                if key == "<<" {
-                    return Err(Error::validation(
-                        "unsafe_yaml_construct",
-                        "YAML merge keys are not supported",
-                    ));
-                }
-                validate_yaml_value(value, depth + 1, nodes)?;
-            }
-            Ok(())
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => Ok(()),
-    }
+    Ok(())
 }
 
 fn take_required_string(properties: &mut Mapping, key: &str) -> Result<String> {
@@ -446,7 +458,7 @@ fn reject_reserved_extras(properties: &Mapping, reserved: &[&str]) -> Result<()>
             .with_field(*key));
         }
     }
-    validate_yaml_value(&Value::Mapping(properties.clone()), 0, &mut 0)
+    validate_yaml_mapping(properties, 0, &mut 0)
 }
 
 fn quoted(value: &str) -> Result<String> {
@@ -458,35 +470,35 @@ fn quoted(value: &str) -> Result<String> {
     })
 }
 
-fn write_string_list(
-    output: &mut String,
-    values: impl IntoIterator<Item = String>,
-) -> Result<()> {
-    let values = values.into_iter().collect::<Vec<_>>();
-    if values.is_empty() {
+fn write_string_list<I, S>(output: &mut String, values: I) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut values = values.into_iter().peekable();
+    if values.peek().is_none() {
         output.push_str(" []\n");
         return Ok(());
     }
     output.push('\n');
     for value in values {
-        let rendered = quoted(&value)?;
+        let rendered = quoted(value.as_ref())?;
         writeln!(output, "  - {rendered}").map_err(fmt_error)?;
     }
     Ok(())
 }
 
 fn serialize_extras(output: &mut String, properties: &Mapping) -> Result<()> {
-    for (key, value) in properties {
-        let mut one = Mapping::new();
-        one.insert(key.clone(), value.clone());
-        let serialized = serde_yaml_ng::to_string(&one).map_err(|source| {
-            Error::validation(
-                "yaml_serialization_failed",
-                format!("Could not preserve an unknown property: {source}"),
-            )
-        })?;
-        output.push_str(&serialized);
+    if properties.is_empty() {
+        return Ok(());
     }
+    let serialized = serde_yaml_ng::to_string(properties).map_err(|source| {
+        Error::validation(
+            "yaml_serialization_failed",
+            format!("Could not preserve unknown properties: {source}"),
+        )
+    })?;
+    output.push_str(&serialized);
     Ok(())
 }
 
@@ -535,6 +547,17 @@ mod tests {
             assert!(parse_document(malformed).is_err());
         }
     }
+    #[test]
+    fn crlf_input_serializes_lf_front_matter_and_preserves_body_bytes() {
+        let parsed =
+            task("---\r\nname: Task\r\nstate: open\r\nprojects: []\r\ntags: []\r\n---\r\nbody\r\n");
+        let serialized = String::from_utf8(serialize_task(&parsed, &config()).expect("serialize"))
+            .expect("UTF-8");
+        assert_eq!(
+            serialized,
+            "---\nname: \"Task\"\nstate: open\nprojects: []\ntags: []\n---\nbody\r\n"
+        );
+    }
 
     #[test]
     fn duplicate_keys_are_rejected_at_every_depth() {
@@ -556,6 +579,34 @@ mod tests {
             "---\n'<<': { key: value }\n---\n",
         ] {
             assert!(parse_document(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+    #[test]
+    fn project_links_reject_every_noncanonical_form() {
+        let valid =
+            "---\nname: Task\nstate: open\nprojects: [\"[[Todo/Projects/work]]\"]\ntags: []\n---\n";
+        assert_eq!(task(valid).projects, ["work"]);
+        for link in [
+            "[[Other/Projects/work]]",
+            "[[Todo/Projects/work|Work]]",
+            "[[Todo/Projects/work#heading]]",
+            "[[Todo/Projects/work^block]]",
+            "[[Todo/Projects/work.md]]",
+            "[[Todo/Projects/Work]]",
+            "[[Todo/Projects/nested/work]]",
+        ] {
+            let source = format!(
+                "---\nname: Task\nstate: open\nprojects: [{}]\ntags: []\n---\n",
+                serde_json::to_string(link).expect("quote link")
+            );
+            let error = parse_task(
+                ID,
+                Path::new("Tasks/example.md"),
+                source.as_bytes(),
+                &config(),
+            )
+            .expect_err("noncanonical link");
+            assert_eq!(error.code(), "invalid_project_link", "{link}");
         }
     }
 
@@ -598,5 +649,41 @@ mod tests {
             parse_project("work", Path::new("Projects/work.md"), &output).expect("reparse");
         assert_eq!(reparsed.extra_properties, project.extra_properties);
         assert_eq!(reparsed.body, "# Notes\n");
+    }
+    #[test]
+    fn checked_in_schema_matches_rust_core_fields() {
+        let schema: serde_json::Value =
+            serde_json::from_str(crate::config::EMBEDDED_SCHEMA).expect("valid JSON schema");
+        assert_eq!(schema["x-obsidian-todo-schema-version"], 1);
+
+        let task_schema = &schema["$defs"]["task"];
+        let required = task_schema["required"]
+            .as_array()
+            .expect("task required fields")
+            .iter()
+            .map(|value| value.as_str().expect("string field"))
+            .collect::<Vec<_>>();
+        assert_eq!(required, ["name", "state", "projects", "tags"]);
+        let properties = task_schema["properties"]
+            .as_object()
+            .expect("task properties");
+        for field in CORE_TASK_KEYS {
+            assert!(
+                properties.contains_key(field),
+                "missing schema field {field}"
+            );
+        }
+        assert_eq!(schema["$defs"]["name"]["pattern"], r"^[^\r\n]*\S[^\r\n]*$");
+        for record in ["task", "project"] {
+            assert_eq!(
+                schema["$defs"][record]["propertyNames"]["not"]["const"],
+                "id"
+            );
+        }
+
+        assert_eq!(
+            schema["$defs"]["project"]["required"],
+            serde_json::json!(["name"])
+        );
     }
 }

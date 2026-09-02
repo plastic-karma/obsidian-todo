@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn validates_tags_without_renaming_unicode_or_case() {
-        for valid in ["Finance", "nested/review", "日本語"] {
+        for valid in ["Finance", "nested/review", "hash#inside", "日本語"] {
             assert!(validate_tag(valid).is_ok(), "{valid}");
         }
         for invalid in ["", "#tag", "two words", "comma,tag", "[[link]]", "line\n"] {

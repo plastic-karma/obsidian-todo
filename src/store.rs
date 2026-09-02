@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -40,8 +41,8 @@ pub(crate) struct FileSnapshot {
 }
 
 impl FileSnapshot {
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.bytes
+    fn take_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.bytes)
     }
 }
 
@@ -80,8 +81,21 @@ impl Store {
                 .with_path(CONFIG_PATH)
         })?;
         let config = Config::parse(&source)?;
-        validate_managed_directory_on_disk(&root, &config.tasks_path()?)?;
-        validate_managed_directory_on_disk(&root, &config.projects_path()?)?;
+        let tasks_path = config.tasks_path()?;
+        let projects_path = config.projects_path()?;
+        validate_managed_directory_on_disk(&root, &tasks_path)?;
+        validate_managed_directory_on_disk(&root, &projects_path)?;
+        if fs::canonicalize(root.join(&tasks_path))
+            .and_then(|tasks| {
+                fs::canonicalize(root.join(&projects_path)).map(|projects| tasks == projects)
+            })
+            .map_err(|source| Error::io("compare the managed directories", &root, &source))?
+        {
+            return Err(Error::validation(
+                "managed_paths_not_distinct",
+                "Tasks and projects directories must be distinct",
+            ));
+        }
         validate_schema(&root, config.schema_version)?;
         Ok(Self { root, config })
     }
@@ -151,20 +165,37 @@ impl Store {
                     ),
                 ));
             }
-            let snapshot = self.read_snapshot(&relative, MAX_RECORD_BYTES as u64, "task")?;
-            let task = parse_task(&id, &relative, snapshot.bytes(), &self.config)
+            let mut snapshot = self.read_snapshot(&relative, MAX_RECORD_BYTES as u64, "task")?;
+            let source = snapshot.take_bytes();
+            let task = parse_task(&id, &relative, &source, &self.config)
                 .map_err(|error| error_with_path(error, &relative))?;
             tasks.push(StoredTask { task, snapshot });
         }
         Ok(tasks)
+    }
+    pub(crate) fn task_ids_unlocked(&self) -> Result<HashSet<String>> {
+        let candidates = self.task_candidates()?;
+        let mut ids = HashSet::with_capacity(candidates.len());
+        for (id, relative) in candidates {
+            let normalized = id.to_ascii_uppercase();
+            if !ids.insert(normalized.clone()) {
+                return Err(Error::validation(
+                    "duplicate_task_id",
+                    format!("Task ID {normalized} appears more than once"),
+                )
+                .with_path(relative));
+            }
+        }
+        Ok(ids)
     }
 
     pub(crate) fn load_all_projects_unlocked(&self) -> Result<Vec<StoredProject>> {
         let candidates = self.project_candidates()?;
         let mut projects = Vec::with_capacity(candidates.len());
         for (slug, relative) in candidates {
-            let snapshot = self.read_snapshot(&relative, MAX_RECORD_BYTES as u64, "project")?;
-            let project = parse_project(&slug, &relative, snapshot.bytes())
+            let mut snapshot = self.read_snapshot(&relative, MAX_RECORD_BYTES as u64, "project")?;
+            let source = snapshot.take_bytes();
+            let project = parse_project(&slug, &relative, &source)
                 .map_err(|error| error_with_path(error, &relative))?;
             projects.push(StoredProject { project, snapshot });
         }
@@ -184,8 +215,9 @@ impl Store {
                 format!("No task matches ID prefix {prefix}"),
             )),
             [(id, relative)] => {
-                let snapshot = self.read_snapshot(relative, MAX_RECORD_BYTES as u64, "task")?;
-                let task = parse_task(id, relative, snapshot.bytes(), &self.config)
+                let mut snapshot = self.read_snapshot(relative, MAX_RECORD_BYTES as u64, "task")?;
+                let source = snapshot.take_bytes();
+                let task = parse_task(id, relative, &source, &self.config)
                     .map_err(|error| error_with_path(error, relative))?;
                 Ok(StoredTask { task, snapshot })
             }
@@ -214,8 +246,9 @@ impl Store {
             )
             .with_path(relative));
         }
-        let snapshot = self.read_snapshot(&relative, MAX_RECORD_BYTES as u64, "project")?;
-        let project = parse_project(slug, &relative, snapshot.bytes())
+        let mut snapshot = self.read_snapshot(&relative, MAX_RECORD_BYTES as u64, "project")?;
+        let source = snapshot.take_bytes();
+        let project = parse_project(slug, &relative, &source)
             .map_err(|error| error_with_path(error, &relative))?;
         Ok(StoredProject { project, snapshot })
     }
@@ -242,6 +275,12 @@ impl Store {
         let parent = snapshot.path.parent().ok_or_else(|| {
             Error::validation("invalid_path", "Record path has no parent directory")
         })?;
+        ensure_real_directory(
+            &self.root,
+            snapshot.relative_path.parent().ok_or_else(|| {
+                Error::validation("invalid_path", "Record path has no parent directory")
+            })?,
+        )?;
         let mut temporary = NamedTempFile::new_in(parent).map_err(|source| {
             Error::io("create an atomic-write temporary file", parent, &source)
         })?;
@@ -278,6 +317,12 @@ impl Store {
 
     pub(crate) fn delete(&self, snapshot: &FileSnapshot) -> Result<()> {
         self.ensure_unchanged(snapshot)?;
+        ensure_real_directory(
+            &self.root,
+            snapshot.relative_path.parent().ok_or_else(|| {
+                Error::validation("invalid_path", "Record path has no parent directory")
+            })?,
+        )?;
         let metadata = fs::symlink_metadata(&snapshot.path).map_err(|source| {
             Error::io("inspect a record before deletion", &snapshot.path, &source)
         })?;
@@ -300,7 +345,7 @@ impl Store {
         &self,
         operation: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
-        let file = self.open_lock_file()?;
+        let file = self.open_lock_file(true)?;
         FileExt::lock_exclusive(&file).map_err(|source| {
             Error::io(
                 "acquire the store's exclusive advisory lock",
@@ -323,7 +368,7 @@ impl Store {
     }
 
     pub(crate) fn with_shared_lock<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
-        let file = self.open_lock_file()?;
+        let file = self.open_lock_file(false)?;
         FileExt::lock_shared(&file).map_err(|source| {
             Error::io(
                 "acquire the store's shared advisory lock",
@@ -347,9 +392,14 @@ impl Store {
 
     fn task_candidates(&self) -> Result<Vec<(String, PathBuf)>> {
         let tasks_directory = self.config.tasks_path()?;
+        ensure_real_directory(&self.root, &tasks_directory)?;
         let absolute = self.root.join(&tasks_directory);
         let mut candidates = Vec::new();
-        for entry in WalkDir::new(&absolute).follow_links(false).into_iter() {
+        for entry in WalkDir::new(&absolute)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| entry.depth() == 0 || !is_hidden_name(entry.file_name()))
+        {
             let entry = entry.map_err(|source| {
                 Error::validation(
                     "task_scan_failed",
@@ -405,12 +455,14 @@ impl Store {
 
     fn project_candidates(&self) -> Result<Vec<(String, PathBuf)>> {
         let projects_directory = self.config.projects_path()?;
+        ensure_real_directory(&self.root, &projects_directory)?;
         let absolute = self.root.join(&projects_directory);
         let mut candidates = Vec::new();
         for entry in WalkDir::new(&absolute)
             .min_depth(1)
             .follow_links(false)
             .into_iter()
+            .filter_entry(|entry| entry.depth() == 0 || !is_hidden_name(entry.file_name()))
         {
             let entry = entry.map_err(|source| {
                 Error::validation(
@@ -483,6 +535,10 @@ impl Store {
         let parent = absolute.parent().ok_or_else(|| {
             Error::validation("invalid_path", "Record path has no parent directory")
         })?;
+        let parent_relative = relative.parent().ok_or_else(|| {
+            Error::validation("invalid_path", "Record path has no parent directory")
+        })?;
+        ensure_real_directory(&self.root, parent_relative)?;
         let mut temporary = NamedTempFile::new_in(parent)
             .map_err(|source| Error::io("create a new-record temporary file", parent, &source))?;
         temporary
@@ -560,18 +616,18 @@ impl Store {
         Ok(())
     }
 
-    fn open_lock_file(&self) -> Result<File> {
+    fn open_lock_file(&self, writable: bool) -> Result<File> {
         let path = self.root.join(CONFIG_PATH);
-        open_options_nofollow(true)
-            .read(true)
-            .write(true)
+        let mut options = open_options_nofollow();
+        options.read(true).write(writable);
+        options
             .open(&path)
             .map_err(|source| Error::io("open the store configuration lock", &path, &source))
     }
 }
 
 fn open_regular_nofollow(path: &Path, relative: &Path) -> Result<File> {
-    let file = open_options_nofollow(false)
+    let file = open_options_nofollow()
         .read(true)
         .open(path)
         .map_err(|source| Error::io("open a record without following symlinks", path, &source))?;
@@ -587,7 +643,7 @@ fn open_regular_nofollow(path: &Path, relative: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn open_options_nofollow(_writing: bool) -> OpenOptions {
+fn open_options_nofollow() -> OpenOptions {
     let mut options = OpenOptions::new();
     #[cfg(unix)]
     {
@@ -595,6 +651,10 @@ fn open_options_nofollow(_writing: bool) -> OpenOptions {
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     }
     options
+}
+
+fn is_hidden_name(name: &OsStr) -> bool {
+    name.as_encoded_bytes().first() == Some(&b'.')
 }
 
 fn content_hash(bytes: &[u8]) -> [u8; 32] {
@@ -680,8 +740,20 @@ fn ensure_regular_file(path: &Path, display_path: &str) -> Result<()> {
 }
 
 fn read_bounded(path: &Path, limit: u64, description: &str) -> Result<Vec<u8>> {
-    let metadata = fs::metadata(path)
+    let mut file = open_options_nofollow()
+        .read(true)
+        .open(path)
+        .map_err(|source| Error::io(&format!("open the {description}"), path, &source))?;
+    let metadata = file
+        .metadata()
         .map_err(|source| Error::io(&format!("inspect the {description}"), path, &source))?;
+    if !metadata.is_file() {
+        return Err(Error::validation(
+            "invalid_store_file",
+            format!("The {description} must be a regular file"),
+        )
+        .with_path(path));
+    }
     if metadata.len() > limit {
         return Err(Error::validation(
             "file_too_large",
@@ -690,8 +762,7 @@ fn read_bounded(path: &Path, limit: u64, description: &str) -> Result<Vec<u8>> {
         .with_path(path));
     }
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    File::open(path)
-        .and_then(|mut file| file.read_to_end(&mut bytes))
+    file.read_to_end(&mut bytes)
         .map_err(|source| Error::io(&format!("read the {description}"), path, &source))?;
     Ok(bytes)
 }
@@ -749,6 +820,13 @@ mod tests {
     use crate::commands::init::{initialize, InitOptions};
 
     use super::*;
+    const FIRST_ID: &str = "01K4B0ZSBZZV25T1K0D3TA8JHR";
+    const SECOND_ID: &str = "01K4B0ZSBZZV25T1K0D3TA8JHS";
+    const DISTINCT_ID: &str = "01J3B0ZSBZZV25T1K0D3TA8JHR";
+
+    fn task_record(name: &str) -> Vec<u8> {
+        format!("---\nname: {name}\nstate: open\nprojects: []\ntags: []\n---\n").into_bytes()
+    }
 
     fn initialized() -> TempDir {
         let temp = TempDir::new().expect("temp");
@@ -790,7 +868,7 @@ mod tests {
         let temp = initialized();
         let root = temp.path().join("Todo");
         let store = Store::open(&root).expect("open");
-        let id = "01K4B0ZSBZZV25T1K0D3TA8JHR";
+        let id = FIRST_ID;
         let original = b"---\nname: Original\nstate: open\nprojects: []\ntags: []\n---\nbody\n";
         let relative = store.create_task(id, original).expect("create");
         let snapshot = store
@@ -803,5 +881,56 @@ mod tests {
             .expect_err("concurrent edit");
         assert_eq!(error.code(), "concurrent_modification");
         assert_eq!(fs::read(root.join(relative)).expect("read"), external);
+        let task_entries = fs::read_dir(root.join("Tasks"))
+            .expect("list task directory")
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("task entries");
+        assert_eq!(task_entries.len(), 1, "temporary file was not removed");
+    }
+
+    #[test]
+    fn resolves_unique_absent_and_ambiguous_task_prefixes() {
+        let temp = initialized();
+        let store = Store::open(temp.path().join("Todo")).expect("open");
+        for (id, name) in [
+            (FIRST_ID, "First"),
+            (SECOND_ID, "Second"),
+            (DISTINCT_ID, "Distinct"),
+        ] {
+            store
+                .create_task(id, &task_record(name))
+                .expect("create task");
+        }
+
+        let unique = store
+            .resolve_task_unlocked("01j3b0")
+            .expect("case-insensitive unique prefix");
+        assert_eq!(unique.task.id, DISTINCT_ID);
+        let absent = store
+            .resolve_task_unlocked("01A000")
+            .expect_err("absent prefix");
+        assert_eq!(absent.code(), "task_not_found");
+        let ambiguous = store
+            .resolve_task_unlocked("01K4B0")
+            .expect_err("ambiguous prefix");
+        assert_eq!(ambiguous.code(), "ambiguous_task_id");
+        assert_eq!(ambiguous.exit_code(), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_reads_work_with_read_only_configuration() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = initialized();
+        let root = temp.path().join("Todo");
+        let config_path = root.join(CONFIG_PATH);
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o444))
+            .expect("make config read-only");
+        let store = Store::open(root).expect("open");
+        assert!(store
+            .list_tasks()
+            .expect("read with shared lock")
+            .is_empty());
     }
 }

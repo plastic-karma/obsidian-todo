@@ -110,15 +110,7 @@ pub fn add(store: &Store, request: &AddTask) -> Result<Task> {
         validate_name(&name, "name")?;
         let known_projects = known_projects(store)?;
         ensure_requested_projects(&request.projects, &known_projects)?;
-        let existing_tasks = store.load_all_tasks_unlocked()?;
-        let existing_ids = existing_tasks
-            .iter()
-            .map(|stored| stored.task.id.as_str())
-            .collect::<HashSet<_>>();
-        validate_task_references(
-            existing_tasks.iter().map(|stored| &stored.task),
-            &known_projects,
-        )?;
+        let existing_ids = store.task_ids_unlocked()?;
 
         for _ in 0..32 {
             let id = Ulid::new().to_string().to_ascii_uppercase();
@@ -634,6 +626,27 @@ mod tests {
 
     fn date(value: &str) -> NaiveDate {
         parse_date(value, "date").expect("date")
+    }
+
+    #[test]
+    fn task_view_keeps_stable_null_and_array_fields() {
+        let (_temp, store) = store();
+        let task = add(&store, &minimal("Minimal")).expect("add");
+        let value = serde_json::to_value(TaskView::from_task(&task, &store).expect("view"))
+            .expect("serialize view");
+        let object = value.as_object().expect("object");
+        assert_eq!(object.len(), 13);
+        for field in [
+            "due_date",
+            "recurrence",
+            "recurrence_from",
+            "last_completed_date",
+        ] {
+            assert!(object[field].is_null(), "{field}");
+        }
+        assert_eq!(object["projects"], serde_json::json!([]));
+        assert_eq!(object["tags"], serde_json::json!([]));
+        assert_eq!(object["extra_properties"], serde_json::json!({}));
     }
 
     #[test]

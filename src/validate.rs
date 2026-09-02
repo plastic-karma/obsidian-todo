@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::ffi::OsStr;
+use std::fs::{self, OpenOptions};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
@@ -75,21 +77,46 @@ pub fn validate_store(root: impl AsRef<Path>) -> ValidationReport {
         return ValidationReport::from_issues(issues, 0, 0);
     };
 
-    validate_managed_path_on_disk(
+    let tasks_path = validate_managed_path_on_disk(
         &root,
         &config.tasks_directory,
         "tasks_directory",
         &mut issues,
     );
-    validate_managed_path_on_disk(
+    let projects_path = validate_managed_path_on_disk(
         &root,
         &config.projects_directory,
         "projects_directory",
         &mut issues,
     );
+    let paths_overlap = matches!(
+        (&tasks_path, &projects_path),
+        (Some(tasks), Some(projects)) if tasks == projects
+    );
+    if paths_overlap && config.tasks_directory != config.projects_directory {
+        issues.push(
+            ValidationIssue::error(
+                "managed_paths_not_distinct",
+                "Tasks and projects directories resolve to the same path",
+            )
+            .at_path(".todo/config.toml"),
+        );
+    }
 
-    let (project_slugs, project_count) = validate_projects(&root, &config, &mut issues);
-    let task_count = validate_tasks(&root, &config, &project_slugs, &mut issues);
+    let (project_slugs, project_count) = if paths_overlap {
+        (HashSet::new(), 0)
+    } else if let Some(projects_path) = projects_path {
+        validate_projects(&root, &projects_path, &mut issues)
+    } else {
+        (HashSet::new(), 0)
+    };
+    let task_count = if paths_overlap {
+        0
+    } else if let Some(tasks_path) = tasks_path {
+        validate_tasks(&root, &tasks_path, &config, &project_slugs, &mut issues)
+    } else {
+        0
+    };
     ValidationReport::from_issues(issues, task_count, project_count)
 }
 
@@ -280,15 +307,15 @@ fn validate_managed_path_on_disk(
     configured: &str,
     field: &str,
     issues: &mut Vec<ValidationIssue>,
-) {
+) -> Option<PathBuf> {
     if validate_managed_directory(configured).is_err() {
-        return;
+        return None;
     }
     let relative = Path::new(configured);
     let mut current = root.to_path_buf();
     for component in relative.components() {
         let Component::Normal(component) = component else {
-            return;
+            return None;
         };
         current.push(component);
         match fs::symlink_metadata(&current) {
@@ -301,7 +328,7 @@ fn validate_managed_path_on_disk(
                     .at_path(relative)
                     .at_field(field),
                 );
-                return;
+                return None;
             }
             Ok(metadata) if !metadata.is_dir() => {
                 issues.push(
@@ -312,7 +339,7 @@ fn validate_managed_path_on_disk(
                     .at_path(relative)
                     .at_field(field),
                 );
-                return;
+                return None;
             }
             Ok(_) => {}
             Err(source) => {
@@ -324,28 +351,52 @@ fn validate_managed_path_on_disk(
                     .at_path(relative)
                     .at_field(field),
                 );
-                return;
+                return None;
             }
+        }
+    }
+    match fs::canonicalize(&current) {
+        Ok(path) if path.starts_with(root) => Some(path),
+        Ok(_) => {
+            issues.push(
+                ValidationIssue::error(
+                    "managed_path_escape",
+                    "Managed path resolves outside the store",
+                )
+                .at_path(relative)
+                .at_field(field),
+            );
+            None
+        }
+        Err(source) => {
+            issues.push(
+                ValidationIssue::error(
+                    "managed_path_unreadable",
+                    format!("Could not resolve configured managed directory: {source}"),
+                )
+                .at_path(relative)
+                .at_field(field),
+            );
+            None
         }
     }
 }
 
 fn validate_projects(
     root: &Path,
-    config: &Config,
+    directory: &Path,
     issues: &mut Vec<ValidationIssue>,
 ) -> (HashSet<String>, usize) {
-    let directory = root.join(&config.projects_directory);
     if !directory.is_dir() {
         return (HashSet::new(), 0);
     }
     let mut valid = HashSet::new();
     let mut count = 0;
-    for entry in WalkDir::new(&directory)
+    let mut entries = WalkDir::new(directory)
         .min_depth(1)
         .follow_links(false)
-        .into_iter()
-    {
+        .into_iter();
+    while let Some(entry) = entries.next() {
         let entry = match entry {
             Ok(entry) => entry,
             Err(source) => {
@@ -354,12 +405,25 @@ fn validate_projects(
                         "project_scan_failed",
                         format!("Could not scan projects: {source}"),
                     )
-                    .at_path(&config.projects_directory),
+                    .at_path(relative_to(root, directory)),
                 );
                 continue;
             }
         };
         let relative = relative_to(root, entry.path());
+        if is_hidden_name(entry.file_name()) {
+            issues.push(
+                ValidationIssue::warning(
+                    "unexpected_file",
+                    "Ignored hidden file or directory in projects directory",
+                )
+                .at_path(relative),
+            );
+            if entry.file_type().is_dir() {
+                entries.skip_current_dir();
+            }
+            continue;
+        }
         if entry.file_type().is_symlink() {
             issues.push(
                 ValidationIssue::error("record_symlink", "Managed records must not be symlinks")
@@ -426,21 +490,21 @@ fn validate_projects(
 
 fn validate_tasks(
     root: &Path,
+    directory: &Path,
     config: &Config,
     projects: &HashSet<String>,
     issues: &mut Vec<ValidationIssue>,
 ) -> usize {
-    let directory = root.join(&config.tasks_directory);
     if !directory.is_dir() {
         return 0;
     }
     let mut ids = HashMap::<String, PathBuf>::new();
     let mut count = 0;
-    for entry in WalkDir::new(&directory)
+    let mut entries = WalkDir::new(directory)
         .min_depth(1)
         .follow_links(false)
-        .into_iter()
-    {
+        .into_iter();
+    while let Some(entry) = entries.next() {
         let entry = match entry {
             Ok(entry) => entry,
             Err(source) => {
@@ -449,12 +513,25 @@ fn validate_tasks(
                         "task_scan_failed",
                         format!("Could not scan tasks: {source}"),
                     )
-                    .at_path(&config.tasks_directory),
+                    .at_path(relative_to(root, directory)),
                 );
                 continue;
             }
         };
         let relative = relative_to(root, entry.path());
+        if is_hidden_name(entry.file_name()) {
+            issues.push(
+                ValidationIssue::warning(
+                    "unexpected_file",
+                    "Ignored hidden file or directory in tasks directory",
+                )
+                .at_path(relative),
+            );
+            if entry.file_type().is_dir() {
+                entries.skip_current_dir();
+            }
+            continue;
+        }
         if entry.file_type().is_symlink() {
             issues.push(
                 ValidationIssue::error("record_symlink", "Managed records must not be symlinks")
@@ -530,11 +607,7 @@ fn validate_tasks(
     count
 }
 
-fn read_regular_file(
-    absolute: &Path,
-    relative: &Path,
-    limit: u64,
-) -> IssueResult<Vec<u8>> {
+fn read_regular_file(absolute: &Path, relative: &Path, limit: u64) -> IssueResult<Vec<u8>> {
     let metadata = fs::symlink_metadata(absolute).map_err(|source| {
         Box::new(
             ValidationIssue::error(
@@ -550,18 +623,51 @@ fn read_regular_file(
                 .at_path(relative),
         ));
     }
-    if metadata.len() > limit {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(absolute).map_err(|source| {
+        Box::new(
+            ValidationIssue::error("file_unreadable", format!("Could not open file: {source}"))
+                .at_path(relative),
+        )
+    })?;
+    let metadata = file.metadata().map_err(|source| {
+        Box::new(
+            ValidationIssue::error(
+                "file_unreadable",
+                format!("Could not inspect open file: {source}"),
+            )
+            .at_path(relative),
+        )
+    })?;
+    if !metadata.is_file() {
         return Err(Box::new(
-            ValidationIssue::error("file_too_large", format!("File exceeds the {limit}-byte limit"))
+            ValidationIssue::error("invalid_store_file", "Expected a regular file")
                 .at_path(relative),
         ));
     }
-    fs::read(absolute).map_err(|source| {
+    if metadata.len() > limit {
+        return Err(Box::new(
+            ValidationIssue::error(
+                "file_too_large",
+                format!("File exceeds the {limit}-byte limit"),
+            )
+            .at_path(relative),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.read_to_end(&mut bytes).map_err(|source| {
         Box::new(
             ValidationIssue::error("file_unreadable", format!("Could not read file: {source}"))
                 .at_path(relative),
         )
-    })
+    })?;
+    Ok(bytes)
 }
 
 fn issue_from_error(error: Error, fallback_path: &Path) -> ValidationIssue {
@@ -577,6 +683,10 @@ fn issue_from_error(error: Error, fallback_path: &Path) -> ValidationIssue {
         issue = issue.at_location(line, column);
     }
     issue
+}
+
+fn is_hidden_name(name: &OsStr) -> bool {
+    name.as_encoded_bytes().first() == Some(&b'.')
 }
 
 fn relative_to(root: &Path, path: &Path) -> PathBuf {
@@ -653,5 +763,57 @@ mod tests {
                 .count(),
             2
         );
+    }
+    #[test]
+    fn invalid_managed_path_is_never_scanned_outside_store() {
+        let (temp, root) = initialized();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).expect("outside directory");
+        fs::write(
+            outside.join("01K4B0ZSBZZV25T1K0D3TA8JHR.md"),
+            b"---\nname: Outside\nstate: open\nprojects: []\ntags: []\n---\n",
+        )
+        .expect("outside task");
+        let config_path = root.join(CONFIG_PATH);
+        let mut config: toml::Value =
+            toml::from_str(&fs::read_to_string(&config_path).expect("config")).expect("TOML");
+        config["tasks_directory"] = toml::Value::String(outside.to_string_lossy().into_owned());
+        fs::write(
+            config_path,
+            toml::to_string_pretty(&config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let report = validate_store(&root);
+        assert_eq!(report.tasks, 0);
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "invalid_managed_path"));
+        assert!(report
+            .issues
+            .iter()
+            .all(|issue| issue.path.as_deref() != Some(outside.as_path())));
+    }
+
+    #[test]
+    fn normal_scans_ignore_hidden_records_and_validate_warns() {
+        let (_temp, root) = initialized();
+        let record = b"---\nname: Hidden\nstate: open\nprojects: []\ntags: []\n---\n";
+        fs::write(root.join("Tasks/.editor.md"), record).expect("hidden task");
+        fs::write(
+            root.join("Projects/.editor.md"),
+            b"---\nname: Hidden\n---\n",
+        )
+        .expect("hidden project");
+
+        let store = crate::store::Store::open(&root).expect("open store");
+        assert!(store.list_tasks().expect("tasks").is_empty());
+        assert!(store.list_projects().expect("projects").is_empty());
+        let report = validate_store(root);
+        assert!(report.valid);
+        assert_eq!(report.tasks, 0);
+        assert_eq!(report.projects, 0);
+        assert_eq!(report.warnings, 2);
     }
 }

@@ -185,11 +185,18 @@ impl Error {
                 format!("Validation failed with {errors} error(s) and {warnings} warning(s)")
             }
         };
-        let kind = if issues
-            .iter()
-            .any(|issue| issue.code == "unsupported_schema")
-        {
+        let kind = if issues.iter().any(|issue| {
+            matches!(
+                issue.code.as_str(),
+                "unsupported_schema" | "unsupported_recurrence"
+            )
+        }) {
             ErrorKind::Unsupported
+        } else if issues
+            .iter()
+            .any(|issue| issue.code == "unresolved_conflict")
+        {
+            ErrorKind::Concurrent
         } else {
             ErrorKind::Validation
         };
@@ -273,3 +280,31 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_validation_preserves_specialized_exit_classes() {
+        for (code, exit) in [
+            ("invalid_name", 5),
+            ("unresolved_conflict", 6),
+            ("unsupported_schema", 7),
+            ("unsupported_recurrence", 7),
+        ] {
+            let error = Error::from_issues(vec![ValidationIssue::error(code, "problem")]);
+            assert_eq!(error.code(), "validation_failed");
+            assert_eq!(error.exit_code(), exit, "{code}");
+        }
+    }
+
+    #[test]
+    fn unsupported_errors_take_precedence_in_mixed_reports() {
+        let error = Error::from_issues(vec![
+            ValidationIssue::error("unresolved_conflict", "conflict"),
+            ValidationIssue::error("unsupported_schema", "schema"),
+        ]);
+        assert_eq!(error.exit_code(), 7);
+    }
+}

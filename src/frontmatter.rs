@@ -212,7 +212,7 @@ pub fn serialize_task(task: &Task, config: &Config) -> Result<Vec<u8>> {
     serialize_extras(&mut output, &task.extra_properties)?;
     output.push_str("---\n");
     output.push_str(&task.body);
-    Ok(output.into_bytes())
+    finish_record(output, &task.path)
 }
 
 pub fn serialize_project(project: &Project) -> Result<Vec<u8>> {
@@ -226,7 +226,7 @@ pub fn serialize_project(project: &Project) -> Result<Vec<u8>> {
     serialize_extras(&mut output, &project.extra_properties)?;
     output.push_str("---\n");
     output.push_str(&project.body);
-    Ok(output.into_bytes())
+    finish_record(output, &project.path)
 }
 
 fn first_line_end(bytes: &[u8]) -> Option<usize> {
@@ -502,6 +502,17 @@ fn serialize_extras(output: &mut String, properties: &Mapping) -> Result<()> {
     Ok(())
 }
 
+fn finish_record(output: String, path: &Path) -> Result<Vec<u8>> {
+    if output.len() > MAX_RECORD_BYTES {
+        return Err(Error::validation(
+            "record_too_large",
+            format!("Markdown record exceeds the {MAX_RECORD_BYTES}-byte limit"),
+        )
+        .with_path(path));
+    }
+    Ok(output.into_bytes())
+}
+
 fn fmt_error(_: std::fmt::Error) -> Error {
     Error::validation(
         "record_serialization_failed",
@@ -684,6 +695,23 @@ mod tests {
         assert_eq!(
             schema["$defs"]["project"]["required"],
             serde_json::json!(["name"])
+        );
+    }
+    #[test]
+    fn oversized_input_and_serialized_records_are_rejected() {
+        let input = vec![b'x'; MAX_RECORD_BYTES + 1];
+        assert_eq!(
+            parse_document(&input).expect_err("oversized input").code(),
+            "record_too_large"
+        );
+
+        let mut parsed = task("---\nname: Task\nstate: open\nprojects: []\ntags: []\n---\n");
+        parsed.body = "x".repeat(MAX_RECORD_BYTES);
+        assert_eq!(
+            serialize_task(&parsed, &config())
+                .expect_err("oversized output")
+                .code(),
+            "record_too_large"
         );
     }
 }

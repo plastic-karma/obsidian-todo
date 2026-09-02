@@ -345,7 +345,7 @@ impl Store {
         &self,
         operation: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
-        let file = self.open_lock_file(true)?;
+        let file = self.open_lock_file()?;
         FileExt::lock_exclusive(&file).map_err(|source| {
             Error::io(
                 "acquire the store's exclusive advisory lock",
@@ -368,7 +368,7 @@ impl Store {
     }
 
     pub(crate) fn with_shared_lock<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
-        let file = self.open_lock_file(false)?;
+        let file = self.open_lock_file()?;
         FileExt::lock_shared(&file).map_err(|source| {
             Error::io(
                 "acquire the store's shared advisory lock",
@@ -616,10 +616,10 @@ impl Store {
         Ok(())
     }
 
-    fn open_lock_file(&self, writable: bool) -> Result<File> {
+    fn open_lock_file(&self) -> Result<File> {
         let path = self.root.join(CONFIG_PATH);
         let mut options = open_options_nofollow();
-        options.read(true).write(writable);
+        options.read(true);
         options
             .open(&path)
             .map_err(|source| Error::io("open the store configuration lock", &path, &source))
@@ -919,7 +919,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn shared_reads_work_with_read_only_configuration() {
+    fn shared_and_exclusive_operations_work_with_read_only_configuration() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = initialized();
@@ -932,5 +932,9 @@ mod tests {
             .list_tasks()
             .expect("read with shared lock")
             .is_empty());
+        store
+            .with_exclusive_lock(|| store.create_task(FIRST_ID, &task_record("Writable")))
+            .expect("mutate with exclusive lock");
+        assert_eq!(store.list_tasks().expect("read created task").len(), 1);
     }
 }

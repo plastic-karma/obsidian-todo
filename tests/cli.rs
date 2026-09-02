@@ -529,7 +529,7 @@ fn errors_have_stable_exit_codes_json_shape_and_leave_no_temporary_files() {
     let validation = json_failure(
         vault.path(),
         &["--root", "Todo", "validate"],
-        5,
+        6,
         "validation_failed",
     );
     assert!(validation["error"]["issues"]

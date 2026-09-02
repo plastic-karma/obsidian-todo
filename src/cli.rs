@@ -13,6 +13,7 @@ use crate::commands::project::{self, CreateProject, EditProject, ProjectSummary,
 use crate::commands::task::{self, AddTask, EditTask, TaskFilter, TaskView};
 use crate::discovery::{discover, DiscoveryOptions};
 use crate::error::{Error, Result};
+use crate::frontmatter::MAX_RECORD_BYTES;
 use crate::model::{Clock, SystemClock, Task};
 use crate::output::{write_error, write_success, ColorChoice, CommandOutput, OutputFormat};
 use crate::recurrence::{parse_date, RecurrenceMode, RecurrenceRule};
@@ -639,17 +640,31 @@ fn read_body(arguments: &BodyArguments) -> Result<Option<String>> {
         return Ok(None);
     };
     let bytes = if path == Path::new("-") {
-        let mut bytes = Vec::new();
-        io::stdin()
-            .read_to_end(&mut bytes)
-            .map_err(|source| Error::io("read a body from standard input", path, &source))?;
-        bytes
+        read_bounded_body(io::stdin().lock(), path, "standard input")?
     } else {
-        fs::read(path).map_err(|source| Error::io("read a body file", path, &source))?
+        let file =
+            fs::File::open(path).map_err(|source| Error::io("open a body file", path, &source))?;
+        read_bounded_body(file, path, "body file")?
     };
     String::from_utf8(bytes).map(Some).map_err(|_| {
         Error::validation("invalid_body_utf8", "Task and project bodies must be UTF-8")
+            .with_path(path)
     })
+}
+fn read_bounded_body(reader: impl Read, path: &Path, description: &str) -> Result<Vec<u8>> {
+    let mut reader = reader.take((MAX_RECORD_BYTES + 1) as u64);
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|source| Error::io(&format!("read a body from {description}"), path, &source))?;
+    if bytes.len() > MAX_RECORD_BYTES {
+        return Err(Error::validation(
+            "body_too_large",
+            format!("Body exceeds the {MAX_RECORD_BYTES}-byte record limit"),
+        )
+        .with_path(path));
+    }
+    Ok(bytes)
 }
 
 fn parse_cli_date(value: &str) -> std::result::Result<NaiveDate, String> {

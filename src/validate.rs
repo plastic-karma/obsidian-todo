@@ -11,6 +11,7 @@ use crate::frontmatter::{parse_project, parse_task, MAX_RECORD_BYTES};
 use crate::model::{validate_project_slug, validate_task_id};
 
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+type IssueResult<T> = std::result::Result<T, Box<ValidationIssue>>;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ValidationReport {
@@ -63,7 +64,7 @@ pub fn validate_store(root: impl AsRef<Path>) -> ValidationReport {
     let root = match validate_root(supplied_root) {
         Ok(root) => root,
         Err(issue) => {
-            issues.push(issue);
+            issues.push(*issue);
             return ValidationReport::from_issues(issues, 0, 0);
         }
     };
@@ -92,27 +93,30 @@ pub fn validate_store(root: impl AsRef<Path>) -> ValidationReport {
     ValidationReport::from_issues(issues, task_count, project_count)
 }
 
-fn validate_root(root: &Path) -> std::result::Result<PathBuf, ValidationIssue> {
+fn validate_root(root: &Path) -> IssueResult<PathBuf> {
     let metadata = fs::symlink_metadata(root).map_err(|source| {
-        ValidationIssue::error(
-            "store_not_found",
-            format!("Could not inspect the store root: {source}"),
+        Box::new(
+            ValidationIssue::error(
+                "store_not_found",
+                format!("Could not inspect the store root: {source}"),
+            )
+            .at_path("."),
         )
-        .at_path(".")
     })?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(ValidationIssue::error(
-            "invalid_store_root",
-            "Store root must be a real directory",
-        )
-        .at_path("."));
+        return Err(Box::new(
+            ValidationIssue::error("invalid_store_root", "Store root must be a real directory")
+                .at_path("."),
+        ));
     }
     fs::canonicalize(root).map_err(|source| {
-        ValidationIssue::error(
-            "invalid_store_root",
-            format!("Could not resolve the store root: {source}"),
+        Box::new(
+            ValidationIssue::error(
+                "invalid_store_root",
+                format!("Could not resolve the store root: {source}"),
+            )
+            .at_path("."),
         )
-        .at_path(".")
     })
 }
 
@@ -142,7 +146,7 @@ fn load_config_for_validation(root: &Path, issues: &mut Vec<ValidationIssue>) ->
     let bytes = match read_regular_file(&path, Path::new(CONFIG_PATH), MAX_CONFIG_BYTES) {
         Ok(bytes) => bytes,
         Err(issue) => {
-            issues.push(issue);
+            issues.push(*issue);
             return None;
         }
     };
@@ -244,7 +248,7 @@ fn validate_schema(root: &Path, issues: &mut Vec<ValidationIssue>) {
     let bytes = match read_regular_file(&path, Path::new(SCHEMA_PATH), MAX_CONFIG_BYTES) {
         Ok(bytes) => bytes,
         Err(issue) => {
-            issues.push(issue);
+            issues.push(*issue);
             return;
         }
     };
@@ -408,13 +412,13 @@ fn validate_projects(
         match read_regular_file(entry.path(), &relative, MAX_RECORD_BYTES as u64).and_then(
             |bytes| {
                 parse_project(slug, &relative, &bytes)
-                    .map_err(|error| issue_from_error(error, &relative))
+                    .map_err(|error| Box::new(issue_from_error(error, &relative)))
             },
         ) {
             Ok(_) => {
                 valid.insert(slug.to_owned());
             }
-            Err(issue) => issues.push(issue),
+            Err(issue) => issues.push(*issue),
         }
     }
     (valid, count)
@@ -500,7 +504,7 @@ fn validate_tasks(
         match read_regular_file(entry.path(), &relative, MAX_RECORD_BYTES as u64).and_then(
             |bytes| {
                 parse_task(id, &relative, &bytes, config)
-                    .map_err(|error| issue_from_error(error, &relative))
+                    .map_err(|error| Box::new(issue_from_error(error, &relative)))
             },
         ) {
             Ok(task) => {
@@ -520,7 +524,7 @@ fn validate_tasks(
                     }
                 }
             }
-            Err(issue) => issues.push(issue),
+            Err(issue) => issues.push(*issue),
         }
     }
     count
@@ -530,30 +534,33 @@ fn read_regular_file(
     absolute: &Path,
     relative: &Path,
     limit: u64,
-) -> std::result::Result<Vec<u8>, ValidationIssue> {
+) -> IssueResult<Vec<u8>> {
     let metadata = fs::symlink_metadata(absolute).map_err(|source| {
-        ValidationIssue::error(
-            "file_unreadable",
-            format!("Could not inspect file: {source}"),
+        Box::new(
+            ValidationIssue::error(
+                "file_unreadable",
+                format!("Could not inspect file: {source}"),
+            )
+            .at_path(relative),
         )
-        .at_path(relative)
     })?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(
+        return Err(Box::new(
             ValidationIssue::error("invalid_store_file", "Expected a regular file")
                 .at_path(relative),
-        );
+        ));
     }
     if metadata.len() > limit {
-        return Err(ValidationIssue::error(
-            "file_too_large",
-            format!("File exceeds the {limit}-byte limit"),
-        )
-        .at_path(relative));
+        return Err(Box::new(
+            ValidationIssue::error("file_too_large", format!("File exceeds the {limit}-byte limit"))
+                .at_path(relative),
+        ));
     }
     fs::read(absolute).map_err(|source| {
-        ValidationIssue::error("file_unreadable", format!("Could not read file: {source}"))
-            .at_path(relative)
+        Box::new(
+            ValidationIssue::error("file_unreadable", format!("Could not read file: {source}"))
+                .at_path(relative),
+        )
     })
 }
 

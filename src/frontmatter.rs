@@ -194,10 +194,9 @@ pub fn serialize_task(task: &Task, config: &Config) -> Result<Vec<u8>> {
     write_string_list(
         &mut output,
         projects.iter().map(|slug| config.project_link(slug)),
-        true,
     )?;
     output.push_str("tags:");
-    write_string_list(&mut output, tags.iter().cloned(), false)?;
+    write_string_list(&mut output, tags.iter().cloned())?;
     if let Some(date) = task.due_date {
         writeln!(output, "due_date: {}", date.format("%Y-%m-%d")).map_err(fmt_error)?;
     }
@@ -462,7 +461,6 @@ fn quoted(value: &str) -> Result<String> {
 fn write_string_list(
     output: &mut String,
     values: impl IntoIterator<Item = String>,
-    quote_all: bool,
 ) -> Result<()> {
     let values = values.into_iter().collect::<Vec<_>>();
     if values.is_empty() {
@@ -471,11 +469,7 @@ fn write_string_list(
     }
     output.push('\n');
     for value in values {
-        let rendered = if quote_all {
-            quoted(&value)?
-        } else {
-            quoted(&value)?
-        };
+        let rendered = quoted(&value)?;
         writeln!(output, "  - {rendered}").map_err(fmt_error)?;
     }
     Ok(())

@@ -2,7 +2,7 @@
 name = "obsidian-todo"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.81"
+rust-version = "1.82"
 description = "Local-first structured todo notes for Obsidian vaults"
 license = "MIT OR Apache-2.0"
 
@@ -10,8 +10,13 @@ license = "MIT OR Apache-2.0"
 name = "obsidian_todo"
 path = "src/lib.rs"
 
+[[bin]]
+name = "otodo"
+path = "src/main.rs"
+
 [dependencies]
 chrono = { version = "0.4.38", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4.5.23", features = ["derive"] }
 fs2 = "0.4.3"
 libc = "0.2.169"
 serde = { version = "1.0.216", features = ["derive"] }
@@ -24,7 +29,10 @@ ulid = "1.1.4"
 walkdir = "2.5.0"
 
 [dev-dependencies]
+assert_cmd = "2.0.16"
 tempfile = "3.14.0"
+
+
 
 [profile.release]
 lto = "thin"
@@ -36,7 +44,6 @@ unsafe_code = "forbid"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
-pedantic = { level = "deny", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"

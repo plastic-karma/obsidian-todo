@@ -43,7 +43,6 @@ pub struct ValidationIssue {
     pub severity: IssueSeverity,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueSeverity {
@@ -104,6 +103,11 @@ impl ValidationIssue {
 pub struct Error {
     kind: ErrorKind,
     code: &'static str,
+    details: Box<ErrorDetails>,
+}
+
+#[derive(Debug)]
+struct ErrorDetails {
     message: String,
     path: Option<PathBuf>,
     field: Option<String>,
@@ -118,12 +122,14 @@ impl Error {
         Self {
             kind,
             code,
-            message: message.into(),
-            path: None,
-            field: None,
-            line: None,
-            column: None,
-            issues: Vec::new(),
+            details: Box::new(ErrorDetails {
+                message: message.into(),
+                path: None,
+                field: None,
+                line: None,
+                column: None,
+                issues: Vec::new(),
+            }),
         }
     }
 
@@ -180,26 +186,26 @@ impl Error {
             }
         };
         let mut error = Self::validation("validation_failed", message);
-        error.issues = issues;
+        error.details.issues = issues;
         error
     }
 
     #[must_use]
     pub fn with_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.path = Some(path.into());
+        self.details.path = Some(path.into());
         self
     }
 
     #[must_use]
     pub fn with_field(mut self, field: impl Into<String>) -> Self {
-        self.field = Some(field.into());
+        self.details.field = Some(field.into());
         self
     }
 
     #[must_use]
-    pub const fn with_location(mut self, line: usize, column: usize) -> Self {
-        self.line = Some(line);
-        self.column = Some(column);
+    pub fn with_location(mut self, line: usize, column: usize) -> Self {
+        self.details.line = Some(line);
+        self.details.column = Some(column);
         self
     }
 
@@ -215,32 +221,32 @@ impl Error {
 
     #[must_use]
     pub fn message(&self) -> &str {
-        &self.message
+        &self.details.message
     }
 
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
+        self.details.path.as_deref()
     }
 
     #[must_use]
     pub fn field(&self) -> Option<&str> {
-        self.field.as_deref()
+        self.details.field.as_deref()
     }
 
     #[must_use]
     pub const fn line(&self) -> Option<usize> {
-        self.line
+        self.details.line
     }
 
     #[must_use]
     pub const fn column(&self) -> Option<usize> {
-        self.column
+        self.details.column
     }
 
     #[must_use]
     pub fn issues(&self) -> &[ValidationIssue] {
-        &self.issues
+        &self.details.issues
     }
 
     #[must_use]
@@ -251,10 +257,10 @@ impl Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(path) = &self.path {
+        if let Some(path) = &self.details.path {
             write!(formatter, "{}: ", path.display())?;
         }
-        write!(formatter, "{}", self.message)
+        write!(formatter, "{}", self.details.message)
     }
 }
 

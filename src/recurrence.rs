@@ -220,10 +220,11 @@ impl RecurrenceRule {
     }
 
     fn next_weekly(&self, anchor: NaiveDate, threshold: NaiveDate) -> Result<NaiveDate> {
+        let default_weekday = anchor.weekday();
         let weekdays = if self.by_day.is_empty() {
-            vec![anchor.weekday()]
+            std::slice::from_ref(&default_weekday)
         } else {
-            self.by_day.clone()
+            &self.by_day
         };
         let anchor_week = anchor
             .checked_sub_days(Days::new(u64::from(
@@ -240,7 +241,7 @@ impl RecurrenceRule {
             let week = anchor_week
                 .checked_add_days(Days::new(week_offset))
                 .ok_or_else(date_overflow)?;
-            for weekday in &weekdays {
+            for weekday in weekdays {
                 let candidate = week
                     .checked_add_days(Days::new(u64::from(weekday.num_days_from_monday())))
                     .ok_or_else(date_overflow)?;
@@ -254,10 +255,11 @@ impl RecurrenceRule {
     }
 
     fn next_monthly(&self, anchor: NaiveDate, threshold: NaiveDate) -> Result<NaiveDate> {
+        let default_day = anchor.day();
         let days = if self.by_month_day.is_empty() {
-            vec![anchor.day()]
+            std::slice::from_ref(&default_day)
         } else {
-            self.by_month_day.clone()
+            &self.by_month_day
         };
         let elapsed_months = month_index(threshold)
             .checked_sub(month_index(anchor))
@@ -274,7 +276,7 @@ impl RecurrenceRule {
                 .with_day(1)
                 .and_then(|date| date.checked_add_months(Months::new(month_offset)))
                 .ok_or_else(date_overflow)?;
-            for day in &days {
+            for day in days {
                 if let Some(candidate) = month.with_day(*day) {
                     if candidate > threshold {
                         return Ok(candidate);
@@ -287,15 +289,17 @@ impl RecurrenceRule {
     }
 
     fn next_yearly(&self, anchor: NaiveDate, threshold: NaiveDate) -> Result<NaiveDate> {
+        let default_month = anchor.month();
         let months = if self.by_month.is_empty() {
-            vec![anchor.month()]
+            std::slice::from_ref(&default_month)
         } else {
-            self.by_month.clone()
+            &self.by_month
         };
+        let default_day = anchor.day();
         let days = if self.by_month_day.is_empty() {
-            vec![anchor.day()]
+            std::slice::from_ref(&default_day)
         } else {
-            self.by_month_day.clone()
+            &self.by_month_day
         };
         let elapsed_years = u64::try_from(threshold.year() - anchor.year()).unwrap_or(0);
         let mut period = elapsed_years / self.interval;
@@ -309,8 +313,8 @@ impl RecurrenceRule {
                 .year()
                 .checked_add(year_delta)
                 .ok_or_else(date_overflow)?;
-            for month in &months {
-                for day in &days {
+            for month in months {
+                for day in days {
                     if let Some(candidate) = NaiveDate::from_ymd_opt(year, *month, *day) {
                         if candidate > threshold {
                             return Ok(candidate);
@@ -387,6 +391,13 @@ fn parse_number_list(value: &str, minimum: u32, maximum: u32, clause: &str) -> R
     let mut values = parse_unique_list(
         value,
         |item| {
+            if item.starts_with('-') {
+                return Err(Error::unsupported(
+                    "unsupported_recurrence",
+                    format!("{clause} does not support negative values in v1"),
+                )
+                .with_field("recurrence"));
+            }
             if !item.bytes().all(|byte| byte.is_ascii_digit()) {
                 return Err(invalid_rule(format!(
                     "{clause} values must be integers from {minimum} through {maximum}"
@@ -539,6 +550,35 @@ mod tests {
             "FREQ=YEARLY;BYMONTH=13",
         ] {
             assert!(RecurrenceRule::parse(source).is_err(), "{source}");
+        }
+    }
+    #[test]
+    fn every_documented_unsupported_feature_returns_exit_seven() {
+        for clause in [
+            "DTSTART=20260901",
+            "COUNT=2",
+            "UNTIL=20261231",
+            "WKST=MO",
+            "BYSETPOS=1",
+            "BYYEARDAY=1",
+            "BYWEEKNO=1",
+            "BYHOUR=9",
+            "BYMINUTE=30",
+            "BYSECOND=0",
+        ] {
+            let source = format!("FREQ=DAILY;{clause}");
+            let error = RecurrenceRule::parse(&source).expect_err("unsupported clause");
+            assert_eq!(error.code(), "unsupported_recurrence", "{source}");
+            assert_eq!(error.exit_code(), 7, "{source}");
+        }
+        for source in [
+            "FREQ=WEEKLY;BYDAY=1MO",
+            "FREQ=MONTHLY;BYMONTHDAY=-1",
+            "FREQ=YEARLY;BYMONTH=-1",
+        ] {
+            let error = RecurrenceRule::parse(source).expect_err("unsupported value");
+            assert_eq!(error.code(), "unsupported_recurrence", "{source}");
+            assert_eq!(error.exit_code(), 7, "{source}");
         }
     }
 

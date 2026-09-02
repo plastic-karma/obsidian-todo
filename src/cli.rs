@@ -129,10 +129,10 @@ pub struct AddArguments {
     pub tags: Vec<String>,
     #[arg(long, value_parser = parse_cli_date)]
     pub due_date: Option<NaiveDate>,
-    #[arg(long, value_parser = parse_cli_recurrence)]
-    pub recurrence: Option<RecurrenceRule>,
-    #[arg(long, value_parser = parse_cli_mode)]
-    pub recurrence_from: Option<RecurrenceMode>,
+    #[arg(long)]
+    pub recurrence: Option<String>,
+    #[arg(long)]
+    pub recurrence_from: Option<String>,
     #[command(flatten)]
     pub body: BodyArguments,
 }
@@ -184,10 +184,10 @@ pub struct EditArguments {
     pub due_date: Option<NaiveDate>,
     #[arg(long)]
     pub clear_due_date: bool,
-    #[arg(long, value_parser = parse_cli_recurrence, conflicts_with = "clear_recurrence")]
-    pub recurrence: Option<RecurrenceRule>,
-    #[arg(long, value_parser = parse_cli_mode, conflicts_with = "clear_recurrence")]
-    pub recurrence_from: Option<RecurrenceMode>,
+    #[arg(long, conflicts_with = "clear_recurrence")]
+    pub recurrence: Option<String>,
+    #[arg(long, conflicts_with = "clear_recurrence")]
+    pub recurrence_from: Option<String>,
     #[arg(long)]
     pub clear_recurrence: bool,
     #[command(flatten)]
@@ -351,6 +351,16 @@ pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<CommandOutput> {
             ))
         }
         Command::Add(arguments) => {
+            let recurrence = arguments
+                .recurrence
+                .as_deref()
+                .map(RecurrenceRule::parse)
+                .transpose()?;
+            let recurrence_from = arguments
+                .recurrence_from
+                .as_deref()
+                .map(RecurrenceMode::parse)
+                .transpose()?;
             let body = read_body(&arguments.body)?.unwrap_or_default();
             let task = task::add(
                 &store,
@@ -360,8 +370,8 @@ pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<CommandOutput> {
                     projects: arguments.projects.clone(),
                     tags: arguments.tags.clone(),
                     due_date: arguments.due_date,
-                    recurrence: arguments.recurrence.clone(),
-                    recurrence_from: arguments.recurrence_from,
+                    recurrence,
+                    recurrence_from,
                     body,
                 },
             )?;
@@ -393,6 +403,16 @@ pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<CommandOutput> {
             task_output(&store, &task, human)
         }
         Command::Edit(arguments) => {
+            let recurrence = arguments
+                .recurrence
+                .as_deref()
+                .map(RecurrenceRule::parse)
+                .transpose()?;
+            let recurrence_from = arguments
+                .recurrence_from
+                .as_deref()
+                .map(RecurrenceMode::parse)
+                .transpose()?;
             let body = read_body(&arguments.body)?;
             let task = task::edit(
                 &store,
@@ -406,8 +426,8 @@ pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<CommandOutput> {
                     remove_tags: arguments.remove_tags.clone(),
                     due_date: arguments.due_date,
                     clear_due_date: arguments.clear_due_date,
-                    recurrence: arguments.recurrence.clone(),
-                    recurrence_from: arguments.recurrence_from,
+                    recurrence,
+                    recurrence_from,
                     clear_recurrence: arguments.clear_recurrence,
                     body,
                 },
@@ -540,11 +560,9 @@ fn task_list_output(store: &Store, tasks: &[Task]) -> Result<CommandOutput> {
         .iter()
         .map(|task| TaskView::from_task(task, store))
         .collect::<Result<Vec<_>>>()?;
-    let prefix_lengths = unique_prefix_lengths(tasks);
     let human = tasks
         .iter()
-        .zip(prefix_lengths)
-        .map(|(task, prefix)| {
+        .map(|task| {
             let due = task.due_date.map_or_else(
                 || "-".to_owned(),
                 |date| date.format("%Y-%m-%d").to_string(),
@@ -561,12 +579,7 @@ fn task_list_output(store: &Store, tasks: &[Task]) -> Result<CommandOutput> {
             };
             format!(
                 "{}  {:<10}  {}{}  [{}]  {}",
-                &task.id[..prefix],
-                task.state,
-                due,
-                recurring,
-                projects,
-                task.name
+                task.id, task.state, due, recurring, projects, task.name
             )
         })
         .collect::<Vec<_>>()
@@ -618,23 +631,6 @@ fn human_project_list(projects: &[ProjectSummary]) -> String {
         .join("\n")
 }
 
-fn unique_prefix_lengths(tasks: &[Task]) -> Vec<usize> {
-    tasks
-        .iter()
-        .map(|task| {
-            (6..=26)
-                .find(|length| {
-                    tasks
-                        .iter()
-                        .filter(|candidate| candidate.id[..*length] == task.id[..*length])
-                        .count()
-                        == 1
-                })
-                .unwrap_or(26)
-        })
-        .collect()
-}
-
 fn read_body(arguments: &BodyArguments) -> Result<Option<String>> {
     if let Some(body) = &arguments.body {
         return Ok(Some(body.clone()));
@@ -658,14 +654,6 @@ fn read_body(arguments: &BodyArguments) -> Result<Option<String>> {
 
 fn parse_cli_date(value: &str) -> std::result::Result<NaiveDate, String> {
     parse_date(value, "date").map_err(|error| error.message().to_owned())
-}
-
-fn parse_cli_recurrence(value: &str) -> std::result::Result<RecurrenceRule, String> {
-    RecurrenceRule::parse(value).map_err(|error| error.message().to_owned())
-}
-
-fn parse_cli_mode(value: &str) -> std::result::Result<RecurrenceMode, String> {
-    RecurrenceMode::parse(value).map_err(|error| error.message().to_owned())
 }
 
 fn requested_format(arguments: &[OsString]) -> OutputFormat {
@@ -708,13 +696,45 @@ mod tests {
     fn all_commands_have_help() {
         for arguments in [
             vec!["otodo", "--help"],
+            vec!["otodo", "init", "--help"],
+            vec!["otodo", "root", "--help"],
             vec!["otodo", "add", "--help"],
             vec!["otodo", "list", "--help"],
+            vec!["otodo", "show", "--help"],
             vec!["otodo", "edit", "--help"],
+            vec!["otodo", "complete", "--help"],
+            vec!["otodo", "finish-series", "--help"],
+            vec!["otodo", "cancel", "--help"],
+            vec!["otodo", "reopen", "--help"],
+            vec!["otodo", "delete", "--help"],
+            vec!["otodo", "project", "--help"],
             vec!["otodo", "project", "create", "--help"],
+            vec!["otodo", "project", "list", "--help"],
+            vec!["otodo", "project", "show", "--help"],
+            vec!["otodo", "project", "edit", "--help"],
+            vec!["otodo", "project", "delete", "--help"],
+            vec!["otodo", "validate", "--help"],
         ] {
             let error = Cli::try_parse_from(arguments).expect_err("help exits through clap");
             assert_eq!(error.kind(), ClapErrorKind::DisplayHelp);
+        }
+    }
+
+    #[test]
+    fn top_level_help_documents_globals_examples_and_sparse_boundary() {
+        let help = Cli::try_parse_from(["otodo", "--help"])
+            .expect_err("help")
+            .to_string();
+        for required in [
+            "--root",
+            "--format",
+            "--color",
+            "--today",
+            "Examples:",
+            "never invoke Git",
+            "not a credential or confidentiality boundary",
+        ] {
+            assert!(help.contains(required), "missing {required:?}:\n{help}");
         }
     }
 }

@@ -75,11 +75,11 @@ impl Config {
         })?;
         let issues = config.validation_issues();
         if let Some(issue) = issues.first() {
-            let kind = if config.schema_version > SCHEMA_VERSION {
+            let kind = if config.schema_version != SCHEMA_VERSION {
                 Error::unsupported(
                     "unsupported_schema",
                     format!(
-                        "Schema version {} is newer than supported version {SCHEMA_VERSION}",
+                        "Schema version {} is unsupported; this client requires version {SCHEMA_VERSION}",
                         config.schema_version
                     ),
                 )
@@ -296,6 +296,17 @@ pub fn validate_managed_directory(value: &str) -> std::result::Result<(), String
     if path.is_absolute() {
         return Err(format!("Managed directory {value:?} must be relative"));
     }
+    if value.contains('\\')
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return Err(format!(
+            "Managed directory {value:?} must use normalized '/'-separated components"
+        ));
+    }
     let mut components = path.components();
     let Some(first) = components.next() else {
         return Err("Managed directory cannot be empty".to_owned());
@@ -374,6 +385,47 @@ mod tests {
             assert!(!is_state_id(invalid), "{invalid}");
         }
     }
+    #[test]
+    fn config_reports_each_state_and_path_invariant() {
+        let issue_codes = |config: &Config| {
+            config
+                .validation_issues()
+                .into_iter()
+                .map(|issue| issue.code)
+                .collect::<Vec<_>>()
+        };
+
+        let mut duplicate = Config::defaults("Todo".to_owned());
+        duplicate.states.push(duplicate.states[0].clone());
+        assert!(issue_codes(&duplicate).contains(&"duplicate_state_id".to_owned()));
+
+        let mut terminal = Config::defaults("Todo".to_owned());
+        for state in &mut terminal.states {
+            state.terminal = true;
+        }
+        assert!(issue_codes(&terminal).contains(&"missing_nonterminal_state".to_owned()));
+        assert!(issue_codes(&terminal).contains(&"terminal_default_state".to_owned()));
+
+        let mut malformed = Config::defaults("Todo".to_owned());
+        malformed.states[0].id = "Open".to_owned();
+        malformed.states[1].name = " \t ".to_owned();
+        malformed.default_state = "missing".to_owned();
+        malformed.projects_directory = malformed.tasks_directory.clone();
+        malformed.obsidian_link_prefix = "../Todo".to_owned();
+        let codes = issue_codes(&malformed);
+        for code in [
+            "invalid_state_id",
+            "invalid_state_name",
+            "invalid_default_state",
+            "managed_paths_not_distinct",
+            "invalid_link_prefix",
+        ] {
+            assert!(
+                codes.contains(&code.to_owned()),
+                "missing {code}: {codes:?}"
+            );
+        }
+    }
 
     #[test]
     fn managed_paths_reject_escape_and_metadata_directory() {
@@ -385,10 +437,24 @@ mod tests {
             "/Tasks",
             ".todo",
             ".todo/tasks",
+            "Tasks//Nested",
+            "Tasks/",
+            "Tasks\\Nested",
         ] {
             assert!(validate_managed_directory(invalid).is_err(), "{invalid}");
         }
         assert!(validate_managed_directory("Areas/Todos").is_ok());
+    }
+    #[test]
+    fn every_unsupported_schema_version_uses_exit_seven() {
+        for version in [0, 2] {
+            let mut config = Config::defaults("Todo".to_owned());
+            config.schema_version = version;
+            let source = config.to_toml().expect("serialize");
+            let error = Config::parse(&source).expect_err("unsupported schema");
+            assert_eq!(error.code(), "unsupported_schema");
+            assert_eq!(error.exit_code(), 7);
+        }
     }
 
     #[test]

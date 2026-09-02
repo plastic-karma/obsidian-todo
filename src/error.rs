@@ -185,7 +185,15 @@ impl Error {
                 format!("Validation failed with {errors} error(s) and {warnings} warning(s)")
             }
         };
-        let mut error = Self::validation("validation_failed", message);
+        let kind = if issues
+            .iter()
+            .any(|issue| issue.code == "unsupported_schema")
+        {
+            ErrorKind::Unsupported
+        } else {
+            ErrorKind::Validation
+        };
+        let mut error = Self::new(kind, "validation_failed", message);
         error.details.issues = issues;
         error
     }

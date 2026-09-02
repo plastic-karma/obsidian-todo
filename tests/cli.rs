@@ -49,6 +49,7 @@ fn json_success(cwd: &Path, arguments: &[&str]) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stderr.is_empty());
+    assert!(!output.stdout.contains(&0x1b));
     let value: Value = serde_json::from_slice(&output.stdout).expect("JSON output");
     assert_eq!(value["version"], 1);
     value
@@ -63,9 +64,19 @@ fn json_failure(cwd: &Path, arguments: &[&str], exit: i32, code: &str) -> Value 
         .expect("run command");
     assert_eq!(output.status.code(), Some(exit));
     assert!(output.stdout.is_empty());
+    assert!(!output.stderr.contains(&0x1b));
     let value: Value = serde_json::from_slice(&output.stderr).expect("JSON error");
     assert_eq!(value["version"], 1);
     assert_eq!(value["error"]["code"], code);
+    let error = value["error"].as_object().expect("JSON error object");
+    for field in [
+        "code", "message", "path", "field", "line", "column", "issues",
+    ] {
+        assert!(
+            error.contains_key(field),
+            "missing JSON error field {field}"
+        );
+    }
     value
 }
 
@@ -124,6 +135,9 @@ fn initialization_is_contained_and_minimal_task_is_exact_markdown() {
 #[test]
 fn full_task_project_recurrence_and_unknown_property_workflow() {
     let vault = fake_vault();
+    let unrelated_before = fs::read(vault.path().join("unrelated.md")).expect("unrelated note");
+    let obsidian_before =
+        fs::read(vault.path().join(".obsidian/community-plugins.json")).expect("Obsidian config");
     let root = initialize(vault.path());
     json_success(
         vault.path(),
@@ -209,6 +223,20 @@ fn full_task_project_recurrence_and_unknown_property_workflow() {
         ],
     );
     assert_eq!(listed["tasks"].as_array().expect("tasks").len(), 1);
+    let human_list = command()
+        .current_dir(vault.path())
+        .args(["--root", "Todo", "list", "--state", "active"])
+        .output()
+        .expect("human list");
+    assert!(human_list.status.success());
+    assert!(human_list.stderr.is_empty());
+    let human_list = String::from_utf8(human_list.stdout).expect("UTF-8 human list");
+    for value in [&id, "active", "2026-09-07", "↻", "[work]", "Review plan"] {
+        assert!(
+            human_list.contains(value),
+            "missing {value:?}: {human_list}"
+        );
+    }
 
     let completed = json_success(
         vault.path(),
@@ -223,6 +251,39 @@ fn full_task_project_recurrence_and_unknown_property_workflow() {
     assert!(default_list["tasks"].as_array().expect("tasks").is_empty());
     json_success(vault.path(), &["--root", "Todo", "reopen", &id]);
     json_success(vault.path(), &["--root", "Todo", "cancel", &id]);
+    let relative = json_success(
+        vault.path(),
+        &[
+            "--root",
+            "Todo",
+            "add",
+            "Completion relative",
+            "--due-date",
+            "2026-09-01",
+            "--recurrence",
+            "FREQ=DAILY;INTERVAL=3",
+            "--recurrence-from",
+            "completion",
+        ],
+    );
+    let relative_id = task_id(&relative).to_owned();
+    let relative = json_success(
+        vault.path(),
+        &[
+            "--root",
+            "Todo",
+            "--today",
+            "2026-09-09",
+            "complete",
+            &relative_id,
+        ],
+    );
+    assert_eq!(relative["task"]["due_date"], "2026-09-12");
+    assert_eq!(relative["task"]["last_completed_date"], "2026-09-09");
+    json_success(
+        vault.path(),
+        &["--root", "Todo", "finish-series", &relative_id],
+    );
 
     let failure = json_failure(
         vault.path(),
@@ -243,6 +304,14 @@ fn full_task_project_recurrence_and_unknown_property_workflow() {
         &["--root", "Todo", "project", "delete", "work", "--yes"],
     );
     json_success(vault.path(), &["--root", "Todo", "validate"]);
+    assert_eq!(
+        fs::read(vault.path().join("unrelated.md")).expect("unrelated note"),
+        unrelated_before
+    );
+    assert_eq!(
+        fs::read(vault.path().join(".obsidian/community-plugins.json")).expect("Obsidian config"),
+        obsidian_before
+    );
 }
 
 #[test]
@@ -297,6 +366,18 @@ fn sparse_store_supports_body_sources_and_all_normal_commands_without_git() {
         &["--root", "OnlyTodo", "edit", &id, "--body", "argument body"],
         None,
     );
+    let edited_from_file = json_success_without_path(
+        sparse.path(),
+        &["--root", "OnlyTodo", "edit", &id, "--body-file", body_path],
+        None,
+    );
+    assert_eq!(edited_from_file["task"]["body"], "from file\n");
+    let edited_from_stdin = json_success_without_path(
+        sparse.path(),
+        &["--root", "OnlyTodo", "edit", &id, "--body-file", "-"],
+        Some("edited from stdin\r\n"),
+    );
+    assert_eq!(edited_from_stdin["task"]["body"], "edited from stdin\n");
     json_success_without_path(sparse.path(), &["--root", "OnlyTodo", "list"], None);
     json_success_without_path(
         sparse.path(),
@@ -320,19 +401,92 @@ fn sparse_store_supports_body_sources_and_all_normal_commands_without_git() {
         ],
         None,
     );
+    json_success_without_path(
+        sparse.path(),
+        &[
+            "--root",
+            "OnlyTodo",
+            "edit",
+            &id,
+            "--remove-project",
+            "work",
+        ],
+        None,
+    );
+    json_success_without_path(
+        sparse.path(),
+        &["--root", "OnlyTodo", "project", "delete", "work", "--yes"],
+        None,
+    );
+    let survivor = json_success_without_path(
+        sparse.path(),
+        &["--root", "OnlyTodo", "add", "Survivor"],
+        None,
+    );
+    let survivor_id = task_id(&survivor).to_owned();
+    json_success_without_path(
+        sparse.path(),
+        &["--root", "OnlyTodo", "delete", &id, "--yes"],
+        None,
+    );
+    assert!(!root.join(format!("Tasks/{id}.md")).exists());
+    json_success_without_path(
+        sparse.path(),
+        &["--root", "OnlyTodo", "show", &survivor_id],
+        None,
+    );
     json_success_without_path(sparse.path(), &["--root", "OnlyTodo", "validate"], None);
 }
 
 #[test]
 fn errors_have_stable_exit_codes_json_shape_and_leave_no_temporary_files() {
     let vault = fake_vault();
+    let unrelated_before = fs::read(vault.path().join("unrelated.md")).expect("unrelated note");
+    let obsidian_before =
+        fs::read(vault.path().join(".obsidian/community-plugins.json")).expect("Obsidian config");
     let root = initialize(vault.path());
+    json_failure(
+        vault.path(),
+        &[
+            "--root",
+            "Todo",
+            "add",
+            "Unsupported recurrence",
+            "--due-date",
+            "2026-09-07",
+            "--recurrence",
+            "FREQ=DAILY;COUNT=2",
+            "--recurrence-from",
+            "schedule",
+        ],
+        7,
+        "unsupported_recurrence",
+    );
+    json_failure(
+        vault.path(),
+        &[
+            "--root",
+            "Todo",
+            "add",
+            "Missing project",
+            "--project",
+            "does-not-exist",
+        ],
+        5,
+        "project_not_found",
+    );
     let first_id = "01K4B0ZSBZZV25T1K0D3TA8JHR";
     let second_id = "01K4B0ZSBZZV25T1K0D3TA8JHS";
+    let dangling_id = "01J3B0ZSBZZV25T1K0D3TA8JHR";
     let record =
         |name: &str| format!("---\nname: \"{name}\"\nstate: open\nprojects: []\ntags: []\n---\n");
     fs::write(root.join(format!("Tasks/{first_id}.md")), record("First")).expect("first");
     fs::write(root.join(format!("Tasks/{second_id}.md")), record("Second")).expect("second");
+    fs::write(
+        root.join(format!("Tasks/{dangling_id}.md")),
+        "---\nname: Dangling\nstate: open\nprojects:\n  - \"[[Todo/Projects/missing]]\"\ntags: []\n---\n",
+    )
+    .expect("dangling task");
 
     let ambiguous = json_failure(
         vault.path(),
@@ -362,12 +516,16 @@ fn errors_have_stable_exit_codes_json_shape_and_leave_no_temporary_files() {
         2,
         "confirmation_required",
     );
+    json_success(
+        vault.path(),
+        &["--root", "Todo", "delete", second_id, "--yes"],
+    );
+    assert!(root.join(format!("Tasks/{first_id}.md")).is_file());
+    assert!(!root.join(format!("Tasks/{second_id}.md")).exists());
+    assert!(root.join(format!("Tasks/{dangling_id}.md")).is_file());
 
-    fs::write(
-        root.join(format!("Tasks/{first_id}.md")),
-        b"---\nname: First\nstate: open\nprojects: []\ntags: []\n---\n<<<<<<< ours\nbody\n=======\nother\n>>>>>>> theirs\n",
-    )
-    .expect("conflict");
+    let conflict = b"---\nname: First\nstate: open\nprojects: []\ntags: []\n---\n<<<<<<< ours\nbody\n=======\nother\n>>>>>>> theirs\n";
+    fs::write(root.join(format!("Tasks/{first_id}.md")), conflict).expect("conflict");
     let validation = json_failure(
         vault.path(),
         &["--root", "Todo", "validate"],
@@ -379,11 +537,20 @@ fn errors_have_stable_exit_codes_json_shape_and_leave_no_temporary_files() {
         .expect("issues")
         .iter()
         .any(|issue| issue["code"] == "unresolved_conflict"));
+    assert!(validation["error"]["issues"]
+        .as_array()
+        .expect("issues")
+        .iter()
+        .any(|issue| issue["code"] == "missing_project_reference"));
     json_failure(
         vault.path(),
         &["--root", "Todo", "edit", first_id, "--state", "active"],
         6,
         "unresolved_conflict",
+    );
+    assert_eq!(
+        fs::read(root.join(format!("Tasks/{first_id}.md"))).expect("conflicted task"),
+        conflict
     );
     assert!(fs::read_dir(root.join("Tasks"))
         .expect("tasks")
@@ -400,6 +567,252 @@ fn errors_have_stable_exit_codes_json_shape_and_leave_no_temporary_files() {
         .expect("human command");
     assert!(!output.stdout.contains(&0x1b));
     assert!(!output.stderr.contains(&0x1b));
+    let config_path = root.join(".todo/config.toml");
+    let config = fs::read_to_string(&config_path)
+        .expect("config")
+        .replace("schema_version = 1", "schema_version = 0");
+    fs::write(config_path, config).expect("older schema");
+    let unsupported = json_failure(
+        vault.path(),
+        &["--root", "Todo", "validate"],
+        7,
+        "validation_failed",
+    );
+    assert!(unsupported["error"]["issues"]
+        .as_array()
+        .expect("issues")
+        .iter()
+        .any(|issue| issue["code"] == "unsupported_schema"));
+    assert_eq!(
+        fs::read(vault.path().join("unrelated.md")).expect("unrelated note"),
+        unrelated_before
+    );
+    assert_eq!(
+        fs::read(vault.path().join(".obsidian/community-plugins.json")).expect("Obsidian config"),
+        obsidian_before
+    );
+}
+
+#[test]
+fn every_cli_command_family_has_a_representative_failure_exit() {
+    let vault = fake_vault();
+    let unrelated_before = fs::read(vault.path().join("unrelated.md")).expect("unrelated note");
+    let root = initialize(vault.path());
+
+    json_failure(
+        vault.path(),
+        &["init", "Todo", "--vault-root", "."],
+        5,
+        "store_already_initialized",
+    );
+    json_failure(
+        vault.path(),
+        &["--root", "missing", "root"],
+        3,
+        "store_not_found",
+    );
+    json_failure(
+        vault.path(),
+        &["--root", "Todo", "add", "Missing", "--project", "missing"],
+        5,
+        "project_not_found",
+    );
+    json_failure(
+        vault.path(),
+        &["--root", "Todo", "list", "--state", "missing"],
+        5,
+        "unknown_state",
+    );
+    json_failure(
+        vault.path(),
+        &["--root", "Todo", "show", "01A000"],
+        3,
+        "task_not_found",
+    );
+
+    json_success(
+        vault.path(),
+        &[
+            "--root", "Todo", "project", "create", "work", "--name", "Work",
+        ],
+    );
+    json_failure(
+        vault.path(),
+        &[
+            "--root",
+            "Todo",
+            "project",
+            "create",
+            "work",
+            "--name",
+            "Duplicate",
+        ],
+        5,
+        "project_already_exists",
+    );
+    json_failure(
+        vault.path(),
+        &["--root", "Todo", "project", "show", "missing"],
+        3,
+        "project_not_found",
+    );
+    json_failure(
+        vault.path(),
+        &["--root", "Todo", "project", "edit", "work"],
+        2,
+        "no_changes",
+    );
+    json_failure(
+        vault.path(),
+        &["--root", "Todo", "project", "delete", "work"],
+        2,
+        "confirmation_required",
+    );
+
+    let open = json_success(vault.path(), &["--root", "Todo", "add", "Open"]);
+    let open_id = task_id(&open).to_owned();
+    let done = json_success(vault.path(), &["--root", "Todo", "add", "Done"]);
+    let done_id = task_id(&done).to_owned();
+    json_success(
+        vault.path(),
+        &["--root", "Todo", "complete", &done_id, "--on", "2026-09-02"],
+    );
+    json_failure(
+        vault.path(),
+        &["--root", "Todo", "edit", &open_id],
+        2,
+        "no_changes",
+    );
+    json_failure(
+        vault.path(),
+        &["--root", "Todo", "finish-series", &open_id],
+        5,
+        "task_not_recurring",
+    );
+    json_failure(
+        vault.path(),
+        &["--root", "Todo", "reopen", &open_id],
+        5,
+        "task_not_terminal",
+    );
+    json_failure(
+        vault.path(),
+        &["--root", "Todo", "complete", &done_id],
+        5,
+        "task_already_terminal",
+    );
+    json_failure(
+        vault.path(),
+        &["--root", "Todo", "cancel", &done_id],
+        5,
+        "task_already_terminal",
+    );
+    json_failure(
+        vault.path(),
+        &[
+            "--root",
+            "Todo",
+            "delete",
+            "01A00000000000000000000000",
+            "--yes",
+        ],
+        3,
+        "task_not_found",
+    );
+
+    fs::write(
+        root.join("Tasks/01J3B0ZSBZZV25T1K0D3TA8JHR.md"),
+        b"not front matter\n",
+    )
+    .expect("malformed task");
+    json_failure(
+        vault.path(),
+        &["--root", "Todo", "project", "list"],
+        5,
+        "missing_frontmatter",
+    );
+    json_failure(
+        vault.path(),
+        &["--root", "Todo", "validate"],
+        5,
+        "validation_failed",
+    );
+    assert_eq!(
+        fs::read(vault.path().join("unrelated.md")).expect("unrelated note"),
+        unrelated_before
+    );
+}
+
+#[test]
+fn cli_detects_an_external_edit_between_read_and_atomic_replace() {
+    const ID: &str = "01K4B0ZSBZZV25T1K0D3TA8JHR";
+    const EXTERNAL: &[u8] =
+        b"---\nname: External\nstate: blocked\nprojects: []\ntags: []\n---\nexternal\n";
+
+    let vault = fake_vault();
+    let root = initialize(vault.path());
+    let target = root.join(format!("Tasks/{ID}.md"));
+    let source = format!(
+        "---\nname: Original\nstate: open\nprojects: []\ntags: []\n---\n{}",
+        "large body\n".repeat(650_000)
+    );
+    assert!(source.len() < 8 * 1024 * 1024);
+    fs::write(&target, source).expect("large task");
+
+    let tasks_directory = root.join("Tasks");
+    let watched_target = target.clone();
+    let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
+    let watcher = std::thread::spawn(move || {
+        ready_sender.send(()).expect("watcher ready");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let temporary_exists = fs::read_dir(&tasks_directory)
+                .expect("scan task directory")
+                .any(|entry| {
+                    entry
+                        .expect("directory entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".tmp")
+                });
+            if temporary_exists {
+                fs::write(&watched_target, EXTERNAL).expect("external edit");
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+    });
+    ready_receiver.recv().expect("watcher started");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_otodo"))
+        .current_dir(vault.path())
+        .args([
+            "--root",
+            "Todo",
+            "edit",
+            ID,
+            "--state",
+            "active",
+            "--format=json",
+        ])
+        .output()
+        .expect("run concurrent edit");
+    assert!(watcher.join().expect("watcher completed"));
+    assert_eq!(output.status.code(), Some(6));
+    assert!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stderr).expect("JSON error");
+    assert_eq!(error["error"]["code"], "concurrent_modification");
+    assert_eq!(fs::read(&target).expect("external result"), EXTERNAL);
+    assert!(fs::read_dir(root.join("Tasks"))
+        .expect("task directory")
+        .all(|entry| !entry
+            .expect("entry")
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".tmp")));
 }
 
 #[test]

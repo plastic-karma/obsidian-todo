@@ -160,13 +160,10 @@ pub fn list(store: &Store, filter: &TaskFilter, today: NaiveDate) -> Result<Vec<
     store.with_shared_lock(|| {
         let known_projects = known_projects(store)?;
         ensure_known_projects(&filter.projects, &known_projects)?;
-        let mut tasks = store
-            .load_all_tasks_unlocked()?
-            .into_iter()
-            .map(|stored| stored.task)
-            .collect::<Vec<_>>();
-        validate_task_references(tasks.iter(), &known_projects)?;
-        tasks.retain(|task| matches_filter(task, filter, store, today));
+        let mut tasks = store.load_selected_tasks_unlocked(|task| {
+            validate_task_references(std::iter::once(task), &known_projects)?;
+            Ok(matches_filter(task, filter, store, today))
+        })?;
         tasks.sort_by(|left, right| {
             match (left.due_date, right.due_date) {
                 (Some(left), Some(right)) => left.cmp(&right),

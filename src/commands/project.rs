@@ -96,15 +96,15 @@ pub fn create(store: &Store, request: &CreateProject) -> Result<Project> {
 pub fn list(store: &Store) -> Result<Vec<ProjectSummary>> {
     store.with_shared_lock(|| {
         let projects = store.load_all_projects_unlocked()?;
-        let tasks = store.load_all_tasks_unlocked()?;
+        let tasks = store.load_selected_tasks_unlocked(|_| Ok(true))?;
         let known = projects
             .iter()
             .map(|stored| stored.project.slug.as_str())
             .collect::<HashSet<_>>();
-        validate_task_projects(tasks.iter().map(|stored| &stored.task), &known)?;
+        validate_task_projects(&tasks, &known)?;
         let mut references = HashMap::<&str, usize>::new();
         for task in &tasks {
-            for project in &task.task.projects {
+            for project in &task.projects {
                 *references.entry(project).or_default() += 1;
             }
         }
@@ -167,11 +167,11 @@ pub fn delete(store: &Store, slug: &str, confirmed: bool) -> Result<Project> {
     }
     store.with_exclusive_lock(|| {
         let stored = store.load_project_unlocked(slug)?;
-        let tasks = store.load_all_tasks_unlocked()?;
+        let tasks = store.load_selected_tasks_unlocked(|_| Ok(true))?;
         let mut references = tasks
             .iter()
-            .filter(|task| task.task.projects.iter().any(|project| project == slug))
-            .map(|task| task.task.id.clone())
+            .filter(|task| task.projects.iter().any(|project| project == slug))
+            .map(|task| task.id.clone())
             .collect::<Vec<_>>();
         references.sort();
         if !references.is_empty() {

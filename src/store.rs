@@ -127,10 +127,7 @@ impl Store {
     }
 
     pub fn list_tasks(&self) -> Result<Vec<Task>> {
-        self.with_shared_lock(|| {
-            self.load_all_tasks_unlocked()
-                .map(|stored| stored.into_iter().map(|stored| stored.task).collect())
-        })
+        self.with_shared_lock(|| self.load_selected_tasks_unlocked(|_| Ok(true)))
     }
 
     pub fn list_projects(&self) -> Result<Vec<Project>> {
@@ -154,12 +151,17 @@ impl Store {
         })
     }
 
-    pub(crate) fn load_all_tasks_unlocked(&self) -> Result<Vec<StoredTask>> {
+    pub(crate) fn load_selected_tasks_unlocked<F>(&self, select: F) -> Result<Vec<Task>>
+    where
+        F: Fn(&Task) -> Result<bool> + Sync,
+    {
+        const TASKS_PER_WORKER: usize = 256;
+        const MAX_WORKERS: usize = 8;
+
         let candidates = self.task_candidates()?;
-        let mut seen = HashMap::<String, PathBuf>::with_capacity(candidates.len());
-        let mut tasks = Vec::with_capacity(candidates.len());
-        for (id, relative) in candidates {
-            if let Some(first) = seen.insert(id.clone(), relative.clone()) {
+        let mut seen = HashMap::<&str, &Path>::with_capacity(candidates.len());
+        for (id, relative) in &candidates {
+            if let Some(first) = seen.insert(id, relative) {
                 return Err(Error::validation(
                     "duplicate_task_id",
                     format!(
@@ -169,11 +171,57 @@ impl Store {
                     ),
                 ));
             }
-            let mut snapshot = self.read_snapshot(&relative, MAX_RECORD_BYTES as u64, "task")?;
-            let source = snapshot.take_bytes();
-            let task = parse_task(&id, &relative, &source, &self.config)
-                .map_err(|error| error_with_path(error, &relative))?;
-            tasks.push(StoredTask { task, snapshot });
+        }
+
+        let available_workers =
+            std::thread::available_parallelism().map_or(1, |workers| workers.get());
+        let worker_count = available_workers
+            .min(MAX_WORKERS)
+            .min(candidates.len().div_ceil(TASKS_PER_WORKER))
+            .max(1);
+        if worker_count == 1 {
+            return self.load_selected_task_chunk(&candidates, &select);
+        }
+
+        let chunk_size = candidates.len().div_ceil(worker_count);
+        std::thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(worker_count);
+            for chunk in candidates.chunks(chunk_size) {
+                let select = &select;
+                workers.push(scope.spawn(move || self.load_selected_task_chunk(chunk, select)));
+            }
+
+            let mut tasks = Vec::new();
+            for worker in workers {
+                let mut selected = worker.join().map_err(|_| {
+                    Error::new(
+                        ErrorKind::Io,
+                        "task_scan_worker_failed",
+                        "A task scan worker stopped unexpectedly",
+                    )
+                })??;
+                tasks.append(&mut selected);
+            }
+            Ok(tasks)
+        })
+    }
+
+    fn load_selected_task_chunk<F>(
+        &self,
+        candidates: &[(String, PathBuf)],
+        select: &F,
+    ) -> Result<Vec<Task>>
+    where
+        F: Fn(&Task) -> Result<bool> + Sync,
+    {
+        let mut tasks = Vec::new();
+        for (id, relative) in candidates {
+            let source = self.read_record(relative, MAX_RECORD_BYTES as u64, "task")?;
+            let task = parse_task(id, relative, &source, &self.config)
+                .map_err(|error| error_with_path(error, relative))?;
+            if select(&task)? {
+                tasks.push(task);
+            }
         }
         Ok(tasks)
     }
@@ -604,12 +652,32 @@ impl Store {
         limit: u64,
         description: &str,
     ) -> Result<FileSnapshot> {
+        let (path, bytes, metadata) = self.read_record_file(relative, limit, description)?;
+        let hash = content_hash(&bytes);
+        Ok(FileSnapshot {
+            path,
+            relative_path: relative.to_path_buf(),
+            bytes,
+            hash,
+            length: metadata.len(),
+            permissions: metadata.permissions(),
+        })
+    }
+
+    fn read_record(&self, relative: &Path, limit: u64, description: &str) -> Result<Vec<u8>> {
+        self.read_record_file(relative, limit, description)
+            .map(|(_, bytes, _)| bytes)
+    }
+
+    fn read_record_file(
+        &self,
+        relative: &Path,
+        limit: u64,
+        description: &str,
+    ) -> Result<(PathBuf, Vec<u8>, fs::Metadata)> {
         validate_relative_record_path(relative)?;
         let path = self.root.join(relative);
-        let mut file = open_regular_nofollow(&path, relative)?;
-        let metadata = file
-            .metadata()
-            .map_err(|source| Error::io(&format!("inspect the {description}"), &path, &source))?;
+        let (mut file, metadata) = open_regular_nofollow(&path, relative)?;
         if metadata.len() > limit {
             return Err(Error::validation(
                 "record_too_large",
@@ -629,19 +697,11 @@ impl Store {
             )
             .with_path(relative));
         }
-        let hash = content_hash(&bytes);
-        Ok(FileSnapshot {
-            path,
-            relative_path: relative.to_path_buf(),
-            bytes,
-            hash,
-            length: metadata.len(),
-            permissions: metadata.permissions(),
-        })
+        Ok((path, bytes, metadata))
     }
 
     fn ensure_unchanged(&self, snapshot: &FileSnapshot) -> Result<()> {
-        let file = open_regular_nofollow(&snapshot.path, &snapshot.relative_path)?;
+        let (file, _) = open_regular_nofollow(&snapshot.path, &snapshot.relative_path)?;
         let mut current =
             Vec::with_capacity(usize::try_from(snapshot.length).unwrap_or(MAX_RECORD_BYTES));
         file.take((MAX_RECORD_BYTES + 1) as u64)
@@ -685,7 +745,7 @@ impl Store {
     }
 }
 
-fn open_regular_nofollow(path: &Path, relative: &Path) -> Result<File> {
+fn open_regular_nofollow(path: &Path, relative: &Path) -> Result<(File, fs::Metadata)> {
     let file = open_options_nofollow()
         .read(true)
         .open(path)
@@ -699,7 +759,7 @@ fn open_regular_nofollow(path: &Path, relative: &Path) -> Result<File> {
                 .with_path(relative),
         );
     }
-    Ok(file)
+    Ok((file, metadata))
 }
 
 fn open_options_nofollow() -> OpenOptions {

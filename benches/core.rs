@@ -1,6 +1,7 @@
 use std::fs;
 use std::hint::black_box;
 use std::path::Path;
+use std::process::Output;
 use std::time::Duration;
 
 use chrono::NaiveDate;
@@ -8,6 +9,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use obsidian_todo::frontmatter::{parse_task, serialize_task};
 use obsidian_todo::recurrence::parse_date;
 use obsidian_todo::{initialize, Config, InitOptions, RecurrenceMode, RecurrenceRule, Store, Task};
+use serde_json::Value;
 use serde_yaml_ng::Mapping;
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -101,6 +103,154 @@ fn scan_benchmarks(criterion: &mut Criterion) {
     drop(temporary);
 }
 
+fn completed_heavy_cli_benchmark(criterion: &mut Criterion) {
+    const COMPLETED_TASKS: usize = 5_000;
+    const OPEN_TASKS: usize = 2;
+
+    let (temporary, root, open_ids) = completed_heavy_store(COMPLETED_TASKS, OPEN_TASKS);
+    let output = list_open_tasks(&root);
+    assert_listed_open_tasks(&output, &open_ids);
+
+    let mut group = criterion.benchmark_group("cli_list");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(5));
+    group.throughput(Throughput::Elements(
+        u64::try_from(COMPLETED_TASKS + OPEN_TASKS).expect("task count"),
+    ));
+    group.bench_with_input(
+        BenchmarkId::new("completed_heavy", COMPLETED_TASKS + OPEN_TASKS),
+        &root,
+        |bencher, root| {
+            bencher.iter(|| {
+                let output = list_open_tasks(black_box(root));
+                assert!(
+                    output.status.success(),
+                    "stdout={} stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                black_box(output)
+            });
+        },
+    );
+    group.finish();
+    drop(temporary);
+}
+
+fn completed_heavy_store(
+    completed_count: usize,
+    open_count: usize,
+) -> (TempDir, std::path::PathBuf, Vec<String>) {
+    let temporary = TempDir::new().expect("benchmark directory");
+    let root = temporary.path().join("Todo");
+    initialize(&InitOptions {
+        store_path: &root,
+        vault_root: Some(temporary.path()),
+        current_directory: temporary.path(),
+        adopt_empty_layout: false,
+        dry_run: false,
+    })
+    .expect("initialize benchmark store");
+    let config = Config::defaults("Todo".to_owned());
+    let archive = root.join("Tasks/Archive");
+    for shard in 0..completed_count.div_ceil(1_000) {
+        fs::create_dir_all(archive.join(format!("{shard:02}")))
+            .expect("create completed-task shard");
+    }
+
+    let completed = benchmark_task(
+        "00000000000000000000000000",
+        Path::new("Tasks/Archive/00/00000000000000000000000000.md"),
+        "Completed benchmark task",
+        "done",
+        Some(date("2026-08-31")),
+    );
+    let completed_source = serialize_task(&completed, &config).expect("serialize completed task");
+    for index in 0..completed_count {
+        let id = Ulid::from(u128::try_from(index + 1).expect("task index")).to_string();
+        let shard = index / 1_000;
+        fs::write(
+            archive.join(format!("{shard:02}/{id}.md")),
+            &completed_source,
+        )
+        .expect("write completed task");
+    }
+
+    let mut open_ids = Vec::with_capacity(open_count);
+    for index in 0..open_count {
+        let id = Ulid::from(u128::try_from(completed_count + index + 1).expect("task index"))
+            .to_string();
+        let relative = Path::new("Tasks").join(format!("{id}.md"));
+        let task = benchmark_task(
+            &id,
+            &relative,
+            &format!("Open benchmark task {index}"),
+            "open",
+            Some(date("2026-09-02")),
+        );
+        fs::write(
+            root.join(&relative),
+            serialize_task(&task, &config).expect("serialize open task"),
+        )
+        .expect("write open task");
+        open_ids.push(id);
+    }
+    (temporary, root, open_ids)
+}
+
+fn benchmark_task(
+    id: &str,
+    path: &Path,
+    name: &str,
+    state: &str,
+    due_date: Option<NaiveDate>,
+) -> Task {
+    Task {
+        id: id.to_owned(),
+        path: path.to_path_buf(),
+        name: name.to_owned(),
+        state: state.to_owned(),
+        projects: Vec::new(),
+        tags: vec!["benchmark".to_owned()],
+        due_date,
+        recurrence: None,
+        recurrence_from: None,
+        last_completed_date: None,
+        body: "Benchmark body with an [[Obsidian link]].\n".to_owned(),
+        extra_properties: Mapping::new(),
+    }
+}
+
+fn list_open_tasks(root: &Path) -> Output {
+    assert_cmd::cargo::cargo_bin_cmd!("otodo")
+        .args(["--root"])
+        .arg(root)
+        .args(["list", "--format", "json"])
+        .output()
+        .expect("run otodo list")
+}
+
+fn assert_listed_open_tasks(output: &Output, open_ids: &[String]) {
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty(), "list wrote to stderr");
+    let value: Value = serde_json::from_slice(&output.stdout).expect("list JSON");
+    let listed = value["tasks"].as_array().expect("tasks array");
+    assert_eq!(listed.len(), open_ids.len());
+    let listed_ids = listed
+        .iter()
+        .map(|task| task["id"].as_str().expect("task ID"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        listed_ids,
+        open_ids.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+}
+
 fn populated_store(count: usize) -> (TempDir, Store) {
     let temporary = TempDir::new().expect("benchmark directory");
     let root = temporary.path().join("Todo");
@@ -144,6 +294,7 @@ criterion_group!(
     benches,
     recurrence_benchmarks,
     frontmatter_benchmarks,
-    scan_benchmarks
+    scan_benchmarks,
+    completed_heavy_cli_benchmark
 );
 criterion_main!(benches);

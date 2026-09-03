@@ -145,7 +145,8 @@ The initialized layout MUST be:
 │   ├── config.toml
 │   └── schema.json
 ├── Tasks/
-└── Projects/
+├── Projects/
+└── todos.base
 ```
 
 Directory names are configurable after initialization, but all configured managed paths MUST:
@@ -184,8 +185,9 @@ Initialization requirements:
 6. Calculate `obsidian_link_prefix` as the store path relative to the vault root, using `/` separators.
 7. Write the default config from section 8.
 8. Write `schema.json` for editor and external-tool consumption.
-9. Validate the resulting store before returning success.
-10. Never initialize or modify Git.
+9. Write `todos.base`, containing a table view filtered to tasks whose `base` property links to that file.
+10. Validate the resulting store before returning success.
+11. Never initialize or modify Git.
 
 The command MUST support `--dry-run`, which reports planned paths and files but makes no changes.
 
@@ -311,6 +313,7 @@ due_date: 2026-09-06
 recurrence: "FREQ=WEEKLY;INTERVAL=1;BYDAY=SU"
 recurrence_from: schedule
 last_completed_date: 2026-08-30
+base: "[[Todo/todos.base]]"
 ---
 
 Review transactions, reconcile accounts, and update the monthly budget.
@@ -330,6 +333,8 @@ Review transactions, reconcile accounts, and update the monthly budget.
 | `last_completed_date` | date scalar | no | Most recent completion date for a recurring series. |
 
 The body after the closing delimiter is the task's `body` in API and JSON output.
+
+CLI-created tasks MUST contain a string property named `base` whose value is an Obsidian wikilink to the generated `todos.base`. The link target MUST include `obsidian_link_prefix` when it is nonempty. This integration property is returned in `extra_properties` and follows the unknown-property preservation rules in section 9.9; externally authored tasks without it remain valid.
 
 ### 9.4 Name
 

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use chrono::NaiveDate;
 use serde::Serialize;
-use serde_yaml_ng::Mapping;
+use serde_yaml_ng::{Mapping, Value};
 use ulid::Ulid;
 
 use crate::error::{Error, Result};
@@ -115,6 +115,11 @@ pub fn add(store: &Store, request: &AddTask) -> Result<Task> {
         let known_projects = known_projects(store)?;
         ensure_requested_projects(&request.projects, &known_projects)?;
         let existing_ids = store.task_ids_unlocked()?;
+        let mut extra_properties = Mapping::new();
+        extra_properties.insert(
+            Value::String("base".to_owned()),
+            Value::String(store.config().todos_base_link()),
+        );
 
         for _ in 0..32 {
             let id = Ulid::new().to_string().to_ascii_uppercase();
@@ -137,7 +142,7 @@ pub fn add(store: &Store, request: &AddTask) -> Result<Task> {
                 recurrence_from: request.recurrence_from,
                 last_completed_date: None,
                 body: normalize_body(&request.body),
-                extra_properties: Mapping::new(),
+                extra_properties: extra_properties.clone(),
             };
             task.validate(store.config())?;
             let bytes = serialize_task(&task, store.config())?;
@@ -657,7 +662,10 @@ mod tests {
         }
         assert_eq!(object["projects"], serde_json::json!([]));
         assert_eq!(object["tags"], serde_json::json!([]));
-        assert_eq!(object["extra_properties"], serde_json::json!({}));
+        assert_eq!(
+            object["extra_properties"],
+            serde_json::json!({"base": "[[Todo/todos.base]]"})
+        );
     }
 
     #[test]

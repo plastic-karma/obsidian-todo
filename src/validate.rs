@@ -10,7 +10,7 @@ use walkdir::WalkDir;
 
 use crate::config::{
     managed_paths_overlap, source_location, validate_managed_directory, Config, CONFIG_PATH,
-    EMBEDDED_SCHEMA, SCHEMA_PATH, SCHEMA_VERSION,
+    EMBEDDED_SCHEMA, SCHEMA_PATH, SCHEMA_VERSION, TODOS_BASE_PATH,
 };
 use crate::error::{Error, IssueSeverity, Result, ValidationIssue};
 use crate::frontmatter::{parse_project, parse_task, MAX_RECORD_BYTES};
@@ -372,6 +372,9 @@ fn validate_store_root_entries(root: &Path, config: &Config, issues: &mut Vec<Va
             if entry.file_type().is_dir() {
                 entries.skip_current_dir();
             }
+            continue;
+        }
+        if relative == Path::new(TODOS_BASE_PATH) && entry.file_type().is_file() {
             continue;
         }
         if managed.contains(&relative) {
@@ -1061,6 +1064,7 @@ mod tests {
         let report = validate_store(root);
         assert!(report.valid, "{:?}", report.issues);
         assert_eq!(report.errors, 0);
+        assert_eq!(report.warnings, 0, "{:?}", report.issues);
     }
     #[test]
     fn visible_task_subdirectories_are_valid_storage() {

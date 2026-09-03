@@ -8,6 +8,7 @@ use crate::error::{Error, Result, ValidationIssue};
 pub const SCHEMA_VERSION: u32 = 1;
 pub const CONFIG_PATH: &str = ".todo/config.toml";
 pub const SCHEMA_PATH: &str = ".todo/schema.json";
+pub const TODOS_BASE_PATH: &str = "todos.base";
 pub const EMBEDDED_SCHEMA: &str = include_str!("../assets/schema.json");
 pub(crate) fn source_location(source: &str, byte_offset: usize) -> (usize, usize) {
     let prefix = source.get(..byte_offset).unwrap_or(source);
@@ -297,6 +298,20 @@ impl Config {
     }
 
     #[must_use]
+    pub fn todos_base_link_target(&self) -> String {
+        if self.obsidian_link_prefix.is_empty() {
+            TODOS_BASE_PATH.to_owned()
+        } else {
+            format!("{}/{TODOS_BASE_PATH}", self.obsidian_link_prefix)
+        }
+    }
+
+    #[must_use]
+    pub fn todos_base_link(&self) -> String {
+        format!("[[{}]]", self.todos_base_link_target())
+    }
+
+    #[must_use]
     pub fn project_link_target_prefix(&self) -> String {
         let directory = self.projects_directory.replace('\\', "/");
         if self.obsidian_link_prefix.is_empty() {
@@ -557,5 +572,16 @@ mod tests {
             config.project_link("work"),
             "[[Area/Todo/Records/Projects/work]]"
         );
+    }
+
+    #[test]
+    fn todos_base_links_use_the_store_prefix() {
+        let nested = Config::defaults("Area/Todo".to_owned());
+        assert_eq!(nested.todos_base_link_target(), "Area/Todo/todos.base");
+        assert_eq!(nested.todos_base_link(), "[[Area/Todo/todos.base]]");
+
+        let vault_root = Config::defaults(String::new());
+        assert_eq!(vault_root.todos_base_link_target(), "todos.base");
+        assert_eq!(vault_root.todos_base_link(), "[[todos.base]]");
     }
 }

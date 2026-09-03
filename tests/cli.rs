@@ -121,6 +121,35 @@ fn initialization_is_contained_and_minimal_task_is_exact_markdown() {
     assert!(root.join(".todo/schema.json").is_file());
     assert!(root.join("Tasks").is_dir());
     assert!(root.join("Projects").is_dir());
+    let todos_base = fs::read_to_string(root.join("todos.base")).expect("Obsidian base");
+    assert_eq!(
+        todos_base,
+        r#"filters: "base == link(\"Todo/todos.base\")"
+formulas:
+  todo: "file.asLink(name)"
+properties:
+  formula.todo:
+    displayName: Todo
+  due_date:
+    displayName: Due
+  recurrence_from:
+    displayName: Recurrence mode
+  last_completed_date:
+    displayName: Last completed
+views:
+  - type: table
+    name: Todos
+    order:
+      - formula.todo
+      - state
+      - due_date
+      - projects
+      - tags
+      - recurrence
+      - recurrence_from
+      - last_completed_date
+"#
+    );
     assert!(!root.join(".git").exists());
     let config = fs::read_to_string(root.join(".todo/config.toml")).expect("configuration");
     assert!(config.contains("schema_version = 1"));
@@ -131,12 +160,16 @@ fn initialization_is_contained_and_minimal_task_is_exact_markdown() {
     assert_eq!(added["task"]["recurrence"], Value::Null);
     assert_eq!(added["task"]["recurrence_from"], Value::Null);
     assert_eq!(added["task"]["last_completed_date"], Value::Null);
+    assert_eq!(
+        added["task"]["extra_properties"]["base"],
+        "[[Todo/todos.base]]"
+    );
     let id = task_id(&added);
     assert_eq!(id.len(), 26);
     let markdown = fs::read_to_string(root.join(format!("Tasks/{id}.md"))).expect("task file");
     assert_eq!(
         markdown,
-        "---\nname: \"Minimal\"\nstate: open\nprojects: []\ntags: []\n---\n"
+        "---\nname: \"Minimal\"\nstate: open\nprojects: []\ntags: []\nbase: '[[Todo/todos.base]]'\n---\n"
     );
     json_success(vault.path(), &["--root", "Todo", "validate"]);
 

@@ -4,7 +4,9 @@ use std::path::{Component, Path, PathBuf};
 
 use tempfile::NamedTempFile;
 
-use crate::config::{validate_link_prefix, Config, CONFIG_PATH, EMBEDDED_SCHEMA, SCHEMA_PATH};
+use crate::config::{
+    validate_link_prefix, Config, CONFIG_PATH, EMBEDDED_SCHEMA, SCHEMA_PATH, TODOS_BASE_PATH,
+};
 use crate::error::{Error, Result};
 
 #[derive(Debug, Clone)]
@@ -26,6 +28,47 @@ pub struct InitPlan {
     pub dry_run: bool,
 }
 
+const TODOS_BASE_VIEW: &str = r#"formulas:
+  todo: "file.asLink(name)"
+properties:
+  formula.todo:
+    displayName: Todo
+  due_date:
+    displayName: Due
+  recurrence_from:
+    displayName: Recurrence mode
+  last_completed_date:
+    displayName: Last completed
+views:
+  - type: table
+    name: Todos
+    order:
+      - formula.todo
+      - state
+      - due_date
+      - projects
+      - tags
+      - recurrence
+      - recurrence_from
+      - last_completed_date
+"#;
+
+fn todos_base_source(config: &Config) -> Result<String> {
+    let target = serde_json::to_string(&config.todos_base_link_target()).map_err(|source| {
+        Error::validation(
+            "base_serialization_failed",
+            format!("Could not serialize the todos base link target: {source}"),
+        )
+    })?;
+    let filter = serde_json::to_string(&format!("base == link({target})")).map_err(|source| {
+        Error::validation(
+            "base_serialization_failed",
+            format!("Could not serialize the todos base filter: {source}"),
+        )
+    })?;
+    Ok(format!("filters: {filter}\n{TODOS_BASE_VIEW}"))
+}
+
 pub fn initialize(options: &InitOptions<'_>) -> Result<InitPlan> {
     let current = fs::canonicalize(options.current_directory).map_err(|source| {
         Error::io(
@@ -41,13 +84,18 @@ pub fn initialize(options: &InitOptions<'_>) -> Result<InitPlan> {
     let prefix = relative_link_prefix(&store, &vault)?;
     let config = Config::defaults(prefix.clone());
     let config_source = config.to_toml()?;
+    let base_source = todos_base_source(&config)?;
     let metadata_directory = store.join(".todo");
     let directories = vec![
         metadata_directory.clone(),
         store.join(&config.tasks_directory),
         store.join(&config.projects_directory),
     ];
-    let files = vec![store.join(CONFIG_PATH), store.join(SCHEMA_PATH)];
+    let files = vec![
+        store.join(CONFIG_PATH),
+        store.join(SCHEMA_PATH),
+        store.join(TODOS_BASE_PATH),
+    ];
     let plan = InitPlan {
         vault_root: vault,
         store_root: store.clone(),
@@ -66,10 +114,18 @@ pub fn initialize(options: &InitOptions<'_>) -> Result<InitPlan> {
             Error::io("create an initialization directory", directory, &source)
         })?;
     }
-    create_new_atomically(&files[0], config_source.as_bytes())?;
-    if let Err(error) = create_new_atomically(&files[1], EMBEDDED_SCHEMA.as_bytes()) {
-        let _ = fs::remove_file(&files[0]);
-        return Err(error);
+    let sources = [
+        config_source.as_bytes(),
+        EMBEDDED_SCHEMA.as_bytes(),
+        base_source.as_bytes(),
+    ];
+    for (index, (path, source)) in files.iter().zip(sources).enumerate() {
+        if let Err(error) = create_new_atomically(path, source) {
+            for created in files.iter().take(index) {
+                let _ = fs::remove_file(created);
+            }
+            return Err(error);
+        }
     }
 
     sync_directory(&metadata_directory)?;

@@ -8,6 +8,7 @@ use chrono::NaiveDate;
 use clap::{error::ErrorKind as ClapErrorKind, Args, Parser, Subcommand};
 use serde_json::json;
 
+use obsidian_todo::commands::attachment;
 use obsidian_todo::commands::init::{initialize, InitOptions};
 use obsidian_todo::commands::project::{
     self, CreateProject, EditProject, ProjectSummary, ProjectView,
@@ -16,9 +17,9 @@ use obsidian_todo::commands::task::{self, AddTask, EditTask, TaskFilter, TaskVie
 use obsidian_todo::discovery::{discover, DiscoveryOptions};
 use obsidian_todo::error::{Error, Result, ValidationSummary};
 use obsidian_todo::frontmatter::MAX_RECORD_BYTES;
-use obsidian_todo::model::{Clock, SystemClock, Task};
+use obsidian_todo::model::{relative_path_string, Clock, SystemClock, Task};
 use obsidian_todo::recurrence::{parse_date, RecurrenceMode, RecurrenceRule};
-use obsidian_todo::store::Store;
+use obsidian_todo::store::{upgrade, Store};
 use obsidian_todo::validate::validate_store;
 
 use crate::output::{
@@ -56,6 +57,23 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Report executable features without discovering or opening a store
+    #[command(after_help = "Example:\n  otodo --format json capabilities")]
+    Capabilities,
+
+    /// Explicitly upgrade a store after stopping all writers and synchronization
+    #[command(
+        after_help = "Stop ALL local/external writers and synchronization, including old clients and clients with pending work, and safeguard that work before applying or resuming. Advisory locks cannot stop stale old writers. Schema and config are replaced separately; rerun this explicit command to resume an interrupted upgrade.\n\nExample:\n  otodo --root Todo upgrade --to 2 --dry-run"
+    )]
+    Upgrade {
+        /// Target store schema version (only 2 is supported)
+        #[arg(long)]
+        to: u32,
+        /// Validate and report the upgrade without changing any file
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Initialize a self-contained todo store inside an existing vault
     #[command(after_help = "Example:\n  otodo init Todo --vault-root .")]
     Init {
@@ -130,6 +148,12 @@ pub enum Command {
         yes: bool,
     },
 
+    /// Import and manage ordinary file links in a task body
+    Attachment {
+        #[command(subcommand)]
+        command: AttachmentCommand,
+    },
+
     /// Manage first-class projects
     #[command(after_help = "Example:\n  otodo --root Todo project list")]
     Project {
@@ -142,15 +166,39 @@ pub enum Command {
     Validate,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum AttachmentCommand {
+    /// Copy local files into fresh attachment directories and link them
+    Add {
+        task_id: String,
+        #[arg(required = true, num_args = 1..)]
+        sources: Vec<PathBuf>,
+    },
+    /// Link an existing store-relative Attachments/... file
+    Link { task_id: String, path: String },
+    /// List recognized attachments, including missing targets
+    List { task_id: String },
+    /// Remove this task's links, retaining the stored file
+    Unlink { task_id: String, path: String },
+    /// Print an existing linked attachment's absolute local path
+    Path { task_id: String, path: String },
+}
+
 #[derive(Debug, Args)]
 pub struct AddArguments {
     pub name: String,
+    /// Import a local file (repeat for multiple files; at most 20 MiB each)
+    #[arg(long = "attach")]
+    pub attachments: Vec<PathBuf>,
     #[arg(long)]
     pub state: Option<String>,
     #[arg(long = "project")]
     pub projects: Vec<String>,
     #[arg(long = "tag")]
     pub tags: Vec<String>,
+    /// Full parent task ID (v2 stores only)
+    #[arg(long)]
+    pub parent: Option<String>,
     #[arg(long, value_parser = parse_cli_date)]
     pub due_date: Option<NaiveDate>,
     #[arg(long)]
@@ -187,6 +235,21 @@ pub struct ListArguments {
     pub recurring: bool,
     #[arg(long, conflicts_with = "recurring")]
     pub non_recurring: bool,
+    /// Select direct children of a full task ID (v2 stores only)
+    #[arg(long, conflicts_with = "roots")]
+    pub parent: Option<String>,
+    /// Select tasks without a parent (v2 stores only)
+    #[arg(long, conflicts_with = "parent")]
+    pub roots: bool,
+    /// Literal case-insensitive substring of task name or full ID
+    #[arg(long)]
+    pub query: Option<String>,
+    /// Return compact task candidates instead of full task records
+    #[arg(long)]
+    pub summary: bool,
+    /// Maximum compact matches, from 1 through 1000
+    #[arg(long, requires = "summary", value_parser = clap::value_parser!(u32).range(1..=1000))]
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Args)]
@@ -204,6 +267,12 @@ pub struct EditArguments {
     pub add_tags: Vec<String>,
     #[arg(long = "remove-tag")]
     pub remove_tags: Vec<String>,
+    /// Set or replace the full parent task ID (v2 stores only)
+    #[arg(long, conflicts_with = "clear_parent")]
+    pub parent: Option<String>,
+    /// Detach this task from its parent (v2 stores only)
+    #[arg(long, conflicts_with = "parent")]
+    pub clear_parent: bool,
     #[arg(long, value_parser = parse_cli_date, conflicts_with = "clear_due_date")]
     pub due_date: Option<NaiveDate>,
     #[arg(long)]
@@ -310,6 +379,17 @@ fn run_with_arguments(arguments: &[OsString], format: OutputFormat) -> u8 {
 }
 
 pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<CommandOutput> {
+    if matches!(cli.command, Command::Capabilities) {
+        return Ok(CommandOutput::new(
+            "Store schema versions: 1, 2\nFeatures: subtasks, task_candidates, store_upgrade, attachments"
+                .to_owned(),
+            json!({
+                "version": 1,
+                "store_schema_versions": [1, 2],
+                "features": ["subtasks", "task_candidates", "store_upgrade", "attachments"],
+            }),
+        ));
+    }
     let current_directory = env::current_dir()
         .map_err(|source| Error::io("read the current directory", Path::new("."), &source))?;
     if let Command::Init {
@@ -350,6 +430,21 @@ pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<CommandOutput> {
     } else {
         discover_root(cli, &current_directory)?
     };
+    if let Command::Upgrade { to, dry_run } = &cli.command {
+        let result = upgrade(&root, *to, *dry_run)?;
+        return Ok(CommandOutput::new(
+            format!(
+                "Store upgrade {}: {} -> {}{}\nSchema: {}\nConfig: {}",
+                result.status,
+                result.from,
+                result.to,
+                if result.dry_run { " (dry run)" } else { "" },
+                root.join(".todo/schema.json").display(),
+                root.join(".todo/config.toml").display(),
+            ),
+            json!({ "version": 1, "upgrade": result }),
+        ));
+    }
     if matches!(cli.command, Command::Validate) {
         let report = validate_store(&root);
         if !report.valid {
@@ -389,7 +484,12 @@ pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<CommandOutput> {
 
     let store = Store::open(&root)?;
     match &cli.command {
-        Command::Init { .. } | Command::Validate => unreachable!("handled before store opening"),
+        Command::Init { .. }
+        | Command::Validate
+        | Command::Capabilities
+        | Command::Upgrade { .. } => {
+            unreachable!("handled before store opening")
+        }
         Command::Root => {
             let paths = store.paths();
             Ok(CommandOutput::new(
@@ -415,20 +515,65 @@ pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<CommandOutput> {
                 .map(RecurrenceMode::parse)
                 .transpose()?;
             let body = read_body(&arguments.body)?.unwrap_or_default();
-            let task = task::add(
+            let task = task::add_with_attachments(
                 &store,
                 &AddTask {
                     name: arguments.name.clone(),
                     state: arguments.state.clone(),
                     projects: arguments.projects.clone(),
                     tags: arguments.tags.clone(),
+                    parent: arguments.parent.clone(),
                     due_date: arguments.due_date,
                     recurrence,
                     recurrence_from,
                     body,
                 },
+                &arguments.attachments,
             )?;
             task_output(&store, &task, format!("{} {}", task.id, task.name))
+        }
+        Command::Attachment { command } => {
+            let views = match command {
+                AttachmentCommand::Add { task_id, sources } => {
+                    attachment::add(&store, task_id, sources)?
+                }
+                AttachmentCommand::Link { task_id, path } => {
+                    vec![attachment::link(&store, task_id, path)?]
+                }
+                AttachmentCommand::List { task_id } => attachment::list(&store, task_id)?,
+                AttachmentCommand::Unlink { task_id, path } => {
+                    vec![attachment::unlink(&store, task_id, path)?]
+                }
+                AttachmentCommand::Path { task_id, path } => {
+                    let absolute = attachment::path(&store, task_id, path)?;
+                    return Ok(CommandOutput::new(
+                        absolute.display().to_string(),
+                        json!({"version": 1, "path": json_path(&absolute)}),
+                    ));
+                }
+            };
+            let human = if views.is_empty() {
+                "No recognized attachments. Use explicit Attachments/... links for manually placed files.".to_owned()
+            } else {
+                views
+                    .iter()
+                    .map(|view| {
+                        format!(
+                            "{}  {}  {} bytes  {}",
+                            view.path,
+                            view.display_name,
+                            view.byte_size
+                                .map_or_else(|| "unknown".to_owned(), |size| size.to_string()),
+                            view.availability
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            Ok(CommandOutput::new(
+                human,
+                json!({"version": 1, "attachments": views}),
+            ))
         }
         Command::List(arguments) => {
             let today = cli.today.unwrap_or_else(|| clock.today());
@@ -445,10 +590,17 @@ pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<CommandOutput> {
                     overdue: arguments.overdue,
                     recurring: arguments.recurring,
                     non_recurring: arguments.non_recurring,
+                    parent: arguments.parent.clone(),
+                    roots: arguments.roots,
+                    query: arguments.query.clone(),
                 },
                 today,
             )?;
-            task_list_output(&store, &tasks)
+            if arguments.summary {
+                Ok(task_summary_output(&store, &tasks, arguments.limit))
+            } else {
+                task_list_output(&store, &tasks)
+            }
         }
         Command::Show { id_or_prefix } => {
             let task = task::show(&store, id_or_prefix)?;
@@ -477,6 +629,8 @@ pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<CommandOutput> {
                     remove_projects: arguments.remove_projects.clone(),
                     add_tags: arguments.add_tags.clone(),
                     remove_tags: arguments.remove_tags.clone(),
+                    parent: arguments.parent.clone(),
+                    clear_parent: arguments.clear_parent,
                     due_date: arguments.due_date,
                     clear_due_date: arguments.clear_due_date,
                     recurrence,
@@ -676,10 +830,41 @@ fn task_list_output(store: &Store, tasks: &[Task]) -> Result<CommandOutput> {
     ))
 }
 
+fn task_summary_output(store: &Store, tasks: &[Task], limit: Option<u32>) -> CommandOutput {
+    let count = limit.map_or(tasks.len(), |limit| (limit as usize).min(tasks.len()));
+    let has_more = count < tasks.len();
+    let tasks = &tasks[..count];
+    let views = tasks
+        .iter()
+        .map(|task| {
+            json!({
+                "id": task.id,
+                "path": relative_path_string(&task.path),
+                "name": task.name,
+                "state": task.state,
+                "terminal": task.terminal(store.config()),
+                "parent": task.parent,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut human = tasks
+        .iter()
+        .map(|task| format!("{}  {:<10}  {}", task.id, task.state, task.name))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if has_more {
+        human.push_str("\nMore matching tasks; refine the query or increase --limit.");
+    }
+    CommandOutput::new(
+        human,
+        json!({ "version": 1, "tasks": views, "has_more": has_more }),
+    )
+}
+
 fn human_task_details(store: &Store, task: &Task) -> Result<String> {
     let view = TaskView::from_task(task, store)?;
     Ok(format!(
-        "id: {}\npath: {}\nname: {}\nstate: {}\nterminal: {}\nprojects: {}\ntags: {}\ndue_date: {}\nrecurrence: {}\nrecurrence_from: {}\nlast_completed_date: {}\nextra_properties: {}\nbody:\n{}",
+        "id: {}\npath: {}\nname: {}\nstate: {}\nterminal: {}\nprojects: {}\ntags: {}\nparent: {}\ndue_date: {}\nrecurrence: {}\nrecurrence_from: {}\nlast_completed_date: {}\nextra_properties: {}\nbody:\n{}",
         view.id,
         view.path,
         view.name,
@@ -687,6 +872,7 @@ fn human_task_details(store: &Store, task: &Task) -> Result<String> {
         view.terminal,
         view.projects.join(", "),
         view.tags.join(", "),
+        task.parent.as_deref().unwrap_or("-"),
         view.due_date.as_deref().unwrap_or("-"),
         view.recurrence.as_deref().unwrap_or("-"),
         view.recurrence_from.as_deref().unwrap_or("-"),
@@ -816,6 +1002,8 @@ mod tests {
         for arguments in [
             vec!["otodo", "--help"],
             vec!["otodo", "init", "--help"],
+            vec!["otodo", "capabilities", "--help"],
+            vec!["otodo", "upgrade", "--help"],
             vec!["otodo", "root", "--help"],
             vec!["otodo", "add", "--help"],
             vec!["otodo", "list", "--help"],

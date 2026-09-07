@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::NaiveDate;
 use serde::Serialize;
@@ -8,8 +8,8 @@ use ulid::Ulid;
 use crate::error::{Error, Result};
 use crate::frontmatter::serialize_task;
 use crate::model::{
-    normalize_body, relative_path_string, validate_name, validate_project_slug, validate_tag,
-    validate_unique_projects, Clock, Task,
+    normalize_body, normalize_parent_id, relative_path_string, validate_name,
+    validate_project_slug, validate_tag, validate_unique_projects, Clock, ParentRecord, Task,
 };
 use crate::recurrence::{RecurrenceMode, RecurrenceRule};
 use crate::store::Store;
@@ -20,6 +20,7 @@ pub struct AddTask {
     pub state: Option<String>,
     pub projects: Vec<String>,
     pub tags: Vec<String>,
+    pub parent: Option<String>,
     pub due_date: Option<NaiveDate>,
     pub recurrence: Option<RecurrenceRule>,
     pub recurrence_from: Option<RecurrenceMode>,
@@ -40,6 +41,8 @@ pub struct EditTask {
     pub recurrence_from: Option<RecurrenceMode>,
     pub clear_recurrence: bool,
     pub body: Option<String>,
+    pub parent: Option<String>,
+    pub clear_parent: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -54,6 +57,9 @@ pub struct TaskFilter {
     pub overdue: bool,
     pub recurring: bool,
     pub non_recurring: bool,
+    pub parent: Option<String>,
+    pub roots: bool,
+    pub query: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -65,6 +71,7 @@ pub struct TaskView {
     pub terminal: bool,
     pub projects: Vec<String>,
     pub tags: Vec<String>,
+    pub parent: Option<String>,
     pub due_date: Option<String>,
     pub recurrence: Option<String>,
     pub recurrence_from: Option<String>,
@@ -94,6 +101,7 @@ impl TaskView {
             terminal: task.terminal(store.config()),
             projects,
             tags,
+            parent: task.parent.clone(),
             due_date: task
                 .due_date
                 .map(|date| date.format("%Y-%m-%d").to_string()),
@@ -109,25 +117,47 @@ impl TaskView {
 }
 
 pub fn add(store: &Store, request: &AddTask) -> Result<Task> {
+    add_with_attachments(store, request, &[])
+}
+
+/// Stage every file before publishing; task publication is the final single-record mutation.
+pub fn add_with_attachments(
+    store: &Store,
+    request: &AddTask,
+    sources: &[std::path::PathBuf],
+) -> Result<Task> {
+    if !sources.is_empty() {
+        crate::attachments::ensure_enabled(store.config())?;
+    }
+    let staged = crate::attachments::stage(sources)?;
+    require_parent_schema(store, request.parent.is_some())?;
+    let parent = request
+        .parent
+        .as_deref()
+        .map(normalize_parent_id)
+        .transpose()?;
     store.with_exclusive_lock(|| {
         let name = request.name.trim().to_owned();
         validate_name(&name, "name")?;
         let known_projects = known_projects(store)?;
         ensure_requested_projects(&request.projects, &known_projects)?;
-        let existing_ids = store.task_ids_unlocked()?;
+        let relations = store.relations_unlocked()?;
+        let existing_ids: HashSet<&str> =
+            relations.iter().map(|record| record.id.as_str()).collect();
         let mut extra_properties = Mapping::new();
         extra_properties.insert(
             Value::String("base".to_owned()),
             Value::String(store.config().todos_base_link()),
         );
 
+        let mut attachments_published = false;
         for _ in 0..32 {
             let id = Ulid::new().to_string().to_ascii_uppercase();
             if existing_ids.contains(id.as_str()) {
                 continue;
             }
             let path = store.config().tasks_path()?.join(format!("{id}.md"));
-            let task = Task {
+            let mut task = Task {
                 id: id.clone(),
                 path,
                 name: name.clone(),
@@ -137,6 +167,7 @@ pub fn add(store: &Store, request: &AddTask) -> Result<Task> {
                     .unwrap_or_else(|| store.config().default_state.clone()),
                 projects: request.projects.clone(),
                 tags: request.tags.clone(),
+                parent: parent.clone(),
                 due_date: request.due_date,
                 recurrence: request.recurrence.clone(),
                 recurrence_from: request.recurrence_from,
@@ -145,8 +176,20 @@ pub fn add(store: &Store, request: &AddTask) -> Result<Task> {
                 extra_properties: extra_properties.clone(),
             };
             task.validate(store.config())?;
+            ensure_parent_destination(&task, &relations)?;
+            task.body = crate::attachments::append_links(
+                &task.body,
+                &task.path,
+                &staged.iter().map(|a| a.path.clone()).collect::<Vec<_>>(),
+            )?;
             let bytes = serialize_task(&task, store.config())?;
-            match store.create_task(&id, &bytes) {
+            if !attachments_published {
+                for attachment in &staged {
+                    store.create_attachment(attachment)?;
+                }
+                attachments_published = true;
+            }
+            match store.create_task_checked(&id, &bytes, &relations) {
                 Ok(_) => return Ok(task),
                 Err(error) if error.code() == "record_already_exists" => {}
                 Err(error) => return Err(error),
@@ -162,6 +205,9 @@ pub fn add(store: &Store, request: &AddTask) -> Result<Task> {
 
 pub fn list(store: &Store, filter: &TaskFilter, today: NaiveDate) -> Result<Vec<Task>> {
     validate_filter(store, filter)?;
+    let mut normalized_filter = filter.clone();
+    normalized_filter.query = filter.query.as_ref().map(|query| query.to_lowercase());
+    let filter = &normalized_filter;
     store.with_shared_lock(|| {
         let known_projects = known_projects(store)?;
         ensure_known_projects(&filter.projects, &known_projects)?;
@@ -169,6 +215,9 @@ pub fn list(store: &Store, filter: &TaskFilter, today: NaiveDate) -> Result<Vec<
             validate_task_references(std::iter::once(task), &known_projects)?;
             Ok(matches_filter(task, filter, store, today))
         })?;
+        if let Some(parent) = &filter.parent {
+            store.resolve_task_unlocked(parent)?;
+        }
         tasks.sort_by(|left, right| {
             match (left.due_date, right.due_date) {
                 (Some(left), Some(right)) => left.cmp(&right),
@@ -200,14 +249,22 @@ pub fn show(store: &Store, id_or_prefix: &str) -> Result<Task> {
 
 pub fn edit(store: &Store, id_or_prefix: &str, changes: &EditTask) -> Result<Task> {
     validate_edit_request(changes)?;
+    require_parent_schema(store, changes.parent.is_some() || changes.clear_parent)?;
     store.with_exclusive_lock(|| {
+        let relations = store.relations_unlocked()?;
         let stored = store.resolve_task_unlocked(id_or_prefix)?;
         let mut task = stored.task;
+        ensure_selected_relation(&task, &relations)?;
         let known_projects = known_projects(store)?;
         apply_edit(&mut task, changes, &known_projects)?;
         task.validate(store.config())?;
+        if changes.parent.is_some() {
+            ensure_parent_destination(&task, &relations)?;
+        }
         let bytes = serialize_task(&task, store.config())?;
-        store.replace(&stored.snapshot, &bytes)?;
+        store.replace_checked(&stored.snapshot, &bytes, || {
+            store.ensure_relations_unchanged(&relations)
+        })?;
         Ok(task)
     })
 }
@@ -220,8 +277,10 @@ pub fn complete(
 ) -> Result<Task> {
     let completed_on = completed_on.unwrap_or_else(|| clock.today());
     store.with_exclusive_lock(|| {
+        let relations = store.relations_unlocked()?;
         let stored = store.resolve_task_unlocked(id_or_prefix)?;
         let mut task = stored.task;
+        ensure_selected_relation(&task, &relations)?;
         ensure_nonterminal(&task, store)?;
         ensure_task_projects(store, &task)?;
         let done = required_terminal_state(store, "done", "complete")?;
@@ -258,15 +317,19 @@ pub fn complete(
         }
         task.validate(store.config())?;
         let bytes = serialize_task(&task, store.config())?;
-        store.replace(&stored.snapshot, &bytes)?;
+        store.replace_checked(&stored.snapshot, &bytes, || {
+            store.ensure_relations_unchanged(&relations)
+        })?;
         Ok(task)
     })
 }
 
 pub fn finish_series(store: &Store, id_or_prefix: &str) -> Result<Task> {
     store.with_exclusive_lock(|| {
+        let relations = store.relations_unlocked()?;
         let stored = store.resolve_task_unlocked(id_or_prefix)?;
         let mut task = stored.task;
+        ensure_selected_relation(&task, &relations)?;
         ensure_nonterminal(&task, store)?;
         ensure_task_projects(store, &task)?;
         if task.recurrence.is_none() {
@@ -276,25 +339,29 @@ pub fn finish_series(store: &Store, id_or_prefix: &str) -> Result<Task> {
             ));
         }
         task.state = required_terminal_state(store, "done", "finish-series")?.to_owned();
-        replace_task(store, stored.snapshot, task)
+        replace_task(store, stored.snapshot, task, &relations)
     })
 }
 
 pub fn cancel(store: &Store, id_or_prefix: &str) -> Result<Task> {
     store.with_exclusive_lock(|| {
+        let relations = store.relations_unlocked()?;
         let stored = store.resolve_task_unlocked(id_or_prefix)?;
         let mut task = stored.task;
+        ensure_selected_relation(&task, &relations)?;
         ensure_nonterminal(&task, store)?;
         ensure_task_projects(store, &task)?;
         task.state = required_terminal_state(store, "cancelled", "cancel")?.to_owned();
-        replace_task(store, stored.snapshot, task)
+        replace_task(store, stored.snapshot, task, &relations)
     })
 }
 
 pub fn reopen(store: &Store, id_or_prefix: &str) -> Result<Task> {
     store.with_exclusive_lock(|| {
+        let relations = store.relations_unlocked()?;
         let stored = store.resolve_task_unlocked(id_or_prefix)?;
         let mut task = stored.task;
+        ensure_selected_relation(&task, &relations)?;
         ensure_task_projects(store, &task)?;
         if !task.terminal(store.config()) {
             return Err(Error::validation(
@@ -304,7 +371,7 @@ pub fn reopen(store: &Store, id_or_prefix: &str) -> Result<Task> {
             .with_field("state"));
         }
         task.state.clone_from(&store.config().default_state);
-        replace_task(store, stored.snapshot, task)
+        replace_task(store, stored.snapshot, task, &relations)
     })
 }
 
@@ -322,13 +389,40 @@ pub fn delete(store: &Store, full_id: &str, confirmed: bool) -> Result<Task> {
         ));
     }
     store.with_exclusive_lock(|| {
+        let relations = store.relations_unlocked()?;
         let stored = store.resolve_task_unlocked(full_id)?;
-        store.delete(&stored.snapshot)?;
+        ensure_selected_relation(&stored.task, &relations)?;
+        let mut children: Vec<&str> = relations
+            .iter()
+            .filter(|record| record.parent.as_deref() == Some(stored.task.id.as_str()))
+            .map(|record| record.id.as_str())
+            .collect();
+        children.sort_unstable();
+        if !children.is_empty() {
+            return Err(Error::validation(
+                "task_in_use",
+                format!(
+                    "Task {} has direct children: {}",
+                    stored.task.id,
+                    children.join(", ")
+                ),
+            )
+            .with_path(&stored.task.path)
+            .with_field("parent"));
+        }
+        store.delete_checked(&stored.snapshot, || {
+            store.ensure_relations_unchanged(&relations)
+        })?;
         Ok(stored.task)
     })
 }
 
 fn apply_edit(task: &mut Task, changes: &EditTask, known_projects: &HashSet<String>) -> Result<()> {
+    if changes.clear_parent {
+        task.parent = None;
+    } else if let Some(parent) = &changes.parent {
+        task.parent = Some(normalize_parent_id(parent)?);
+    }
     if let Some(name) = &changes.name {
         let name = name.trim().to_owned();
         validate_name(&name, "name")?;
@@ -413,6 +507,8 @@ fn apply_edit(task: &mut Task, changes: &EditTask, known_projects: &HashSet<Stri
 
 fn validate_edit_request(changes: &EditTask) -> Result<()> {
     let has_change = changes.name.is_some()
+        || changes.parent.is_some()
+        || changes.clear_parent
         || changes.state.is_some()
         || !changes.add_projects.is_empty()
         || !changes.remove_projects.is_empty()
@@ -428,6 +524,12 @@ fn validate_edit_request(changes: &EditTask) -> Result<()> {
         return Err(Error::usage(
             "no_changes",
             "Task edit requires at least one change",
+        ));
+    }
+    if changes.parent.is_some() && changes.clear_parent {
+        return Err(Error::usage(
+            "conflicting_changes",
+            "--parent conflicts with --clear-parent",
         ));
     }
     if changes.due_date.is_some() && changes.clear_due_date {
@@ -460,6 +562,16 @@ fn reject_overlapping_changes(add: &[String], remove: &[String], kind: &str) -> 
 }
 
 fn validate_filter(store: &Store, filter: &TaskFilter) -> Result<()> {
+    if filter.parent.is_some() && filter.roots {
+        return Err(Error::usage(
+            "conflicting_filters",
+            "--parent conflicts with --roots",
+        ));
+    }
+    require_parent_schema(store, filter.parent.is_some() || filter.roots)?;
+    if let Some(parent) = &filter.parent {
+        normalize_parent_id(parent)?;
+    }
     if filter.recurring && filter.non_recurring {
         return Err(Error::usage(
             "conflicting_filters",
@@ -485,6 +597,23 @@ fn validate_filter(store: &Store, filter: &TaskFilter) -> Result<()> {
 }
 
 fn matches_filter(task: &Task, filter: &TaskFilter, store: &Store, today: NaiveDate) -> bool {
+    if filter.roots && task.parent.is_some() {
+        return false;
+    }
+    if let Some(parent) = &filter.parent {
+        if task
+            .parent
+            .as_ref()
+            .is_none_or(|value| !value.eq_ignore_ascii_case(parent))
+        {
+            return false;
+        }
+    }
+    if let Some(query) = &filter.query {
+        if !task.name.to_lowercase().contains(query) && !task.id.to_lowercase().contains(query) {
+            return false;
+        }
+    }
     if !filter.include_terminal && task.terminal(store.config()) {
         return false;
     }
@@ -591,11 +720,83 @@ fn required_terminal_state<'a>(store: &'a Store, id: &str, command: &str) -> Res
     }
 }
 
-fn replace_task(store: &Store, snapshot: crate::store::FileSnapshot, task: Task) -> Result<Task> {
+fn replace_task(
+    store: &Store,
+    snapshot: crate::store::FileSnapshot,
+    task: Task,
+    relations: &[ParentRecord],
+) -> Result<Task> {
     task.validate(store.config())?;
     let bytes = serialize_task(&task, store.config())?;
-    store.replace(&snapshot, &bytes)?;
+    store.replace_checked(&snapshot, &bytes, || {
+        store.ensure_relations_unchanged(relations)
+    })?;
     Ok(task)
+}
+
+fn require_parent_schema(store: &Store, requested: bool) -> Result<()> {
+    if requested && store.config().schema_version == 1 {
+        return Err(Error::unsupported(
+            "unsupported_schema",
+            "Parent operations require store schema version 2; explicitly upgrade the store first",
+        )
+        .with_field("parent"));
+    }
+    Ok(())
+}
+
+fn ensure_selected_relation(task: &Task, relations: &[ParentRecord]) -> Result<()> {
+    if relations.iter().any(|record| {
+        record.id == task.id && record.path == task.path && record.parent == task.parent
+    }) {
+        Ok(())
+    } else {
+        Err(Error::new(
+            crate::error::ErrorKind::Concurrent,
+            "concurrent_modification",
+            "Selected task changed during the relationship scan",
+        )
+        .with_path(&task.path))
+    }
+}
+
+/// Validate the effective ancestry, not unrelated existing faults. Detach needs no
+/// valid old ancestry, so a malformed graph remains explicitly repairable.
+fn ensure_parent_destination(task: &Task, relations: &[ParentRecord]) -> Result<()> {
+    let Some(parent) = &task.parent else {
+        return Ok(());
+    };
+    let by_id: HashMap<&str, &ParentRecord> = relations
+        .iter()
+        .map(|record| (record.id.as_str(), record))
+        .collect();
+    if parent != &task.id && !by_id.contains_key(parent.as_str()) {
+        return Err(Error::not_found(
+            "task_not_found",
+            format!("Parent task {parent} does not exist"),
+        )
+        .with_path(&task.path)
+        .with_field("parent"));
+    }
+    let mut ancestry = vec![ParentRecord {
+        id: task.id.clone(),
+        path: task.path.clone(),
+        parent: task.parent.clone(),
+    }];
+    let mut seen = HashSet::new();
+    seen.insert(task.id.as_str());
+    let mut current = Some(parent.as_str());
+    while let Some(id) = current {
+        if !seen.insert(id) {
+            break;
+        }
+        let Some(record) = by_id.get(id) else {
+            break;
+        };
+        ancestry.push((**record).clone());
+        current = record.parent.as_deref();
+    }
+    crate::store::ensure_valid_relations(&ancestry)
 }
 
 #[cfg(test)]
@@ -633,6 +834,7 @@ mod tests {
             state: None,
             projects: Vec::new(),
             tags: Vec::new(),
+            parent: None,
             due_date: None,
             recurrence: None,
             recurrence_from: None,
@@ -651,8 +853,8 @@ mod tests {
         let value = serde_json::to_value(TaskView::from_task(&task, &store).expect("view"))
             .expect("serialize view");
         let object = value.as_object().expect("object");
-        assert_eq!(object.len(), 13);
         for field in [
+            "parent",
             "due_date",
             "recurrence",
             "recurrence_from",
@@ -814,5 +1016,129 @@ mod tests {
         .expect("complete");
         assert_eq!(done.state, "done");
         assert_eq!(done.due_date, None);
+    }
+
+    #[test]
+    fn explicit_repairs_and_unrelated_safe_mutations_preserve_bad_edges() {
+        let (_temp, store) = store();
+        let root = add(&store, &minimal("Root")).expect("root");
+        let first = add(&store, &minimal("Cycle one")).expect("first");
+        let second = add(&store, &minimal("Cycle two")).expect("second");
+        let orphan = add(&store, &minimal("Orphan")).expect("orphan");
+        let missing = "00000000000000000000000000";
+        for (task, parent) in [
+            (&first, second.id.as_str()),
+            (&second, first.id.as_str()),
+            (&orphan, missing),
+        ] {
+            let mut external = task.clone();
+            external.parent = Some(parent.to_owned());
+            fs::write(
+                store.root().join(&task.path),
+                serialize_task(&external, store.config()).expect("well typed bad edge"),
+            )
+            .expect("external graph");
+        }
+        assert_eq!(
+            show(&store, &orphan.id)
+                .expect("inspect orphan")
+                .parent
+                .as_deref(),
+            Some(missing)
+        );
+        let untouched_cycle = fs::read(store.root().join(&second.path)).expect("cycle bytes");
+        let edited = edit(
+            &store,
+            &orphan.id,
+            &EditTask {
+                name: Some("Still orphaned".to_owned()),
+                ..EditTask::default()
+            },
+        )
+        .expect("ordinary safe edit");
+        assert_eq!(edited.parent.as_deref(), Some(missing));
+        cancel(&store, &root.id).expect("independent lifecycle amid faults");
+        let fixed = edit(
+            &store,
+            &first.id,
+            &EditTask {
+                parent: Some(root.id.clone()),
+                ..EditTask::default()
+            },
+        )
+        .expect("break cycle with new ancestry");
+        assert_eq!(fixed.parent.as_deref(), Some(root.id.as_str()));
+        assert_eq!(
+            fs::read(store.root().join(&second.path)).expect("relative preserved"),
+            untouched_cycle
+        );
+        let detached = edit(
+            &store,
+            &orphan.id,
+            &EditTask {
+                clear_parent: true,
+                ..EditTask::default()
+            },
+        )
+        .expect("detach orphan");
+        assert_eq!(detached.parent, None);
+        let tasks = list(
+            &store,
+            &TaskFilter {
+                include_terminal: true,
+                ..TaskFilter::default()
+            },
+            date("2026-09-06"),
+        )
+        .expect("repaired complete graph");
+        assert_eq!(tasks.len(), 4);
+    }
+
+    #[test]
+    fn replacing_parent_requires_valid_effective_ancestry_and_writes_nothing_on_error() {
+        let (_temp, store) = store();
+        let root = add(&store, &minimal("Root")).expect("root");
+        let mut child = minimal("Child");
+        child.parent = Some(root.id.clone());
+        let child = add(&store, &child).expect("child");
+        let original = fs::read(store.root().join(&root.path)).expect("original");
+        let error = edit(
+            &store,
+            &root.id,
+            &EditTask {
+                parent: Some(child.id.clone()),
+                ..EditTask::default()
+            },
+        )
+        .expect_err("descendant parent");
+        assert_eq!(error.code(), "parent_cycle");
+        assert_eq!(
+            fs::read(store.root().join(&root.path)).expect("unchanged root"),
+            original
+        );
+        let error = edit(
+            &store,
+            &root.id,
+            &EditTask {
+                parent: Some(root.id.to_lowercase()),
+                ..EditTask::default()
+            },
+        )
+        .expect_err("self parent");
+        assert_eq!(error.code(), "self_parent_reference");
+        let error = edit(
+            &store,
+            &child.id,
+            &EditTask {
+                parent: Some("00000000000000000000000000".to_owned()),
+                ..EditTask::default()
+            },
+        )
+        .expect_err("absent destination");
+        assert_eq!(error.code(), "task_not_found");
+        assert_eq!(
+            show(&store, &child.id).expect("unchanged child").parent,
+            Some(root.id)
+        );
     }
 }

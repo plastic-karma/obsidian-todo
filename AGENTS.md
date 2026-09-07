@@ -2,24 +2,25 @@
 
 ## Project Overview
 
-`obsidian-todo` is a local-first Rust library plus the `otodo` CLI. It stores tasks and projects as human-editable Markdown notes with YAML front matter inside an existing Obsidian vault. Durable state is filesystem-only: `.todo/config.toml`, `.todo/schema.json`, `Tasks/**/*.md`, and `Projects/*.md`; initialization also creates `todos.base` for Obsidian.
+`obsidian-todo` is a local-first Rust library plus the `otodo` CLI. It stores tasks and projects as human-editable Markdown notes with YAML front matter inside an existing Obsidian vault. Durable state is filesystem-only: `.todo/config.toml`, `.todo/schema.json`, `Tasks/**/*.md`, `Projects/*.md`, and ordinary `Attachments/**` files with task body links; initialization also creates `todos.base` for Obsidian.
 
-`REQUIREMENTS.md` is the normative v1 specification. Treat its RFC 2119 requirements and non-goals as hard constraints. The application must not invoke Git, require network access, create a hidden database, or touch unrelated vault content.
+`REQUIREMENTS.md` is the normative v2 specification with explicit legacy-v1 support. Treat its RFC 2119 requirements and non-goals as hard constraints. V2 enables optional `parent` ULIDs; v1 remains flat and preserves any unknown `parent` metadata. Never auto-upgrade a store. The application must not invoke Git, require network access, create a hidden database, or touch unrelated vault content.
 
 ## Architecture & Data Flow
 
 1. `src/main.rs` calls `src/cli.rs::run`; `cli::execute` is the composition root and maps Clap arguments into command request structs.
-2. `init` resolves a vault and creates a contained store. Other commands discover a store in this order: `--root`, `OBSIDIAN_TODO_ROOT`, nearest ancestor store, then one unambiguous direct child.
-3. `Store::open` in `src/store.rs` canonicalizes paths, loads strict TOML config, verifies the embedded schema, and establishes managed-directory boundaries.
-4. `src/commands/{task,project}.rs` owns use-case transactions and cross-record invariants. Commands acquire shared/exclusive store locks, load records, validate references and state transitions, then serialize changes.
+2. `init` resolves a vault and creates a contained v2 store. Store commands, including explicit upgrade, discover a store in this order: `--root`, `OBSIDIAN_TODO_ROOT`, nearest ancestor store, then one unambiguous direct child. `capabilities`, help, and executable-version queries bypass store discovery.
+3. `Store::open` in `src/store.rs` canonicalizes paths, loads strict TOML config, verifies the exact embedded schema for explicitly supported v1/v2, and establishes managed-directory boundaries. Operations must recheck config/schema generation and config path identity after locking and before publication; upgrades require quiesced old writers and fail-closed explicit resume.
+4. `src/commands/{task,project}.rs` owns use-case transactions and cross-record invariants. Commands acquire shared/exclusive store locks, load records, validate references and state transitions, then serialize changes. V2 parent edits validate the effective graph, preserve repairability of well-typed faults, and never cascade; deleting a task with any direct children refuses.
 5. `src/frontmatter.rs` parses bounded YAML front matter into `Task`/`Project` models while preserving Markdown bodies and unknown Obsidian properties. `src/model.rs` and `src/recurrence.rs` enforce domain rules.
-6. Mutations carry a full-file snapshot. Before replace/delete, the store re-reads and hashes the source; mismatches fail as concurrent edits. Writes use same-directory temporary files, sync, atomic persist/rename, and parent-directory sync.
+6. Mutations carry a full-file snapshot. Before replace/delete, the store re-reads and hashes the source; mismatches fail as concurrent edits. Relation-sensitive operations also recheck identity/edge dependencies, including newly added children. Writes use same-directory temporary files, sync, atomic persist/rename, and parent-directory sync. These are single-file guarantees, not multi-file atomicity against external editors.
 7. `src/output.rs` renders either human output or the stable versioned JSON envelope. Success goes to stdout; errors and diagnostics go to stderr with stable error codes and exit classes.
 
 Whole-store validation is a separate tolerant path: `src/validate.rs::validate_store` accumulates and deterministically sorts independent issues. Do not replace it with fail-fast `Store::open` behavior.
 
 ## Key Directories
 
+- `src/attachments.rs`: shared explicit-link parsing, safe source staging, attachment metadata, and diagnostics.
 - `src/commands/`: initialization and task/project application operations.
 - `src/`: CLI boundary, persistence, domain models, codecs, discovery, validation, and errors.
 - `tests/`: black-box CLI integration coverage in `tests/cli.rs`.
@@ -65,7 +66,7 @@ Use `cargo build --release` for the optimized binary. Automation may add `--lock
 - Return `crate::error::Result<T>` and propagate with `?`/`map_err`. Build typed errors through `Error::{usage, not_found, validation, unsupported, io}` and attach `path`, `field`, or source location. Malformed user/repository data must not panic or produce a backtrace.
 - Treat config, paths, filenames, links, and YAML as hostile input. Preserve path containment and symlink defenses. Never construct shell commands from record data or invoke Git/editors/hooks.
 - Never regex-parse front matter. Preserve unknown YAML values semantically and preserve an untouched Markdown body byte-for-byte. Writers normalize user-supplied bodies to LF with one trailing newline, emit canonical core-property order, and sort projects/tags deterministically.
-- Task identity is the 26-character ULID filename, never front matter. Tasks may be nested recursively; projects are flat and use stable lowercase slugs. State is a string validated against ordered `Config.states`, not a Rust enum.
+- Task identity is the 26-character ULID filename, never front matter. Tasks may be nested recursively; projects are flat and use stable lowercase slugs. V2 `parent` is an optional quoted full ULID, case-insensitive on read/canonical-uppercase on write, emitted after tags; omission means root. Derive children by identity, never persist child arrays or inherit metadata/lifecycle. State is a string validated against ordered `Config.states`, not a Rust enum.
 - Production code is synchronous. There is no async runtime, global mutable state, service container, or storage abstraction. Dependency injection is explicit: command functions receive `&Store` plus request structs, and time-sensitive code receives `Clock` (`SystemClock` or `FixedClock`).
 - Prefer command-layer APIs when cross-record invariants matter. Low-level store reads do not uniformly enforce project-reference consistency.
 
@@ -80,7 +81,7 @@ Use `cargo build --release` for the optimized binary. Automation may add `--lock
 - `src/model.rs`, `src/recurrence.rs`: domain invariants, clock injection, recurrence parsing, and date advancement.
 - `src/frontmatter.rs`: safe YAML/Markdown parsing and canonical serialization.
 - `src/validate.rs`, `src/error.rs`: aggregate diagnostics, stable codes, and exit-status mapping.
-- `assets/schema.json`: JSON Schema copied to initialized stores; keep it aligned with Rust record validation and tests.
+- `assets/`: exact supported structural schemas copied to initialized/upgraded stores; retain the historical v1 asset and keep v1/v2 schemas aligned with runtime validation and tests.
 
 ## Runtime/Tooling Preferences
 
@@ -100,5 +101,5 @@ Tests use standard Rust `#[test]`, `assert_cmd`, `TempDir`, and Criterion; no sn
 - `tests/cli.rs` runs the compiled binary against real temporary vaults and verifies streams, exit codes, JSON shapes, exact files, preservation, containment, concurrency refusal, discovery, and no-Git behavior.
 - Keep tests deterministic with fixed ULIDs where identity is incidental, `FixedClock`/`--today` for dates, local fixture builders, and per-test `TempDir`s. Do not mutate process-global environment when command-local injection works.
 - Assert observable contracts: serialized bytes, resulting filesystem state, stable error code/exit class, stdout versus stderr, JSON fields, and unchanged unrelated data. Avoid tests that only mirror source structure.
-- Changes to record fields/order, line endings, JSON, schema, recurrence, filesystem safety, or CLI output require the nearest unit test plus relevant black-box CLI coverage. Keep `REQUIREMENTS.md`, `assets/schema.json`, Rust validation, and generated output synchronized.
+- Changes to record fields/order, line endings, JSON, schema, recurrence, filesystem safety, or CLI output require the nearest behavioral unit test plus relevant black-box CLI coverage. Keep `REQUIREMENTS.md`, supported schema assets, Rust validation, generated output, and the shared subtask conformance corpus synchronized.
 - No numeric coverage threshold or coverage tool is configured. Behavioral completeness and the full format/lint/test gate are the acceptance standard.

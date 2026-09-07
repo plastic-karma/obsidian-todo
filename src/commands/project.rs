@@ -167,12 +167,10 @@ pub fn delete(store: &Store, slug: &str, confirmed: bool) -> Result<Project> {
     }
     store.with_exclusive_lock(|| {
         let stored = store.load_project_unlocked(slug)?;
-        let tasks = store.load_selected_tasks_unlocked(|_| Ok(true))?;
-        let mut references = tasks
-            .iter()
-            .filter(|task| task.projects.iter().any(|project| project == slug))
-            .map(|task| task.id.clone())
-            .collect::<Vec<_>>();
+        let tasks = store.load_selected_task_records_unlocked(|task| {
+            Ok(task.projects.iter().any(|project| project == slug))
+        })?;
+        let mut references = tasks.into_iter().map(|task| task.id).collect::<Vec<_>>();
         references.sort();
         if !references.is_empty() {
             return Err(Error::validation(

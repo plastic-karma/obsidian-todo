@@ -1,0 +1,129 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "relative",
+      "task_path": "Tasks/task.md",
+      "body": "- [Receipt](../Attachments/id/receipt.pdf)\n",
+      "paths": [
+        "Attachments/id/receipt.pdf"
+      ],
+      "unlink_path": "Attachments/id/receipt.pdf",
+      "unlinked": "- \n"
+    },
+    {
+      "name": "nested unicode",
+      "task_path": "Tasks/2026/work/task.md",
+      "body": "Before ![Photo](../../../Attachments/id/caf%C3%A9%20photo.png) after\n",
+      "paths": [
+        "Attachments/id/café photo.png"
+      ],
+      "unlink_path": "Attachments/id/café photo.png",
+      "unlinked": "Before  after\n"
+    },
+    {
+      "name": "explicit wikilinks",
+      "task_path": "Tasks/task.md",
+      "body": "[[Attachments/manual.pdf|Receipt]] ![[../Attachments/photo.png]]\n",
+      "paths": [
+        "Attachments/manual.pdf",
+        "Attachments/photo.png"
+      ],
+      "unlink_path": "Attachments/manual.pdf",
+      "unlinked": " ![[../Attachments/photo.png]]\n"
+    },
+    {
+      "name": "code examples",
+      "task_path": "Tasks/task.md",
+      "body": "`[x](../Attachments/no.pdf)`\n```md\n![[Attachments/no.png]]\n```\n    [[Attachments/indented.pdf]]\n[x](../Attachments/yes.pdf)\n",
+      "paths": [
+        "Attachments/yes.pdf"
+      ],
+      "unlink_path": "Attachments/yes.pdf",
+      "unlinked": "`[x](../Attachments/no.pdf)`\n```md\n![[Attachments/no.png]]\n```\n    [[Attachments/indented.pdf]]\n\n"
+    },
+    {
+      "name": "ambiguous external unsafe",
+      "task_path": "Tasks/task.md",
+      "body": "[[receipt.pdf]] [external](https://example.org/Attachments/x.pdf) [escape](../../Attachments/x.pdf) [bad](../Attachments/../Tasks/x.md)\n",
+      "paths": [],
+      "unlink_path": "Attachments/x.pdf",
+      "unlinked": "[[receipt.pdf]] [external](https://example.org/Attachments/x.pdf) [escape](../../Attachments/x.pdf) [bad](../Attachments/../Tasks/x.md)\n"
+    },
+    {
+      "name": "duplicate fragments and title",
+      "task_path": "Tasks/task.md",
+      "body": "[One](../Attachments/x.pdf#page=2 \"Title\") [[Attachments/x.pdf#page=3|Two]]\n",
+      "paths": [
+        "Attachments/x.pdf"
+      ],
+      "unlink_path": "Attachments/x.pdf",
+      "unlinked": " \n"
+    },
+    {
+      "name": "configured vault prefix",
+      "task_path": "Tasks/task.md",
+      "store_prefix": "Personal/Todo",
+      "body": "[[Personal/Todo/Attachments/manual.pdf|Receipt]] ![[Other/Attachments/ignore.png]]\n",
+      "paths": [
+        "Attachments/manual.pdf"
+      ],
+      "unlink_path": "Attachments/manual.pdf",
+      "unlinked": " ![[Other/Attachments/ignore.png]]\n"
+    },
+    {
+      "name": "balanced parentheses and label brackets",
+      "task_path": "Tasks/task.md",
+      "body": "[Report [revised]](../Attachments/report(1).pdf)\n",
+      "paths": [
+        "Attachments/report(1).pdf"
+      ],
+      "unlink_path": "Attachments/report(1).pdf",
+      "unlinked": "\n"
+    },
+    {
+      "name": "multiline and exact inline code spans",
+      "task_path": "Tasks/task.md",
+      "body": "``example ` [no](../Attachments/no.pdf) ``\n`example\n[[Attachments/no.pdf]]`\n[yes](../Attachments/yes.pdf)\n",
+      "paths": [
+        "Attachments/yes.pdf"
+      ],
+      "unlink_path": "Attachments/yes.pdf",
+      "unlinked": "``example ` [no](../Attachments/no.pdf) ``\n`example\n[[Attachments/no.pdf]]`\n\n"
+    },
+    {
+      "name": "escaped syntax",
+      "task_path": "Tasks/task.md",
+      "body": "\\[not](../Attachments/no.pdf) \\\\[yes](../Attachments/yes.pdf)\n",
+      "paths": [
+        "Attachments/yes.pdf"
+      ],
+      "unlink_path": "Attachments/yes.pdf",
+      "unlinked": "\\[not](../Attachments/no.pdf) \\\\\n"
+    },
+    {
+      "name": "fence requires empty closing suffix",
+      "task_path": "Tasks/task.md",
+      "body": "```\n``` not a closer\n[[Attachments/no.pdf]]\n```\n[[Attachments/yes.pdf]]\n",
+      "paths": [
+        "Attachments/yes.pdf"
+      ],
+      "unlink_path": "Attachments/yes.pdf",
+      "unlinked": "```\n``` not a closer\n[[Attachments/no.pdf]]\n```\n\n"
+    }
+  ],
+  "filenames": [
+    {
+      "input": "café photo.png",
+      "output": "café photo.png"
+    },
+    {
+      "input": "../bad:name?.pdf",
+      "output": "_bad_name_.pdf"
+    },
+    {
+      "input": " . ",
+      "output": "attachment"
+    }
+  ]
+}

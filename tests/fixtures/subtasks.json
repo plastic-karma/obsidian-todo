@@ -1,0 +1,296 @@
+{
+  "version": 1,
+  "record_cases": [
+    {
+      "name": "v2_root_terminal_with_metadata",
+      "schema_version": 2,
+      "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      "markdown": "---\nname: \"v2_root_terminal_with_metadata\"\nstate: done\nprojects: []\ntags: [fixture]\nplugin:\n  enabled: true\n  values: [yes, 7, null]\n  nested:\n    note: \"Retain parent-related metadata\"\n---\n<!-- A terminal root may have active children. -->\r\n\r\nKeep trailing spaces.  \nFinal line without newline",
+      "expected_parent": null,
+      "expected_error": null
+    },
+    {
+      "name": "v2_parent_canonical",
+      "schema_version": 2,
+      "id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "markdown": "---\nname: \"v2_parent_canonical\"\nstate: open\nprojects: []\ntags: [fixture]\nparent: \"01ARZ3NDEKTSV4RRFFQ69G5FAV\"\ndue_date: \"2026-09-06\"\nplugin: {source: capture}\n---\n<!-- Preserve this comment. -->\n\n- Keep **Markdown** and [[unrelated/link]].\n",
+      "expected_parent": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      "expected_error": null
+    },
+    {
+      "name": "v2_parent_lowercase",
+      "schema_version": 2,
+      "id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "markdown": "---\nname: \"v2_parent_lowercase\"\nstate: open\nprojects: []\ntags: [fixture]\nparent: \"01arz3ndektsv4rrffq69g5fav\"\n---\n<!-- Preserve this comment. -->\n\n- Keep **Markdown** and [[unrelated/link]].\n",
+      "expected_parent": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      "expected_error": null
+    },
+    {
+      "name": "v2_parent_all_numeric_quoted",
+      "schema_version": 2,
+      "id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "markdown": "---\nname: \"v2_parent_all_numeric_quoted\"\nstate: open\nprojects: []\ntags: [fixture]\nparent: \"00000000000000000000000001\"\n---\n<!-- Preserve this comment. -->\n\n- Keep **Markdown** and [[unrelated/link]].\n",
+      "expected_parent": "00000000000000000000000001",
+      "expected_error": null
+    },
+    {
+      "name": "v2_terminal_child",
+      "schema_version": 2,
+      "id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+      "markdown": "---\nname: \"v2_terminal_child\"\nstate: done\nprojects: []\ntags: [fixture]\nparent: \"01ARZ3NDEKTSV4RRFFQ69G5FAW\"\n---\n<!-- Preserve this comment. -->\n\n- Keep **Markdown** and [[unrelated/link]].\n",
+      "expected_parent": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "expected_error": null
+    },
+    {
+      "name": "v2_self_parent_remains_repairable",
+      "schema_version": 2,
+      "id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "markdown": "---\nname: \"v2_self_parent_remains_repairable\"\nstate: open\nprojects: []\ntags: [fixture]\nparent: \"01ARZ3NDEKTSV4RRFFQ69G5FAW\"\n---\n<!-- Decode this edge; graph validation diagnoses it and explicit detach repairs it. -->\n",
+      "expected_parent": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "expected_error": null
+    },
+    {
+      "name": "v2_parent_null_invalid",
+      "schema_version": 2,
+      "id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "markdown": "---\nname: \"v2_parent_null_invalid\"\nstate: open\nprojects: []\ntags: [fixture]\nparent: null\n---\n<!-- Preserve this comment. -->\n\n- Keep **Markdown** and [[unrelated/link]].\n",
+      "expected_parent": null,
+      "expected_error": "invalid_parent_id"
+    },
+    {
+      "name": "v2_parent_number_invalid",
+      "schema_version": 2,
+      "id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "markdown": "---\nname: \"v2_parent_number_invalid\"\nstate: open\nprojects: []\ntags: [fixture]\nparent: 42\n---\n<!-- Preserve this comment. -->\n\n- Keep **Markdown** and [[unrelated/link]].\n",
+      "expected_parent": null,
+      "expected_error": "invalid_parent_id"
+    },
+    {
+      "name": "v2_parent_empty_invalid",
+      "schema_version": 2,
+      "id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "markdown": "---\nname: \"v2_parent_empty_invalid\"\nstate: open\nprojects: []\ntags: [fixture]\nparent: \"\"\n---\n<!-- Preserve this comment. -->\n\n- Keep **Markdown** and [[unrelated/link]].\n",
+      "expected_parent": null,
+      "expected_error": "invalid_parent_id"
+    },
+    {
+      "name": "v2_parent_prefix_invalid",
+      "schema_version": 2,
+      "id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "markdown": "---\nname: \"v2_parent_prefix_invalid\"\nstate: open\nprojects: []\ntags: [fixture]\nparent: \"01ARZ3\"\n---\n<!-- Preserve this comment. -->\n\n- Keep **Markdown** and [[unrelated/link]].\n",
+      "expected_parent": null,
+      "expected_error": "invalid_parent_id"
+    },
+    {
+      "name": "v2_parent_path_invalid",
+      "schema_version": 2,
+      "id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "markdown": "---\nname: \"v2_parent_path_invalid\"\nstate: open\nprojects: []\ntags: [fixture]\nparent: \"Tasks/nested/01ARZ3NDEKTSV4RRFFQ69G5FAV.md\"\n---\n<!-- Preserve this comment. -->\n\n- Keep **Markdown** and [[unrelated/link]].\n",
+      "expected_parent": null,
+      "expected_error": "invalid_parent_id"
+    },
+    {
+      "name": "v2_parent_wikilink_invalid",
+      "schema_version": 2,
+      "id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "markdown": "---\nname: \"v2_parent_wikilink_invalid\"\nstate: open\nprojects: []\ntags: [fixture]\nparent: \"[[01ARZ3NDEKTSV4RRFFQ69G5FAV]]\"\n---\n<!-- Preserve this comment. -->\n\n- Keep **Markdown** and [[unrelated/link]].\n",
+      "expected_parent": null,
+      "expected_error": "invalid_parent_id"
+    },
+    {
+      "name": "v2_parent_overflow_invalid",
+      "schema_version": 2,
+      "id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "markdown": "---\nname: \"v2_parent_overflow_invalid\"\nstate: open\nprojects: []\ntags: [fixture]\nparent: \"81ARZ3NDEKTSV4RRFFQ69G5FAV\"\n---\n<!-- Preserve this comment. -->\n\n- Keep **Markdown** and [[unrelated/link]].\n",
+      "expected_parent": null,
+      "expected_error": "invalid_parent_id"
+    },
+    {
+      "name": "v1_parent_mapping_preserved_as_unknown",
+      "schema_version": 1,
+      "id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "markdown": "---\nname: \"v1_parent_mapping_preserved_as_unknown\"\nstate: open\nprojects: []\ntags: [fixture]\nparent:\n  label: \"Plugin-owned parent\"\n  values: [yes, 7, null]\n  nested:\n    enabled: true\nplugin: {source: legacy}\n---\n<!-- Preserve the entire unknown parent mapping semantically. -->\r\nLegacy body without newline",
+      "expected_parent": null,
+      "expected_error": null
+    },
+    {
+      "name": "v1_parent_ulid_preserved_as_unknown",
+      "schema_version": 1,
+      "id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "markdown": "---\nname: \"v1_parent_ulid_preserved_as_unknown\"\nstate: open\nprojects: []\ntags: [fixture]\nparent: \"01arz3ndektsv4rrffq69g5fav\"\n---\n<!-- Do not adopt or uppercase the legacy parent extra. -->\n",
+      "expected_parent": null,
+      "expected_error": null
+    },
+    {
+      "name": "v1_parent_null_preserved_as_unknown",
+      "schema_version": 1,
+      "id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "markdown": "---\nname: \"v1_parent_null_preserved_as_unknown\"\nstate: open\nprojects: []\ntags: [fixture]\nparent: null\n---\n<!-- A present null extra is not an absent property. -->\n",
+      "expected_parent": null,
+      "expected_error": null
+    }
+  ],
+  "graph_cases": [
+    {
+      "name": "valid_nesting_and_independent_root",
+      "tasks": [
+        {
+          "id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+          "parent": "01ARZ3NDEKTSV4RRFFQ69G5FAW"
+        },
+        {
+          "id": "01ARZ3NDEKTSV4RRFFQ69G5FAY",
+          "parent": null
+        },
+        {
+          "id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+          "parent": "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        },
+        {
+          "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          "parent": null
+        }
+      ],
+      "expected_issues": []
+    },
+    {
+      "name": "orphan_parent",
+      "tasks": [
+        {
+          "id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+          "parent": "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        },
+        {
+          "id": "01ARZ3NDEKTSV4RRFFQ69G5FAY",
+          "parent": null
+        }
+      ],
+      "expected_issues": [
+        {
+          "code": "missing_parent_reference",
+          "task_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW"
+        }
+      ]
+    },
+    {
+      "name": "self_parent",
+      "tasks": [
+        {
+          "id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+          "parent": "01ARZ3NDEKTSV4RRFFQ69G5FAW"
+        }
+      ],
+      "expected_issues": [
+        {
+          "code": "self_parent_reference",
+          "task_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW"
+        }
+      ]
+    },
+    {
+      "name": "two_node_cycle",
+      "tasks": [
+        {
+          "id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+          "parent": "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        },
+        {
+          "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          "parent": "01ARZ3NDEKTSV4RRFFQ69G5FAW"
+        }
+      ],
+      "expected_issues": [
+        {
+          "code": "parent_cycle",
+          "task_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        },
+        {
+          "code": "parent_cycle",
+          "task_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW"
+        }
+      ]
+    },
+    {
+      "name": "longer_cycle_excludes_incoming_descendant",
+      "tasks": [
+        {
+          "id": "01ARZ3NDEKTSV4RRFFQ69G5FAY",
+          "parent": "01ARZ3NDEKTSV4RRFFQ69G5FAX"
+        },
+        {
+          "id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+          "parent": "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        },
+        {
+          "id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+          "parent": "01ARZ3NDEKTSV4RRFFQ69G5FAX"
+        },
+        {
+          "id": "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+          "parent": null
+        },
+        {
+          "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          "parent": "01ARZ3NDEKTSV4RRFFQ69G5FAW"
+        }
+      ],
+      "expected_issues": [
+        {
+          "code": "parent_cycle",
+          "task_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        },
+        {
+          "code": "parent_cycle",
+          "task_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW"
+        },
+        {
+          "code": "parent_cycle",
+          "task_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX"
+        }
+      ]
+    },
+    {
+      "name": "duplicate_ids_once_per_identity",
+      "tasks": [
+        {
+          "id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+          "parent": null
+        },
+        {
+          "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          "parent": null
+        },
+        {
+          "id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+          "parent": "01ARZ3NDEKTSV4RRFFQ69G5FAX"
+        },
+        {
+          "id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+          "parent": "01ARZ3NDEKTSV4RRFFQ69G5FAX"
+        },
+        {
+          "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          "parent": null
+        },
+        {
+          "id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+          "parent": "00000000000000000000000001"
+        },
+        {
+          "id": "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+          "parent": null
+        }
+      ],
+      "expected_issues": [
+        {
+          "code": "duplicate_task_id",
+          "task_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        },
+        {
+          "code": "duplicate_task_id",
+          "task_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX"
+        }
+      ]
+    }
+  ]
+}

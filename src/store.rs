@@ -9,10 +9,15 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use walkdir::WalkDir;
 
-use crate::config::{managed_paths_overlap, Config, CONFIG_PATH, EMBEDDED_SCHEMA, SCHEMA_PATH};
+use crate::config::{
+    embedded_schema, managed_paths_overlap, Config, CONFIG_PATH, EMBEDDED_SCHEMA, SCHEMA_PATH,
+};
 use crate::error::{Error, ErrorKind, Result};
 use crate::frontmatter::{parse_project, parse_task, MAX_RECORD_BYTES};
-use crate::model::{validate_id_prefix, validate_project_slug, validate_task_id, Project, Task};
+use crate::model::{
+    analyze_parents, validate_id_prefix, validate_project_slug, validate_task_id, ParentRecord,
+    Project, Task,
+};
 
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
@@ -20,6 +25,9 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 pub struct Store {
     root: PathBuf,
     config: Config,
+    config_hash: [u8; 32],
+    schema_hash: [u8; 32],
+    config_identity: FileIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,9 +67,50 @@ pub(crate) struct StoredProject {
     pub snapshot: FileSnapshot,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    created: Option<std::time::SystemTime>,
+}
+
+impl FileIdentity {
+    fn of(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                created: metadata.created().ok(),
+            }
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct UpgradeResult {
+    pub from: u32,
+    pub to: u32,
+    pub dry_run: bool,
+    pub status: String,
+}
+
 impl Store {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
-        let supplied = root.as_ref();
+        Self::open_pair(root.as_ref(), false)
+    }
+
+    fn open_pair(root: &Path, upgrading: bool) -> Result<Self> {
+        let supplied = root;
         let metadata = fs::symlink_metadata(supplied)
             .map_err(|source| Error::io("inspect the todo store root", supplied, &source))?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -76,7 +125,22 @@ impl Store {
         ensure_real_directory(&root, Path::new(".todo"))?;
         let config_path = root.join(CONFIG_PATH);
         ensure_regular_file(&config_path, CONFIG_PATH)?;
-        let source = read_bounded(&config_path, MAX_CONFIG_BYTES, "configuration")?;
+        let (mut config_file, metadata) =
+            open_regular_nofollow(&config_path, Path::new(CONFIG_PATH))?;
+        let config_identity = FileIdentity::of(&metadata);
+        let mut source = Vec::new();
+        Read::by_ref(&mut config_file)
+            .take(MAX_CONFIG_BYTES + 1)
+            .read_to_end(&mut source)
+            .map_err(|source| Error::io("read configuration", &config_path, &source))?;
+        if exceeds_limit(source.len(), MAX_CONFIG_BYTES) {
+            return Err(Error::validation(
+                "record_too_large",
+                "Configuration exceeds the size limit",
+            )
+            .with_path(CONFIG_PATH));
+        }
+        let config_hash = content_hash(&source);
         let source = String::from_utf8(source).map_err(|_| {
             Error::validation("invalid_config_utf8", "Configuration must be UTF-8")
                 .with_path(CONFIG_PATH)
@@ -101,8 +165,23 @@ impl Store {
                 "Managed directories must be distinct from .todo and from one another",
             ));
         }
-        validate_schema(&root, config.schema_version)?;
-        Ok(Self { root, config })
+        let schema_hash = if upgrading && config.schema_version == 1 {
+            match validate_schema(&root, 1) {
+                Ok(hash) => hash,
+                Err(_) => validate_schema(&root, 2)?,
+            }
+        } else {
+            validate_schema(&root, config.schema_version)?
+        };
+        let store = Self {
+            root,
+            config,
+            config_hash,
+            schema_hash,
+            config_identity,
+        };
+        store.ensure_generation()?;
+        Ok(store)
     }
 
     #[must_use]
@@ -155,6 +234,25 @@ impl Store {
     where
         F: Fn(&Task) -> Result<bool> + Sync,
     {
+        self.scan_selected_tasks_unlocked(select, true)
+    }
+
+    /// Read every record and reject ambiguous identities without validating parent edges.
+    pub(crate) fn load_selected_task_records_unlocked<F>(&self, select: F) -> Result<Vec<Task>>
+    where
+        F: Fn(&Task) -> Result<bool> + Sync,
+    {
+        self.scan_selected_tasks_unlocked(select, false)
+    }
+
+    fn scan_selected_tasks_unlocked<F>(
+        &self,
+        select: F,
+        validate_relations: bool,
+    ) -> Result<Vec<Task>>
+    where
+        F: Fn(&Task) -> Result<bool> + Sync,
+    {
         const TASKS_PER_WORKER: usize = 256;
         const MAX_WORKERS: usize = 8;
 
@@ -180,7 +278,12 @@ impl Store {
             .min(candidates.len().div_ceil(TASKS_PER_WORKER))
             .max(1);
         if worker_count == 1 {
-            return self.load_selected_task_chunk(&candidates, &select);
+            let (tasks, relations) =
+                self.load_selected_task_chunk(&candidates, &select, validate_relations)?;
+            if validate_relations {
+                ensure_valid_relations(&relations)?;
+            }
+            return Ok(tasks);
         }
 
         let chunk_size = candidates.len().div_ceil(worker_count);
@@ -188,12 +291,19 @@ impl Store {
             let mut workers = Vec::with_capacity(worker_count);
             for chunk in candidates.chunks(chunk_size) {
                 let select = &select;
-                workers.push(scope.spawn(move || self.load_selected_task_chunk(chunk, select)));
+                workers.push(scope.spawn(move || {
+                    self.load_selected_task_chunk(chunk, select, validate_relations)
+                }));
             }
 
             let mut tasks = Vec::new();
+            let mut relations = if validate_relations {
+                Vec::with_capacity(candidates.len())
+            } else {
+                Vec::new()
+            };
             for worker in workers {
-                let mut selected = worker.join().map_err(|_| {
+                let (mut selected, mut edges) = worker.join().map_err(|_| {
                     Error::new(
                         ErrorKind::Io,
                         "task_scan_worker_failed",
@@ -201,6 +311,10 @@ impl Store {
                     )
                 })??;
                 tasks.append(&mut selected);
+                relations.append(&mut edges);
+            }
+            if validate_relations {
+                ensure_valid_relations(&relations)?;
             }
             Ok(tasks)
         })
@@ -210,34 +324,68 @@ impl Store {
         &self,
         candidates: &[(String, PathBuf)],
         select: &F,
-    ) -> Result<Vec<Task>>
+        collect_relations: bool,
+    ) -> Result<(Vec<Task>, Vec<ParentRecord>)>
     where
         F: Fn(&Task) -> Result<bool> + Sync,
     {
         let mut tasks = Vec::new();
+        let mut relations = if collect_relations {
+            Vec::with_capacity(candidates.len())
+        } else {
+            Vec::new()
+        };
         for (id, relative) in candidates {
             let source = self.read_record(relative, MAX_RECORD_BYTES as u64, "task")?;
             let task = parse_task(id, relative, &source, &self.config)
                 .map_err(|error| error_with_path(error, relative))?;
+            if collect_relations {
+                relations.push(ParentRecord {
+                    id: id.clone(),
+                    path: relative.clone(),
+                    parent: task.parent.clone(),
+                });
+            }
             if select(&task)? {
                 tasks.push(task);
             }
         }
-        Ok(tasks)
+        Ok((tasks, relations))
     }
-    pub(crate) fn task_ids_unlocked(&self) -> Result<HashSet<String>> {
+
+    /// Compact complete identity/edge snapshot; no excluded record bodies survive a scan.
+    pub(crate) fn relations_unlocked(&self) -> Result<Vec<ParentRecord>> {
         let candidates = self.task_candidates()?;
-        let mut ids = HashSet::with_capacity(candidates.len());
-        for (id, relative) in candidates {
-            if !ids.insert(id.clone()) {
+        let mut seen = HashSet::with_capacity(candidates.len());
+        let mut records = Vec::with_capacity(candidates.len());
+        for (id, path) in candidates {
+            if !seen.insert(id.clone()) {
                 return Err(Error::validation(
                     "duplicate_task_id",
                     format!("Task ID {id} appears more than once"),
                 )
-                .with_path(relative));
+                .with_path(path));
             }
+            let bytes = self.read_record(&path, MAX_RECORD_BYTES as u64, "task")?;
+            let task = parse_task(&id, &path, &bytes, &self.config)
+                .map_err(|error| error_with_path(error, &path))?;
+            records.push(ParentRecord {
+                id,
+                path,
+                parent: task.parent,
+            });
         }
-        Ok(ids)
+        Ok(records)
+    }
+
+    pub(crate) fn ensure_relations_unchanged(&self, expected: &[ParentRecord]) -> Result<()> {
+        match self.relations_unlocked() {
+            Ok(current) if current == expected => Ok(()),
+            _ => Err(concurrent(
+                "Task identities or parent edges changed after they were read",
+                Path::new(&self.config.tasks_directory),
+            )),
+        }
     }
 
     pub(crate) fn load_all_projects_unlocked(&self) -> Result<Vec<StoredProject>> {
@@ -333,10 +481,25 @@ impl Store {
         Ok(StoredProject { project, snapshot })
     }
 
+    #[cfg(test)]
     pub(crate) fn create_task(&self, id: &str, bytes: &[u8]) -> Result<PathBuf> {
         validate_task_id(id)?;
         let relative = self.config.tasks_path()?.join(format!("{id}.md"));
         self.create_file(&relative, bytes)?;
+        Ok(relative)
+    }
+
+    pub(crate) fn create_task_checked(
+        &self,
+        id: &str,
+        bytes: &[u8],
+        relations: &[ParentRecord],
+    ) -> Result<PathBuf> {
+        validate_task_id(id)?;
+        let relative = self.config.tasks_path()?.join(format!("{id}.md"));
+        self.create_file_checked(&relative, bytes, || {
+            self.ensure_relations_unchanged(relations)
+        })?;
         Ok(relative)
     }
 
@@ -348,6 +511,15 @@ impl Store {
     }
 
     pub(crate) fn replace(&self, snapshot: &FileSnapshot, bytes: &[u8]) -> Result<()> {
+        self.replace_checked(snapshot, bytes, || Ok(()))
+    }
+
+    pub(crate) fn replace_checked(
+        &self,
+        snapshot: &FileSnapshot,
+        bytes: &[u8],
+        recheck: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         std::str::from_utf8(bytes).map_err(|_| {
             Error::validation("invalid_utf8", "Replacement record must be UTF-8")
                 .with_path(&snapshot.relative_path)
@@ -388,6 +560,8 @@ impl Store {
             )
         })?;
 
+        recheck()?;
+        self.ensure_generation()?;
         self.ensure_unchanged(snapshot)?;
         temporary.persist(&snapshot.path).map_err(|error| {
             Error::io("atomically replace a record", &snapshot.path, &error.error)
@@ -396,7 +570,14 @@ impl Store {
     }
 
     pub(crate) fn delete(&self, snapshot: &FileSnapshot) -> Result<()> {
-        self.ensure_unchanged(snapshot)?;
+        self.delete_checked(snapshot, || Ok(()))
+    }
+
+    pub(crate) fn delete_checked(
+        &self,
+        snapshot: &FileSnapshot,
+        recheck: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         ensure_real_directory(
             &self.root,
             snapshot.relative_path.parent().ok_or_else(|| {
@@ -413,6 +594,9 @@ impl Store {
             )
             .with_path(&snapshot.relative_path));
         }
+        recheck()?;
+        self.ensure_generation()?;
+        self.ensure_unchanged(snapshot)?;
         fs::remove_file(&snapshot.path)
             .map_err(|source| Error::io("delete a record", &snapshot.path, &source))?;
         if let Some(parent) = snapshot.path.parent() {
@@ -433,7 +617,9 @@ impl Store {
                 &source,
             )
         })?;
-        let result = operation();
+        let result = self
+            .ensure_lock_generation(&file)
+            .and_then(|()| operation());
         let unlock_result = FileExt::unlock(&file).map_err(|source| {
             Error::io(
                 "release the store's advisory lock",
@@ -456,7 +642,9 @@ impl Store {
                 &source,
             )
         })?;
-        let result = operation();
+        let result = self
+            .ensure_lock_generation(&file)
+            .and_then(|()| operation());
         let unlock_result = FileExt::unlock(&file).map_err(|source| {
             Error::io(
                 "release the store's advisory lock",
@@ -609,11 +797,58 @@ impl Store {
         Ok(candidates)
     }
 
+    pub(crate) fn create_attachment(
+        &self,
+        attachment: &crate::attachments::StagedAttachment,
+    ) -> Result<()> {
+        crate::attachments::ensure_enabled(self.config())?;
+        let relative = crate::attachments::validate_selector(&attachment.path)?;
+        self.ensure_generation()?;
+        let parent = relative.parent().ok_or_else(|| {
+            Error::validation("unsafe_attachment_path", "Missing attachment parent")
+        })?;
+        let mut current = PathBuf::new();
+        for component in parent.components() {
+            current.push(component);
+            match fs::create_dir(self.root.join(&current)) {
+                Ok(()) => {
+                    sync_directory(self.root.join(&current).parent().unwrap_or(&self.root))?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(Error::io("create attachment directory", &current, &error))
+                }
+            }
+            ensure_real_directory(&self.root, &current)?;
+        }
+        self.create_data_file_checked(relative, &attachment.bytes, || {
+            ensure_real_directory(&self.root, parent)
+        })
+    }
+
     fn create_file(&self, relative: &Path, bytes: &[u8]) -> Result<()> {
-        validate_relative_record_path(relative)?;
+        self.create_file_checked(relative, bytes, || Ok(()))
+    }
+
+    fn create_file_checked(
+        &self,
+        relative: &Path,
+        bytes: &[u8],
+        recheck: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         std::str::from_utf8(bytes).map_err(|_| {
             Error::validation("invalid_utf8", "New record must be UTF-8").with_path(relative)
         })?;
+        self.create_data_file_checked(relative, bytes, recheck)
+    }
+
+    fn create_data_file_checked(
+        &self,
+        relative: &Path,
+        bytes: &[u8],
+        recheck: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        validate_relative_record_path(relative)?;
         let absolute = self.root.join(relative);
         let parent = absolute.parent().ok_or_else(|| {
             Error::validation("invalid_path", "Record path has no parent directory")
@@ -635,6 +870,8 @@ impl Store {
             .as_file_mut()
             .sync_all()
             .map_err(|source| Error::io("synchronize a new record", temporary.path(), &source))?;
+        recheck()?;
+        self.ensure_generation()?;
         temporary.persist_noclobber(&absolute).map_err(|error| {
             if error.error.kind() == std::io::ErrorKind::AlreadyExists {
                 Error::validation("record_already_exists", "Record already exists")
@@ -724,6 +961,61 @@ impl Store {
         Ok(())
     }
 
+    fn ensure_lock_generation(&self, file: &File) -> Result<()> {
+        let metadata = file.metadata().map_err(|source| {
+            Error::io(
+                "inspect the locked configuration",
+                &self.root.join(CONFIG_PATH),
+                &source,
+            )
+        })?;
+        if FileIdentity::of(&metadata) != self.config_identity {
+            return Err(concurrent(
+                "Configuration identity changed; reopen the store",
+                Path::new(CONFIG_PATH),
+            ));
+        }
+        self.ensure_generation()
+    }
+
+    fn ensure_generation(&self) -> Result<()> {
+        self.ensure_generation_with_schema(self.schema_hash)
+    }
+
+    fn ensure_generation_with_schema(&self, schema_hash: [u8; 32]) -> Result<()> {
+        let check = || -> Result<bool> {
+            ensure_real_directory(&self.root, Path::new(".todo"))?;
+            let (mut file, metadata) =
+                open_regular_nofollow(&self.root.join(CONFIG_PATH), Path::new(CONFIG_PATH))?;
+            if FileIdentity::of(&metadata) != self.config_identity {
+                return Ok(false);
+            }
+            let mut bytes = Vec::new();
+            Read::by_ref(&mut file)
+                .take(MAX_CONFIG_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|source| {
+                    Error::io(
+                        "recheck configuration",
+                        &self.root.join(CONFIG_PATH),
+                        &source,
+                    )
+                })?;
+            if content_hash(&bytes) != self.config_hash {
+                return Ok(false);
+            }
+            let schema = read_bounded(&self.root.join(SCHEMA_PATH), MAX_CONFIG_BYTES, "schema")?;
+            Ok(content_hash(&schema) == schema_hash)
+        };
+        match check() {
+            Ok(true) => Ok(()),
+            _ => Err(concurrent(
+                "Configuration or schema changed; reopen the store before continuing",
+                Path::new(CONFIG_PATH),
+            )),
+        }
+    }
+
     fn open_lock_file(&self) -> Result<File> {
         let path = self.root.join(CONFIG_PATH);
         let mut options = open_options_nofollow();
@@ -743,6 +1035,275 @@ impl Store {
         }
         Ok(file)
     }
+}
+
+/// Explicit two-file activation. All other writers, including old binaries and
+/// external sync clients, must be quiesced: an inode advisory lock cannot make
+/// this a rolling upgrade or a multi-file atomic transaction.
+pub fn upgrade(root: impl AsRef<Path>, to: u32, dry_run: bool) -> Result<UpgradeResult> {
+    if to != 2 {
+        return Err(Error::unsupported(
+            "unsupported_schema",
+            "Only explicit upgrade --to 2 is supported",
+        )
+        .with_field("schema_version"));
+    }
+    let store = Store::open_pair(root.as_ref(), true)?;
+    store.with_exclusive_lock(|| {
+        let from = store.config.schema_version;
+        let config_snapshot =
+            store.read_snapshot(Path::new(CONFIG_PATH), MAX_CONFIG_BYTES, "configuration")?;
+        let schema_snapshot =
+            store.read_snapshot(Path::new(SCHEMA_PATH), MAX_CONFIG_BYTES, "schema")?;
+        if config_snapshot.hash != store.config_hash || schema_snapshot.hash != store.schema_hash {
+            return Err(concurrent(
+                "Store metadata changed before upgrade preflight",
+                Path::new(CONFIG_PATH),
+            ));
+        }
+        let schema: serde_json::Value =
+            serde_json::from_slice(&schema_snapshot.bytes).map_err(|_| {
+                concurrent(
+                    "Schema changed before upgrade preflight",
+                    Path::new(SCHEMA_PATH),
+                )
+            })?;
+        let resumed = from == 1 && schema["x-obsidian-todo-schema-version"].as_u64() == Some(2);
+        let mut report = crate::validate::validate_store_unlocked(&store.root);
+        if resumed {
+            report
+                .issues
+                .retain(|issue| issue.code != "schema_version_mismatch");
+        }
+        if report
+            .issues
+            .iter()
+            .any(|issue| issue.severity == crate::error::IssueSeverity::Error)
+        {
+            return Err(Error::from_issues(report.issues));
+        }
+        let records = UpgradeRecords::capture(&store)?;
+        store.ensure_generation()?;
+        records.recheck(&store)?;
+        if from == 2 {
+            return Ok(UpgradeResult {
+                from,
+                to,
+                dry_run,
+                status: "already_current".to_owned(),
+            });
+        }
+        let source = std::str::from_utf8(&config_snapshot.bytes).map_err(|_| {
+            Error::validation("invalid_config_utf8", "Configuration must be UTF-8")
+                .with_path(CONFIG_PATH)
+        })?;
+        let next_config = upgraded_config(source)?;
+        if dry_run {
+            return Ok(UpgradeResult {
+                from,
+                to,
+                dry_run,
+                status: "planned".to_owned(),
+            });
+        }
+        let config_temporary = stage_upgrade_file(&config_snapshot, next_config.as_bytes())?;
+        let schema_temporary = if resumed {
+            None
+        } else {
+            Some(stage_upgrade_file(
+                &schema_snapshot,
+                EMBEDDED_SCHEMA.as_bytes(),
+            )?)
+        };
+        records.recheck(&store)?;
+        store.ensure_generation()?;
+        store.ensure_unchanged(&config_snapshot)?;
+        store.ensure_unchanged(&schema_snapshot)?;
+        let metadata_directory = store.root.join(".todo");
+        let mut expected_schema = store.schema_hash;
+        if let Some(temporary) = schema_temporary {
+            temporary.persist(&schema_snapshot.path).map_err(|error| {
+                Error::io(
+                    "activate the version 2 schema",
+                    &schema_snapshot.path,
+                    &error.error,
+                )
+            })?;
+            sync_directory(&metadata_directory)?;
+            expected_schema = content_hash(EMBEDDED_SCHEMA.as_bytes());
+        }
+        // Failure here deliberately leaves the exact, fail-closed v1/v2 pair.
+        // Re-run this explicit command only after resolving/quiescing the writer.
+        records.recheck(&store)?;
+        store.ensure_generation_with_schema(expected_schema)?;
+        store.ensure_unchanged(&config_snapshot)?;
+        config_temporary
+            .persist(&config_snapshot.path)
+            .map_err(|error| {
+                Error::io(
+                    "activate version 2 configuration",
+                    &config_snapshot.path,
+                    &error.error,
+                )
+            })?;
+        sync_directory(&metadata_directory)?;
+        Ok(UpgradeResult {
+            from,
+            to,
+            dry_run,
+            status: if resumed { "resumed" } else { "upgraded" }.to_owned(),
+        })
+    })
+}
+
+#[derive(Debug)]
+struct UpgradeRecords {
+    tasks: Vec<(String, PathBuf)>,
+    projects: Vec<(String, PathBuf)>,
+    snapshots: Vec<FileSnapshot>,
+}
+
+impl UpgradeRecords {
+    fn capture(store: &Store) -> Result<Self> {
+        let tasks = store.task_candidates()?;
+        let projects = store.project_candidates()?;
+        let mut snapshots = Vec::with_capacity(tasks.len() + projects.len());
+        let known_projects: HashSet<&str> =
+            projects.iter().map(|(slug, _)| slug.as_str()).collect();
+        for (slug, path) in &projects {
+            let mut snapshot = store.read_snapshot(path, MAX_RECORD_BYTES as u64, "project")?;
+            parse_project(slug, path, &snapshot.take_bytes())
+                .map_err(|error| error_with_path(error, path))?;
+            snapshots.push(snapshot);
+        }
+        let mut relations = Vec::with_capacity(tasks.len());
+        let mut issues = Vec::new();
+        for (id, path) in &tasks {
+            let mut snapshot = store.read_snapshot(path, MAX_RECORD_BYTES as u64, "task")?;
+            let task = parse_task(id, path, &snapshot.take_bytes(), &store.config)
+                .map_err(|error| error_with_path(error, path))?;
+            if store.config.schema_version == 1 && task.extra_properties.contains_key("parent") {
+                issues.push(crate::error::ValidationIssue::error(
+                    "parent_property_collision", "Legacy task contains a top-level parent property; explicitly relocate or remove it before upgrade"
+                ).at_path(path).at_field("parent"));
+            }
+            for project in &task.projects {
+                if !known_projects.contains(project.as_str()) {
+                    issues.push(
+                        crate::error::ValidationIssue::error(
+                            "missing_project_reference",
+                            format!("Task {id} references missing project {project:?}"),
+                        )
+                        .at_path(path)
+                        .at_field("projects"),
+                    );
+                }
+            }
+            relations.push(ParentRecord {
+                id: id.clone(),
+                path: path.clone(),
+                parent: task.parent,
+            });
+            snapshots.push(snapshot);
+        }
+        issues.extend(analyze_parents(&relations));
+        if !issues.is_empty() {
+            return Err(Error::from_issues(issues));
+        }
+        Ok(Self {
+            tasks,
+            projects,
+            snapshots,
+        })
+    }
+
+    fn recheck(&self, store: &Store) -> Result<()> {
+        let check = || -> Result<()> {
+            if store.task_candidates()? != self.tasks
+                || store.project_candidates()? != self.projects
+            {
+                return Err(concurrent(
+                    "Records were added, deleted, or moved during upgrade",
+                    store.root(),
+                ));
+            }
+            for snapshot in &self.snapshots {
+                store.ensure_unchanged(snapshot)?;
+            }
+            Ok(())
+        };
+        check().map_err(|_| {
+            concurrent(
+                "Store records changed during upgrade; no task or project was rewritten",
+                store.root(),
+            )
+        })
+    }
+}
+
+fn upgraded_config(source: &str) -> Result<String> {
+    #[derive(serde::Deserialize)]
+    struct VersionToken {
+        schema_version: toml::Spanned<i64>,
+    }
+    let token: VersionToken = toml::from_str(source).map_err(|error| {
+        Error::validation(
+            "invalid_config",
+            format!("Could not locate schema version token: {error}"),
+        )
+        .with_path(CONFIG_PATH)
+    })?;
+    if *token.schema_version.get_ref() != 1 {
+        return Err(Error::unsupported(
+            "unsupported_schema",
+            "Upgrade source configuration must be version 1",
+        )
+        .with_path(CONFIG_PATH));
+    }
+    let mut upgraded = source.to_owned();
+    upgraded.replace_range(token.schema_version.span(), "2");
+    let parsed = Config::parse(&upgraded)?;
+    if parsed.schema_version != 2 {
+        return Err(
+            Error::validation("invalid_config", "Could not update schema version")
+                .with_path(CONFIG_PATH),
+        );
+    }
+    Ok(upgraded)
+}
+
+fn stage_upgrade_file(snapshot: &FileSnapshot, bytes: &[u8]) -> Result<NamedTempFile> {
+    let parent = snapshot
+        .path
+        .parent()
+        .ok_or_else(|| Error::validation("invalid_path", "Store metadata path has no parent"))?;
+    let mut temporary = NamedTempFile::new_in(parent)
+        .map_err(|source| Error::io("stage store upgrade", parent, &source))?;
+    temporary
+        .write_all(bytes)
+        .map_err(|source| Error::io("write staged store upgrade", temporary.path(), &source))?;
+    temporary
+        .as_file_mut()
+        .flush()
+        .map_err(|source| Error::io("flush staged store upgrade", temporary.path(), &source))?;
+    temporary
+        .as_file_mut()
+        .set_permissions(snapshot.permissions.clone())
+        .map_err(|source| {
+            Error::io(
+                "preserve store metadata permissions",
+                temporary.path(),
+                &source,
+            )
+        })?;
+    temporary.as_file_mut().sync_all().map_err(|source| {
+        Error::io(
+            "synchronize staged store upgrade",
+            temporary.path(),
+            &source,
+        )
+    })?;
+    Ok(temporary)
 }
 
 fn open_regular_nofollow(path: &Path, relative: &Path) -> Result<(File, fs::Metadata)> {
@@ -902,7 +1463,7 @@ fn exceeds_limit(length: usize, limit: u64) -> bool {
     }
 }
 
-fn validate_schema(root: &Path, expected_version: u32) -> Result<()> {
+fn validate_schema(root: &Path, expected_version: u32) -> Result<[u8; 32]> {
     let path = root.join(SCHEMA_PATH);
     ensure_regular_file(&path, SCHEMA_PATH)?;
     let bytes = read_bounded(&path, MAX_CONFIG_BYTES, "schema")?;
@@ -914,12 +1475,13 @@ fn validate_schema(root: &Path, expected_version: u32) -> Result<()> {
         .with_path(SCHEMA_PATH)
         .with_location(source.line(), source.column())
     })?;
-    let embedded: serde_json::Value = serde_json::from_str(EMBEDDED_SCHEMA).map_err(|source| {
-        Error::validation(
-            "invalid_embedded_schema",
-            format!("The schema embedded in this build is invalid JSON: {source}"),
-        )
-    })?;
+    let embedded: serde_json::Value = serde_json::from_str(embedded_schema(expected_version)?)
+        .map_err(|source| {
+            Error::validation(
+                "invalid_embedded_schema",
+                format!("The schema embedded in this build is invalid JSON: {source}"),
+            )
+        })?;
     let version = schema
         .get("x-obsidian-todo-schema-version")
         .and_then(serde_json::Value::as_u64);
@@ -930,7 +1492,7 @@ fn validate_schema(root: &Path, expected_version: u32) -> Result<()> {
         )
         .with_path(SCHEMA_PATH));
     }
-    Ok(())
+    Ok(content_hash(&bytes))
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
@@ -951,6 +1513,39 @@ fn error_with_path(error: Error, path: &Path) -> Error {
     } else {
         error.with_path(path)
     }
+}
+
+fn concurrent(message: &str, path: &Path) -> Error {
+    Error::new(ErrorKind::Concurrent, "concurrent_modification", message).with_path(path)
+}
+
+pub(crate) fn ensure_valid_relations(records: &[ParentRecord]) -> Result<()> {
+    let mut issues = analyze_parents(records);
+    issues.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.field.cmp(&right.field))
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.column.cmp(&right.column))
+            .then_with(|| left.code.cmp(&right.code))
+    });
+    if let Some(issue) = issues.into_iter().next() {
+        let code = match issue.code.as_str() {
+            "missing_parent_reference" => "missing_parent_reference",
+            "self_parent_reference" => "self_parent_reference",
+            "parent_cycle" => "parent_cycle",
+            _ => "duplicate_task_id",
+        };
+        let mut error = Error::validation(code, issue.message);
+        if let Some(path) = issue.path {
+            error = error.with_path(path);
+        }
+        if let Some(field) = issue.field {
+            error = error.with_field(field);
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -987,7 +1582,7 @@ mod tests {
     fn opens_initialized_store() {
         let temp = initialized();
         let store = Store::open(temp.path().join("Todo")).expect("open");
-        assert_eq!(store.config().schema_version, 1);
+        assert_eq!(store.config().schema_version, 2);
         assert!(store.paths().tasks.ends_with("Tasks"));
     }
 
@@ -1185,5 +1780,211 @@ mod tests {
             .with_exclusive_lock(|| store.create_task(FIRST_ID, &task_record("Writable")))
             .expect("mutate with exclusive lock");
         assert_eq!(store.list_tasks().expect("read created task").len(), 1);
+    }
+
+    #[test]
+    fn configuration_and_schema_generation_changes_refuse_stale_writes() {
+        for changed_schema in [false, true] {
+            let temp = initialized();
+            let root = temp.path().join("Todo");
+            let store = Store::open(&root).expect("open");
+            let path = root.join(if changed_schema {
+                SCHEMA_PATH
+            } else {
+                CONFIG_PATH
+            });
+            let mut external = fs::read(&path).expect("read");
+            external.push(b'\n');
+            fs::write(&path, &external).expect("external metadata edit");
+            let error = store
+                .with_exclusive_lock(|| store.create_task(FIRST_ID, &task_record("Stale")))
+                .expect_err("stale generation");
+            assert_eq!(error.code(), "concurrent_modification");
+            assert!(!root.join(format!("Tasks/{FIRST_ID}.md")).exists());
+            assert_eq!(fs::read(path).expect("external bytes"), external);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identical_config_replacement_invalidates_the_open_store_identity() {
+        let temp = initialized();
+        let root = temp.path().join("Todo");
+        let store = Store::open(&root).expect("open");
+        let config = root.join(CONFIG_PATH);
+        let replacement = root.join(".todo/replacement");
+        fs::write(&replacement, fs::read(&config).expect("config")).expect("replacement");
+        fs::rename(replacement, config).expect("replace inode");
+        assert_eq!(
+            store.list_tasks().expect_err("new identity").code(),
+            "concurrent_modification"
+        );
+        let reopened = Store::open(&root).expect("reopen");
+        reopened
+            .with_exclusive_lock(|| reopened.create_task(FIRST_ID, &task_record("Fresh")))
+            .expect("new store generation works");
+    }
+
+    #[test]
+    fn final_publication_rechecks_metadata_and_selected_full_content() {
+        for config_changed in [false, true] {
+            let temp = initialized();
+            let root = temp.path().join("Todo");
+            let store = Store::open(&root).expect("open");
+            let relative = store
+                .create_task(FIRST_ID, &task_record("Original"))
+                .expect("create");
+            let snapshot = store
+                .read_snapshot(&relative, MAX_RECORD_BYTES as u64, "task")
+                .expect("snapshot");
+            let external = if config_changed {
+                let mut bytes = fs::read(root.join(CONFIG_PATH)).expect("config");
+                bytes.push(b'\n');
+                bytes
+            } else {
+                task_record("External")
+            };
+            let changed = if config_changed {
+                root.join(CONFIG_PATH)
+            } else {
+                root.join(&relative)
+            };
+            let error = store
+                .with_exclusive_lock(|| {
+                    store.replace_checked(&snapshot, &task_record("Replacement"), || {
+                        fs::write(&changed, &external).expect("external writer");
+                        Ok(())
+                    })
+                })
+                .expect_err("publication refuses observed change");
+            assert_eq!(error.code(), "concurrent_modification");
+            assert_eq!(fs::read(changed).expect("preserved external"), external);
+            if config_changed {
+                assert_eq!(
+                    fs::read(root.join(relative)).expect("unchanged task"),
+                    task_record("Original")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inbound_child_added_before_delete_is_detected_without_deleting_parent() {
+        let temp = initialized();
+        let root = temp.path().join("Todo");
+        let store = Store::open(&root).expect("open");
+        let relative = store
+            .create_task(FIRST_ID, &task_record("Parent"))
+            .expect("parent");
+        let snapshot = store
+            .read_snapshot(&relative, MAX_RECORD_BYTES as u64, "task")
+            .expect("snapshot");
+        let relations = store.relations_unlocked().expect("relations");
+        let child = format!(
+            "---\nname: Child\nstate: done\nprojects: []\ntags: []\nparent: \"{FIRST_ID}\"\n---\n"
+        );
+        let error = store
+            .with_exclusive_lock(|| {
+                store.delete_checked(&snapshot, || {
+                    fs::write(root.join(format!("Tasks/{SECOND_ID}.md")), child.as_bytes())
+                        .expect("external child");
+                    store.ensure_relations_unchanged(&relations)
+                })
+            })
+            .expect_err("new terminal child");
+        assert_eq!(error.code(), "concurrent_modification");
+        assert_eq!(
+            fs::read(root.join(relative)).expect("parent preserved"),
+            task_record("Parent")
+        );
+    }
+
+    #[test]
+    fn relation_snapshots_detect_deleted_moved_duplicate_and_reparented_candidates() {
+        for change in ["delete", "move", "duplicate", "parent"] {
+            let temp = initialized();
+            let root = temp.path().join("Todo");
+            let store = Store::open(&root).expect("open");
+            let parent = store
+                .create_task(FIRST_ID, &task_record("Parent"))
+                .expect("parent");
+            let child = store
+                .create_task(SECOND_ID, &task_record("Child"))
+                .expect("child");
+            let snapshot = store
+                .read_snapshot(&child, MAX_RECORD_BYTES as u64, "task")
+                .expect("snapshot");
+            let relations = store.relations_unlocked().expect("relations");
+            let error = store.with_exclusive_lock(|| store.replace_checked(&snapshot, &task_record("Edited"), || {
+                match change {
+                    "delete" => fs::remove_file(root.join(&parent)).expect("external delete"),
+                    "move" => {
+                        fs::create_dir(root.join("Tasks/nested")).expect("nested");
+                        fs::rename(root.join(&parent), root.join(format!("Tasks/nested/{FIRST_ID}.md"))).expect("external move");
+                    }
+                    "duplicate" => {
+                        fs::create_dir(root.join("Tasks/nested")).expect("nested");
+                        fs::write(root.join(format!("Tasks/nested/{}.md", FIRST_ID.to_lowercase())), task_record("Duplicate")).expect("external duplicate");
+                    }
+                    "parent" => {
+                        fs::write(root.join(&parent), format!("---\nname: Parent\nstate: open\nprojects: []\ntags: []\nparent: \"{SECOND_ID}\"\n---\n")).expect("external edge");
+                    }
+                    _ => unreachable!(),
+                }
+                store.ensure_relations_unchanged(&relations)
+            })).expect_err("relationship race");
+            assert_eq!(error.code(), "concurrent_modification", "{change}");
+            assert_eq!(
+                fs::read(root.join(child)).expect("unchanged child"),
+                task_record("Child"),
+                "{change}"
+            );
+        }
+    }
+
+    #[test]
+    fn upgrade_replaces_only_spanned_version_token() {
+        let mut config = Config::defaults("Todo".to_owned());
+        config.schema_version = 1;
+        let source = config
+            .to_toml()
+            .expect("config")
+            .replace(
+                "schema_version = 1",
+                "\"schema_version\" = 0x1 # keep version comment",
+            )
+            .replace('\n', "\r\n");
+        let expected = source.replace("= 0x1 #", "= 2 #");
+        assert_eq!(upgraded_config(&source).expect("spanned upgrade"), expected);
+    }
+
+    #[test]
+    fn upgrade_record_snapshot_detects_new_files_and_content_changes() {
+        let temp = initialized();
+        let root = temp.path().join("Todo");
+        let store = Store::open(&root).expect("open");
+        store
+            .create_task(FIRST_ID, &task_record("Original"))
+            .expect("task");
+        let snapshot = UpgradeRecords::capture(&store).expect("capture");
+        fs::write(
+            root.join(format!("Tasks/{FIRST_ID}.md")),
+            task_record("External"),
+        )
+        .expect("external edit");
+        assert_eq!(
+            snapshot.recheck(&store).expect_err("changed bytes").code(),
+            "concurrent_modification"
+        );
+        let snapshot = UpgradeRecords::capture(&store).expect("recapture");
+        fs::write(
+            root.join(format!("Tasks/{SECOND_ID}.md")),
+            task_record("Added"),
+        )
+        .expect("external addition");
+        assert_eq!(
+            snapshot.recheck(&store).expect_err("new file").code(),
+            "concurrent_modification"
+        );
     }
 }

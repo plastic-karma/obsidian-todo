@@ -9,12 +9,14 @@ use serde::Serialize;
 use walkdir::WalkDir;
 
 use crate::config::{
-    managed_paths_overlap, source_location, validate_managed_directory, Config, CONFIG_PATH,
-    EMBEDDED_SCHEMA, SCHEMA_PATH, SCHEMA_VERSION, TODOS_BASE_PATH,
+    embedded_schema, managed_paths_overlap, source_location, validate_managed_directory, Config,
+    CONFIG_PATH, SCHEMA_PATH, TODOS_BASE_PATH,
 };
 use crate::error::{Error, IssueSeverity, Result, ValidationIssue};
-use crate::frontmatter::{parse_project, parse_task, MAX_RECORD_BYTES};
-use crate::model::{validate_project_slug, validate_task_id};
+use crate::frontmatter::{
+    parent_from_properties, parse_document, parse_project, parse_task, MAX_RECORD_BYTES,
+};
+use crate::model::{analyze_parents, validate_project_slug, validate_task_id, ParentRecord};
 
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const VALIDATION_PROJECT_SLUG: &str = "validation-record";
@@ -67,7 +69,14 @@ impl ValidationReport {
 }
 
 pub fn validate_store(root: impl AsRef<Path>) -> ValidationReport {
-    let supplied_root = root.as_ref();
+    validate_store_impl(root.as_ref(), true)
+}
+
+pub(crate) fn validate_store_unlocked(root: &Path) -> ValidationReport {
+    validate_store_impl(root, false)
+}
+
+fn validate_store_impl(supplied_root: &Path, acquire_lock: bool) -> ValidationReport {
     let mut issues = Vec::new();
     let root = match validate_root(supplied_root) {
         Ok(root) => root,
@@ -79,20 +88,31 @@ pub fn validate_store(root: impl AsRef<Path>) -> ValidationReport {
     if !validate_metadata_directory(&root, &mut issues) {
         return ValidationReport::from_issues(issues, 0, 0);
     }
-    let _lock = match acquire_validation_lock(&root) {
-        Ok(lock) => lock,
-        Err(issue) => {
-            issues.push(*issue);
-            None
+    let _lock = if acquire_lock {
+        match acquire_validation_lock(&root) {
+            Ok(lock) => lock,
+            Err(issue) => {
+                issues.push(*issue);
+                None
+            }
         }
+    } else {
+        None
     };
     validate_metadata_entries(&root, &mut issues);
     let config = load_config_for_validation(&root, &mut issues);
-    validate_schema(&root, &mut issues);
+    validate_schema(
+        &root,
+        config.as_ref().map(|config| config.schema_version),
+        &mut issues,
+    );
     let Some(config) = config else {
         return ValidationReport::from_issues(issues, 0, 0);
     };
     validate_store_root_entries(&root, &config, &mut issues);
+    if let Err(error) = crate::attachments::ensure_enabled(&config) {
+        issues.push(ValidationIssue::warning(error.code(), error.message()).at_path("Attachments"));
+    }
 
     let mut tasks_path = validate_managed_path_on_disk(
         &root,
@@ -368,7 +388,7 @@ fn validate_store_root_entries(root: &Path, config: &Config, issues: &mut Vec<Va
             }
         };
         let relative = relative_to(root, entry.path());
-        if relative == Path::new(".todo") {
+        if relative == Path::new(".todo") || relative == Path::new("Attachments") {
             if entry.file_type().is_dir() {
                 entries.skip_current_dir();
             }
@@ -444,6 +464,17 @@ fn load_config_for_validation(root: &Path, issues: &mut Vec<ValidationIssue>) ->
     let declared_schema_version = table
         .get("schema_version")
         .and_then(toml::Value::as_integer);
+    if let Some(version) = declared_schema_version.filter(|version| !matches!(*version, 1 | 2)) {
+        issues.push(
+            ValidationIssue::error(
+                "unsupported_schema",
+                format!("Schema version {version} is unsupported; supported versions are 1 and 2"),
+            )
+            .at_path(CONFIG_PATH)
+            .at_field("schema_version"),
+        );
+        return None;
+    }
     const KEYS: [&str; 6] = [
         "schema_version",
         "tasks_directory",
@@ -493,20 +524,6 @@ fn load_config_for_validation(root: &Path, issues: &mut Vec<ValidationIssue>) ->
     let config: Config = match value.try_into() {
         Ok(config) => config,
         Err(source) => {
-            if let Some(version) =
-                declared_schema_version.filter(|version| *version != i64::from(SCHEMA_VERSION))
-            {
-                issues.push(
-                    ValidationIssue::error(
-                        "unsupported_schema",
-                        format!(
-                            "Schema version {version} is unsupported; expected {SCHEMA_VERSION}"
-                        ),
-                    )
-                    .at_path(CONFIG_PATH)
-                    .at_field("schema_version"),
-                );
-            }
             issues.push(
                 ValidationIssue::error(
                     "invalid_config",
@@ -521,7 +538,7 @@ fn load_config_for_validation(root: &Path, issues: &mut Vec<ValidationIssue>) ->
     Some(config)
 }
 
-fn validate_schema(root: &Path, issues: &mut Vec<ValidationIssue>) {
+fn validate_schema(root: &Path, version: Option<u32>, issues: &mut Vec<ValidationIssue>) {
     let path = root.join(SCHEMA_PATH);
     let bytes = match read_regular_file(&path, Path::new(SCHEMA_PATH), MAX_CONFIG_BYTES) {
         Ok(bytes) => bytes,
@@ -530,7 +547,14 @@ fn validate_schema(root: &Path, issues: &mut Vec<ValidationIssue>) {
             return;
         }
     };
-    let embedded = match serde_json::from_str::<serde_json::Value>(EMBEDDED_SCHEMA) {
+    let source = match embedded_schema(version.unwrap_or(2)) {
+        Ok(source) => source,
+        Err(error) => {
+            issues.push(issue_from_error(error, Path::new(CONFIG_PATH)));
+            return;
+        }
+    };
+    let embedded = match serde_json::from_str::<serde_json::Value>(source) {
         Ok(schema) => schema,
         Err(source) => {
             issues.push(ValidationIssue::error(
@@ -541,11 +565,14 @@ fn validate_schema(root: &Path, issues: &mut Vec<ValidationIssue>) {
         }
     };
     match serde_json::from_slice::<serde_json::Value>(&bytes) {
-        Ok(schema) if schema == embedded => {}
+        Ok(schema) if version.is_none() || schema == embedded => {}
         Ok(_) => issues.push(
             ValidationIssue::error(
                 "schema_version_mismatch",
-                "schema.json is not compatible with schema version 1",
+                format!(
+                    "schema.json is not compatible with schema version {}",
+                    version.unwrap_or(2)
+                ),
             )
             .at_path(SCHEMA_PATH),
         ),
@@ -796,6 +823,7 @@ fn validate_tasks(
         return 0;
     }
     let mut ids = HashMap::<String, PathBuf>::new();
+    let mut parent_records = Vec::new();
     let mut count = 0;
     let mut entries = WalkDir::new(directory)
         .sort_by_file_name()
@@ -831,6 +859,17 @@ fn validate_tasks(
             continue;
         }
         if entry.file_type().is_symlink() {
+            if config.schema_version == 2 && entry.path().extension() == Some(OsStr::new("md")) {
+                if let Some(id) = entry.path().file_stem().and_then(|value| value.to_str()) {
+                    if validate_task_id(id).is_ok() {
+                        parent_records.push(ParentRecord {
+                            id: id.to_ascii_uppercase(),
+                            path: relative.clone(),
+                            parent: None,
+                        });
+                    }
+                }
+            }
             issues.push(
                 ValidationIssue::error("record_symlink", "Managed records must not be symlinks")
                     .at_path(relative),
@@ -885,25 +924,49 @@ fn validate_tasks(
                 None
             }
         };
-        if let Some(normalized) = &normalized {
-            if let Some(first) = ids.insert(normalized.clone(), relative.clone()) {
-                issues.push(
-                    ValidationIssue::error(
-                        "duplicate_task_id",
-                        format!("Task ID {normalized} also appears at {}", first.display()),
-                    )
-                    .at_path(&relative),
-                );
+        let graph_index = normalized.as_ref().map(|id| {
+            let index = parent_records.len();
+            parent_records.push(ParentRecord {
+                id: id.clone(),
+                path: relative.clone(),
+                parent: None,
+            });
+            index
+        });
+        if config.schema_version == 1 {
+            if let Some(normalized) = &normalized {
+                if let Some(first) = ids.insert(normalized.clone(), relative.clone()) {
+                    issues.push(
+                        ValidationIssue::error(
+                            "duplicate_task_id",
+                            format!("Task ID {normalized} also appears at {}", first.display()),
+                        )
+                        .at_path(&relative),
+                    );
+                }
             }
         }
         let parse_id = normalized.as_deref().unwrap_or(VALIDATION_TASK_ID);
-        match read_regular_file(entry.path(), &relative, MAX_RECORD_BYTES as u64).and_then(
-            |bytes| {
-                parse_task(parse_id, &relative, &bytes, config)
-                    .map_err(|error| Box::new(issue_from_error(error, &relative)))
-            },
-        ) {
+        let bytes = match read_regular_file(entry.path(), &relative, MAX_RECORD_BYTES as u64) {
+            Ok(bytes) => bytes,
+            Err(issue) => {
+                issues.push(*issue);
+                continue;
+            }
+        };
+        match parse_task(parse_id, &relative, &bytes, config) {
             Ok(task) => {
+                if crate::attachments::ensure_enabled(config).is_ok() {
+                    issues.extend(crate::attachments::diagnostics(
+                        root,
+                        &relative,
+                        &task.body,
+                        &config.obsidian_link_prefix,
+                    ));
+                }
+                if let Some(index) = graph_index {
+                    parent_records[index].parent = task.parent;
+                }
                 for project in &task.projects {
                     if !projects.contains(project) {
                         issues.push(
@@ -920,8 +983,29 @@ fn validate_tasks(
                     }
                 }
             }
-            Err(issue) => issues.push(*issue),
+            Err(error) => {
+                let parent_error = error.field() == Some("parent");
+                issues.push(issue_from_error(error, &relative));
+                if config.schema_version == 2 {
+                    if let Ok(document) = parse_document(&bytes) {
+                        match parent_from_properties(&document.properties) {
+                            Ok(parent) => {
+                                if let Some(index) = graph_index {
+                                    parent_records[index].parent = parent;
+                                }
+                            }
+                            Err(error) if !parent_error => {
+                                issues.push(issue_from_error(error, &relative));
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+            }
         }
+    }
+    if config.schema_version == 2 {
+        issues.extend(analyze_parents(&parent_records));
     }
     count
 }
@@ -1283,7 +1367,7 @@ mod tests {
         let (_temp, root) = initialized();
         fs::write(
             root.join(CONFIG_PATH),
-            "schema_version = 2\nfuture_field = true\n",
+            "schema_version = 3\nfuture_field = true\n",
         )
         .expect("write future config");
         let report = validate_store(root);
@@ -1370,5 +1454,239 @@ mod tests {
         assert_eq!(report.tasks, 0);
         assert_eq!(report.projects, 0);
         assert_eq!(report.warnings, 2);
+    }
+
+    #[test]
+    fn malformed_physical_targets_and_invalid_filenames_do_not_fabricate_graph_nodes() {
+        let (_temp, root) = initialized();
+        let parent = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let child = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+        let orphan = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
+        let missing = "01ARZ3NDEKTSV4RRFFQ69G5FB0";
+        let dummy_reference = "01ARZ3NDEKTSV4RRFFQ69G5FAY";
+        let invalid_parent = "01ARZ3NDEKTSV4RRFFQ69G5FAZ";
+        fs::write(
+            root.join(format!("Tasks/{parent}.md")),
+            "not front matter\n",
+        )
+        .expect("malformed target");
+        for (id, metadata) in [
+            (child, format!("name: Child\nparent: \"{parent}\"")),
+            (orphan, format!("parent: \"{missing}\"")),
+            (
+                "not-an-id",
+                format!("name: Bad filename\nparent: \"{VALIDATION_TASK_ID}\""),
+            ),
+            (
+                dummy_reference,
+                format!("name: Missing physical target\nparent: \"{VALIDATION_TASK_ID}\""),
+            ),
+            (invalid_parent, "parent: null".to_owned()),
+        ] {
+            fs::write(
+                root.join(format!("Tasks/{id}.md")),
+                format!("---\n{metadata}\nstate: open\nprojects: []\ntags: []\n---\n"),
+            )
+            .expect("record");
+        }
+        let report = validate_store(&root);
+        let graph = report
+            .issues
+            .iter()
+            .filter(|issue| issue.field.as_deref() == Some("parent"))
+            .map(|issue| (issue.path.clone().expect("path"), issue.code.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            graph,
+            vec![
+                (
+                    PathBuf::from(format!("Tasks/{orphan}.md")),
+                    "missing_parent_reference"
+                ),
+                (
+                    PathBuf::from(format!("Tasks/{dummy_reference}.md")),
+                    "missing_parent_reference"
+                ),
+                (
+                    PathBuf::from(format!("Tasks/{invalid_parent}.md")),
+                    "invalid_parent_id"
+                ),
+            ]
+        );
+        for (id, code) in [
+            (parent, "missing_frontmatter"),
+            (orphan, "missing_property"),
+            (invalid_parent, "missing_property"),
+            ("not-an-id", "invalid_task_id"),
+        ] {
+            assert!(
+                report.issues.iter().any(|issue| issue.path.as_deref()
+                    == Some(Path::new(&format!("Tasks/{id}.md")))
+                    && issue.code == code),
+                "{id}: {:?}",
+                report.issues
+            );
+        }
+        assert_eq!(report.tasks, 6);
+    }
+
+    #[test]
+    fn safely_parsed_edges_preserve_cycles_despite_unrelated_record_errors() {
+        let (_temp, root) = initialized();
+        let first = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let second = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+        let descendant = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
+        for (id, parent, name) in [
+            (first, second, ""),
+            (second, first, "name: Terminal\n"),
+            (descendant, second, "name: Descendant\n"),
+        ] {
+            fs::write(
+                root.join(format!("Tasks/{id}.md")),
+                format!(
+                    "---\n{name}state: done\nprojects: []\ntags: []\nparent: \"{parent}\"\n---\n"
+                ),
+            )
+            .expect("record");
+        }
+        let report = validate_store(&root);
+        let cycles = report
+            .issues
+            .iter()
+            .filter(|issue| issue.code == "parent_cycle")
+            .map(|issue| issue.path.clone().expect("path"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cycles,
+            vec![
+                PathBuf::from(format!("Tasks/{first}.md")),
+                PathBuf::from(format!("Tasks/{second}.md")),
+            ]
+        );
+        assert_eq!(report.errors, 3, "{:?}", report.issues);
+    }
+
+    #[test]
+    fn validation_selects_exact_historical_schema_without_promoting_parent_extras() {
+        let (_temp, root) = initialized();
+        let mut config = Config::defaults("Todo".to_owned());
+        config.schema_version = 1;
+        fs::write(root.join(CONFIG_PATH), config.to_toml().expect("config"))
+            .expect("legacy config");
+        fs::write(root.join(SCHEMA_PATH), embedded_schema(1).expect("v1")).expect("legacy schema");
+        fs::write(
+            root.join("Tasks/01ARZ3NDEKTSV4RRFFQ69G5FAV.md"),
+            "---\nname: Legacy\nstate: open\nprojects: []\ntags: []\nparent: null\n---\n",
+        )
+        .expect("legacy metadata");
+        assert!(validate_store(&root).valid);
+        fs::write(root.join(SCHEMA_PATH), embedded_schema(2).expect("v2"))
+            .expect("interrupted upgrade");
+        let intermediate = validate_store(&root);
+        assert_eq!(intermediate.errors, 1, "{:?}", intermediate.issues);
+        assert_eq!(intermediate.issues[0].code, "schema_version_mismatch");
+        config.schema_version = 2;
+        fs::write(root.join(CONFIG_PATH), config.to_toml().expect("config")).expect("v2 config");
+        fs::write(root.join(SCHEMA_PATH), embedded_schema(1).expect("v1")).expect("reversed pair");
+        let reversed = validate_store(&root);
+        assert_eq!(reversed.errors, 2, "{:?}", reversed.issues);
+        assert!(reversed
+            .issues
+            .iter()
+            .any(|issue| issue.code == "schema_version_mismatch"));
+        assert!(reversed
+            .issues
+            .iter()
+            .any(|issue| issue.code == "invalid_parent_id"));
+    }
+
+    #[test]
+    fn upgrade_preflight_reuses_validation_under_an_existing_exclusive_lock() {
+        let (_temp, root) = initialized();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join(CONFIG_PATH))
+            .expect("config");
+        file.lock_exclusive().expect("exclusive lock");
+        fs::write(
+            root.join("Tasks/01ARZ3NDEKTSV4RRFFQ69G5FAV.md"),
+            "---\nname: Orphan\nstate: open\nprojects: []\ntags: []\nparent: \"01ARZ3NDEKTSV4RRFFQ69G5FAW\"\n---\n",
+        ).expect("orphan");
+        let report = validate_store_unlocked(&root);
+        assert_eq!(report.errors, 1, "{:?}", report.issues);
+        assert_eq!(report.issues[0].code, "missing_parent_reference");
+    }
+
+    #[test]
+    fn malformed_duplicate_identity_suppresses_only_ambiguous_graph_claims() {
+        let (_temp, root) = initialized();
+        let duplicate = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let child = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+        let orphan = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
+        let missing = "01ARZ3NDEKTSV4RRFFQ69G5FAY";
+        fs::create_dir(root.join("Tasks/nested")).expect("nested tasks");
+        for (path, name, parent) in [
+            (format!("Tasks/{duplicate}.md"), "", duplicate),
+            (
+                format!("Tasks/nested/{}.md", duplicate.to_ascii_lowercase()),
+                "name: Duplicate\n",
+                missing,
+            ),
+            (format!("Tasks/{child}.md"), "name: Child\n", duplicate),
+            (
+                format!("Tasks/{orphan}.md"),
+                "name: Independent orphan\n",
+                missing,
+            ),
+        ] {
+            fs::write(
+                root.join(path),
+                format!(
+                    "---\n{name}state: open\nprojects: []\ntags: []\nparent: \"{parent}\"\n---\n"
+                ),
+            )
+            .expect("record");
+        }
+        let report = validate_store(&root);
+        let mut codes = report
+            .issues
+            .iter()
+            .map(|issue| issue.code.as_str())
+            .collect::<Vec<_>>();
+        codes.sort_unstable();
+        assert_eq!(
+            codes,
+            [
+                "duplicate_task_id",
+                "missing_parent_reference",
+                "missing_property"
+            ]
+        );
+        let missing_issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "missing_parent_reference")
+            .expect("orphan");
+        assert_eq!(
+            missing_issue.path.as_ref(),
+            Some(&PathBuf::from(format!("Tasks/{orphan}.md")))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_physical_parent_is_reported_without_following_or_fabricating_absence() {
+        let (temp, root) = initialized();
+        let outside = temp.path().join("outside.md");
+        fs::write(&outside, "not front matter\n").expect("outside record");
+        symlink(&outside, root.join("Tasks/01ARZ3NDEKTSV4RRFFQ69G5FAV.md")).expect("unsafe parent");
+        fs::write(
+            root.join("Tasks/01ARZ3NDEKTSV4RRFFQ69G5FAW.md"),
+            "---\nname: Child\nstate: open\nprojects: []\ntags: []\nparent: \"01ARZ3NDEKTSV4RRFFQ69G5FAV\"\n---\n",
+        ).expect("child");
+        let report = validate_store(&root);
+        assert_eq!(report.errors, 1, "{:?}", report.issues);
+        assert_eq!(report.issues[0].code, "record_symlink");
     }
 }

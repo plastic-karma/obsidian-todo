@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod attachments;
 pub mod commands;
 pub mod config;
 pub mod discovery;
@@ -26,5 +27,5 @@ pub use discovery::{discover, DiscoveryOptions};
 pub use error::{Error, ErrorKind, IssueSeverity, Result, ValidationIssue, ValidationSummary};
 pub use model::{Clock, FixedClock, Project, SystemClock, Task};
 pub use recurrence::{Frequency, RecurrenceMode, RecurrenceRule};
-pub use store::{Store, StorePaths};
+pub use store::{upgrade, Store, StorePaths, UpgradeResult};
 pub use validate::{validate_store, ValidationReport};

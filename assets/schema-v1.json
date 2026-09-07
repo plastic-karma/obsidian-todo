@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://obsidian-todo.local/schema/v2",
+  "$id": "https://obsidian-todo.local/schema/v1",
   "title": "Obsidian Todo records",
-  "x-obsidian-todo-schema-version": 2,
+  "x-obsidian-todo-schema-version": 1,
   "$defs": {
     "date": {
       "type": "string",
@@ -48,10 +48,6 @@
             "minLength": 1,
             "pattern": "^[^#\\s,\\[\\]{}][^\\s,\\[\\]{}]*$"
           }
-        },
-        "parent": {
-          "type": "string",
-          "pattern": "^[0-7][0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{25}$"
         },
         "due_date": { "$ref": "#/$defs/date" },
         "recurrence": { "type": "string", "minLength": 1 },

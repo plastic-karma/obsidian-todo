@@ -1,6 +1,8 @@
 # Obsidian Todo CLI — Implementation Requirements
 
-Status: normative implementation specification for the first production-capable release
+Status: normative implementation specification for store schema v2 and explicit legacy-v1 compatibility
+
+Except where this specification explicitly distinguishes v1 from v2, the established v1 constraints remain requirements for both supported store versions. Store schema version is distinct from CLI JSON and client-local persistence envelope versions.
 
 Repository name: `obsidian-todo`
 
@@ -29,7 +31,7 @@ Normative terms `MUST`, `MUST NOT`, `SHOULD`, and `MAY` have their RFC 2119 mean
 
 ## 2. Product goals
 
-The first release MUST:
+The implementation MUST:
 
 1. Initialize a self-contained todo store inside an existing Obsidian vault.
 2. Discover and operate on that store without assuming it is the Git repository root.
@@ -48,10 +50,14 @@ The first release MUST:
 15. Work when only the todo folder is materialized by Git sparse checkout.
 16. Never invoke Git or modify files outside the todo store during normal operation.
 17. Expose the domain and storage implementation as a Rust library reusable by a future desktop application.
+18. Support optional, identity-based parent relationships in v2 stores, with independent task lifecycle and explicit repair of broken relationships.
+19. Support legacy-v1 flat stores without reinterpreting their unknown properties, and provide a deliberate, fail-closed upgrade to v2.
+20. Provide rootless capability discovery and bounded compact task-candidate queries.
+21. Import and manage file attachments through ordinary Markdown body links in both store versions, without a schema upgrade or attachment frontmatter field.
 
-## 3. Non-goals for the first release
+## 3. Non-goals
 
-The first release MUST NOT implement:
+Neither supported store version introduces:
 
 - A hosted backend, daemon, web service, or account system.
 - GitHub Issues or GitHub Projects synchronization.
@@ -60,7 +66,7 @@ The first release MUST NOT implement:
 - A TUI or graphical desktop application.
 - Notifications, alarms, or a background scheduler.
 - Timed due dates; v1 due values are calendar dates only.
-- Assignments, priorities, dependencies, subtasks, comments, or attachments as domain fields.
+- Assignments, priorities, dependencies, comments, or attachments as frontmatter domain fields. File attachments and body links are explicitly authorized by section 27 below. Subtasks are authorized only by the v2 parent contract below; v1 remains flat.
 - Full historical occurrence tracking for recurring tasks.
 - Arbitrary RFC 5545 recurrence features beyond the subset defined here.
 - Semantic three-way merging of conflicting task files.
@@ -68,6 +74,7 @@ The first release MUST NOT implement:
 - A local SQLite index or any other required derived database.
 - Project slug renaming. A project display name can change; its slug is a stable identifier.
 - Silent repair of malformed files.
+- Inherited metadata, aggregate completion, cascading changes/deletion, child arrays, or recurring subtree templates.
 
 These exclusions are scope boundaries, not placeholders. Code must not add partially implemented versions of them.
 
@@ -95,7 +102,7 @@ MyVault/
 
 `MyVault/Todo` is the store root. `MyVault` is the vault and Git worktree root, but neither is required during normal CLI operation.
 
-Except for explicitly reading a user-supplied `--body-file`, the CLI MUST NOT read, create, modify, rename, or delete any path outside the store root. It MUST NOT modify `.obsidian/`, `.git/`, vault notes, or repository-level configuration.
+Except for explicitly reading a user-supplied `--body-file` or attachment import source, the CLI MUST NOT read, create, modify, rename, or delete any path outside the store root. It MUST NOT modify `.obsidian/`, `.git/`, vault notes, or repository-level configuration.
 
 ### 4.2 Canonical state
 
@@ -105,16 +112,17 @@ The canonical current state consists only of:
 - `.todo/schema.json`
 - Markdown project records under the configured projects directory
 - Markdown task records under the configured tasks directory
+- Ordinary attachment files under fixed `Attachments/`, associated only by task body links
 
 Git history is an audit and synchronization mechanism, not required application state. The Obsidian Git plugin is free to group unrelated note and task changes in one commit. Therefore application behavior MUST NOT depend on commit boundaries, commit messages, author dates, branches, tags, or a reachable `.git` directory.
 
 ### 4.3 Stable placement
 
-Task state, project membership, tags, due date, and recurrence MUST be represented only in front matter. Changing them MUST NOT move the task file.
+Task state, project membership, tags, parent relationship (v2), due date, and recurrence MUST be represented only in front matter. Changing them MUST NOT move the task file.
 
 Folders such as `Tasks/Open`, `Tasks/Done`, or `Tasks/ProjectName` MUST NOT have domain meaning.
 
-Task identity is the ULID filename basename, independent of any future subdirectory. The scanner MUST recursively inspect the configured tasks directory. V1 initialization MUST create tasks directly in the top-level tasks directory; it MUST NOT pre-shard them.
+Task identity is the ULID filename basename, independent of any subdirectory. The scanner MUST recursively inspect the configured tasks directory. Initialization and normal task creation in both supported versions MUST create tasks directly in the top-level tasks directory; they MUST NOT pre-shard them.
 
 ### 4.4 Obsidian compatibility
 
@@ -132,6 +140,9 @@ Core properties MUST be flat because Obsidian Properties does not provide a norm
 - **Project slug:** The stable project filename basename.
 - **State:** Exactly one configured workflow state referenced by a task.
 - **Terminal state:** A configured state with `terminal = true`.
+- **Parent (v2):** The single task identified by a task's optional `parent` ULID in the same store.
+- **Root (v2):** A task with no `parent` key, not a task whose parent reference is broken.
+- **Child (v2):** An ordinary task with a parent; children and descendants are derived, never separately stored.
 - **Current occurrence:** The occurrence represented by a recurring task's current `due_date`.
 - **External writer:** Obsidian, another CLI invocation, a Git checkout operation, an agent, or any process capable of changing store files.
 
@@ -193,7 +204,7 @@ The command MUST support `--dry-run`, which reports planned paths and files but 
 
 ### 7.2 Discovery precedence
 
-All commands except `init` MUST locate the store using this precedence:
+All store commands, including `upgrade`, MUST locate the store using this precedence. `init` uses its explicit destination; `capabilities`, help, and executable-version queries MUST NOT discover or open a store:
 
 1. Global `--root <path>`.
 2. `OBSIDIAN_TODO_ROOT` environment variable.
@@ -215,12 +226,33 @@ otodo root
 
 This prints the resolved store root. In JSON mode it also reports config, tasks, and projects paths.
 
+### 7.3 Explicit v1-to-v2 upgrade
+
+```text
+otodo upgrade --to 2 [--dry-run]
+```
+
+Normal reads, writes, initialization, and capability discovery MUST NOT automatically upgrade a store. New stores initialize at v2. The upgrader MUST:
+
+1. Require explicit target `2`; unsupported targets fail with `unsupported_schema`. Require users to quiesce all writers and external synchronization, including old CLIs and clients with pending writes, before applying or resuming. The command MUST document this prerequisite, not claim that an advisory lock can enforce it.
+2. Discover the contained store, acquire its exclusive config-file lock, and recheck the config/schema generation after acquiring the lock. Preflight exact supported config/schema compatibility, normal path/symlink/duplicate/conflict/record validation, and the entire recursive task tree.
+3. Refuse a v1-to-v2 upgrade if ANY task has an existing top-level `parent` key, regardless of type, emptiness, or whether it looks like a valid ULID. It is legacy user/plugin metadata, not consent to promote a field. Report affected paths and `field: parent`; the user must explicitly relocate/remove that metadata first. Do not rewrite or discard it.
+4. Preserve all task/project bytes, unknown config values only where already permitted, state configuration, managed paths, permissions, and unrelated files. Preserve the original config except for its schema-version change. The exact historical v1 schema asset MUST remain available for compatibility checks.
+5. For `--dry-run`, perform preflight and describe the source/target versions, affected config/schema paths, and any resume state without changing any file. Collision and validation failures remain failures in dry-run.
+6. Prepare and sync replacements, then atomically replace `.todo/schema.json` with the exact v2 schema before atomically replacing `.todo/config.toml` with its v2 version, using source snapshots and single-file safety rules. Sync each containing directory as appropriate. This is TWO atomic file replacements, NOT a multi-file atomic transaction.
+7. Recognize only these upgrade states: coherent v1 config/v1 schema (start), valid v1 config/exact v2 schema (explicit resume), and coherent v2 config/v2 schema (already complete, no-op). Re-running `upgrade --to 2` explicitly resumes the intermediate pair after the same quiescence, collision, record, containment, and source-snapshot checks. Unsupported, malformed, customized, reversed, or otherwise mismatched pairs MUST fail without guessing or overwriting them.
+8. Make the intermediate v1-config/v2-schema state fail closed for all normal store operations, including writes by a newly opened client. `validate` may report the mismatch but MUST NOT repair it. No parent semantics become writable until the coherent v2 pair is installed. A process interrupted before the schema replacement leaves a normal v1 store; one interrupted after the config replacement leaves a normal v2 store.
+9. Never automatically roll back or downgrade to v1. Upgrading a relationless store does not require rewriting records or creating a persistent journal, lock file, or transaction framework.
+10. Preserve every existing `todos.base` byte, including customized Base files, during upgrade and resume. New-store Base generation may show a plain parent-ID property column, but upgrading MUST NOT replace a user's Base or fabricate parent links from a guessed flat task path.
+
+A held/open config inode is not a reliable lock across replacement of that path. Old clients already holding or waiting on the original inode may use stale v1 semantics. Therefore stopping old writers is a REQUIRED rollout boundary, not an optional precaution; only already updated clients can perform the post-lock generation checks in section 18.2. Installing compatible clients and safeguarding their pending work precedes activating v2. The CLI never runs Git to coordinate rollout.
+
 ## 8. Store configuration
 
 Default `.todo/config.toml`:
 
 ```toml
-schema_version = 1
+schema_version = 2
 
 tasks_directory = "Tasks"
 projects_directory = "Projects"
@@ -257,18 +289,18 @@ The generated `obsidian_link_prefix` MUST reflect the actual vault-relative stor
 
 Configuration validation:
 
-- `schema_version` MUST equal `1` for v1 clients.
-- A newer version MUST produce an unsupported-schema error and no mutation.
+- New clients MUST explicitly support schema versions `1` and `2`, selecting the exact structural schema for that version. All other versions fail with `unsupported_schema` and no mutation, before shape errors in unsupported configurations.
+- V1 remains legacy flat semantics: `parent` is an arbitrary unknown task property, not a relationship. V1 parent feature operations (`add/edit --parent`, `edit --clear-parent`, `list --parent`, and `list --roots`) MUST fail with `unsupported_schema`, even when clearing an absent field. Other v1 operations retain their existing semantics and preserve unknown `parent` values.
 - State IDs MUST be unique, nonempty lowercase ASCII slugs matching `[a-z0-9][a-z0-9_-]*`.
 - State display names MUST be nonempty after trimming.
 - At least one state MUST be nonterminal.
 - `default_state` MUST reference a configured nonterminal state.
 - The same state ID MUST NOT appear more than once.
 - State array order defines presentation and board-column order.
-- Unknown top-level config keys MUST cause a validation error in v1. Configuration typos must not be silently ignored.
+- Unknown top-level config keys MUST cause a validation error in both supported versions. Configuration typos must not be silently ignored.
 - Managed directory and link-prefix rules from sections 6 and 10 apply.
 
-`schema.json` is a machine-readable description of record shapes. The Rust validation code remains authoritative for cross-record checks, recurrence semantics, path containment, and duplicate-key rejection that JSON Schema cannot fully express. The checked-in schema and Rust model MUST be kept in agreement by tests.
+`schema.json` is a machine-readable description of record shapes. Its parsed document MUST equal the exact supported asset selected by `schema_version`; merely matching a version marker is insufficient. The Rust validation code remains authoritative for cross-record checks, recurrence semantics, path containment, and duplicate-key rejection that JSON Schema cannot fully express. Checked-in schemas and Rust models MUST remain in agreement, including explicit v1/v2 support and rejection of versions such as 0 and 3; tests MUST NOT continue treating v2 as an unsupported future version.
 
 ## 9. Task storage schema
 
@@ -280,7 +312,7 @@ A task path is:
 <tasks-directory>/<optional-subdirectories>/<ULID>.md
 ```
 
-V1 writers create:
+Writers for both supported versions create:
 
 ```text
 Tasks/01K4B0ZSBZZV25T1K0D3TA8JHR.md
@@ -294,7 +326,7 @@ Task IDs MUST:
 - Be generated locally without coordination.
 - Never be stored redundantly in front matter.
 
-A task move within the tasks directory does not change its identity. The CLI does not perform such moves in v1.
+A task move within the tasks directory does not change its identity or require rewriting children's parent IDs. The CLI does not perform task moves in either supported version.
 
 Every `.md` file under the tasks directory MUST be a valid task record. Non-Markdown files, hidden editor temporary files, and atomic-write temporary files are ignored by normal scanning; `validate` SHOULD warn about persistent unexpected files.
 
@@ -327,6 +359,7 @@ Review transactions, reconcile accounts, and update the monthly budget.
 | `state` | string | yes | Exactly one configured state ID. |
 | `projects` | list of strings | yes | Zero or more project wikilinks. |
 | `tags` | list of strings | yes | Zero or more Obsidian tags without `#`. |
+| `parent` | quoted string | no; v2 only | Full ULID of one task in the same store; omission means root. In v1 this spelling remains an unknown property. |
 | `due_date` | date scalar | no | Local calendar date in `YYYY-MM-DD`. |
 | `recurrence` | string | conditional | Supported RRULE subset. |
 | `recurrence_from` | string | conditional | `schedule` or `completion`. |
@@ -411,11 +444,11 @@ Requirements:
 
 ### 9.9 Unknown properties
 
-Obsidian and community plugins allow arbitrary properties. A v1 task mutation MUST preserve unknown front-matter keys and their YAML values semantically.
+Obsidian and community plugins allow arbitrary properties. Task mutations in both supported versions MUST preserve unknown front-matter keys and their YAML values semantically.
 
 Rules:
 
-- Core key names are reserved and case-sensitive.
+- Core key names are reserved and case-sensitive for the selected store version. `parent` is reserved only in v2; v1 MUST preserve an arbitrary safely representable `parent` extra unchanged in meaning, including null, strings, lists, and mappings. It MUST NOT decode that extra as a typed relationship or remove it on a metadata edit.
 - Duplicate YAML keys are invalid, including duplicate unknown keys.
 - Unknown scalar, list, and mapping values MUST survive a known-field mutation.
 - YAML comments and original formatting inside front matter SHOULD be preserved when the selected YAML editing library supports it, but comment preservation is not a v1 correctness requirement.
@@ -423,13 +456,14 @@ Rules:
 - YAML custom tags, merge keys, and cyclic aliases MUST be rejected.
 - YAML parsing MUST use a safe data-only mode and MUST NOT instantiate application objects from YAML tags.
 
-Writers SHOULD emit core properties first in this order, followed by unknown properties in their existing relative order:
+Writers MUST emit present core properties first in this order, followed by unknown properties in their existing relative order (`parent` is a core field only in v2):
 
 ```text
 name
 state
 projects
 tags
+parent
 due_date
 recurrence
 recurrence_from
@@ -437,6 +471,18 @@ last_completed_date
 ```
 
 Property order is presentational only. `validate` MUST accept any property order.
+
+### 9.10 Parent relationships (v2)
+
+The optional `parent` value MUST be a YAML string containing a full valid 26-character ULID, with the same Crockford alphabet and leading-digit/overflow bounds as task IDs. Reads accept either ASCII case and normalize the logical value to uppercase; canonical writers MUST quote and uppercase it, including all-digit ULIDs. Quotation is required of canonical output, not of an input scalar already resolved as a string.
+
+Only omission means root. Explicit null, empty string, nonstring values, whitespace-padded values, prefixes, names, paths, wikilinks, child lists, or root sentinels MUST fail with `invalid_parent_id`. Do not coerce a numeric YAML value into a string or treat a malformed value as absent.
+
+Each parent MUST resolve to exactly one physical task identity in the same recursive task tree. A task may have one parent and arbitrary depth; it MUST NOT parent itself or form a cycle. Terminal parents and children are allowed. No parent lookup may escape the store or infer identity from folder placement. Duplicate case-normalized IDs invalidate identity resolution; never select an arbitrary duplicate as the parent.
+
+Parent shape validation is separate from graph validation. Well-typed missing/self/cyclic edges MUST remain representable for inspection and explicit repair; malformed YAML or parent values retain the existing safe failure/no-rewrite policy. Missing references do not turn into roots. Derive parent/child indexes and diagnostics from a complete identity snapshot, without persisting child arrays or retaining excluded bodies unnecessarily. Use iterative traversal so valid depth is not limited by the call stack.
+
+All other fields remain independent per task: names, bodies, state, projects, tags, dates, recurrence, and completion metadata are never inherited. Parent relations point to stable task/series identities, not historical occurrences. Hierarchy is organization, not a dependency system or recurring checklist template.
 
 ## 10. Project storage schema
 
@@ -610,6 +656,8 @@ The implementation MUST include recurrence tests for interval anchoring, multipl
 
 ## 13. Task operation semantics
 
+The v2 parent invariant applies to every mutation entry point, not only parent flags. Changes MUST NOT introduce or worsen graph faults. Unrelated operations and explicit repairs MUST remain possible when other well-typed graph faults already exist; a global pre-edit graph rejection MUST NOT prevent detaching the offending edge. Malformed records, duplicate identity, unsafe paths, and concurrent changes retain their existing safe failure policy.
+
 ### 13.1 Add
 
 ```text
@@ -622,6 +670,7 @@ Options:
 --state <state>
 --project <slug>            repeatable
 --tag <tag>                 repeatable
+--parent <full-id>          v2 only
 --due-date <YYYY-MM-DD>
 --recurrence <rule>
 --recurrence-from <schedule|completion>
@@ -640,6 +689,7 @@ Requirements:
 - Retry ULID generation on the effectively impossible filename collision.
 - Make no Git commit.
 - Return the task and path in JSON mode; print the ID and name in human mode.
+- Without `--parent`, create a root in v2. With it, validate the full-ID destination and its prospective ancestry under the operation lock immediately before writing. The destination may be terminal or itself a child; no metadata is copied from it.
 
 ### 13.2 List
 
@@ -660,11 +710,18 @@ Filters:
 --overdue
 --recurring
 --non-recurring
+--parent <full-id>          v2 only; direct children
+--roots                    v2 only; no parent key
+--query <text>              literal case-insensitive name/ID substring
+--summary                  compact task projection
+--limit <N>                1..1000; requires --summary
 ```
 
-Default behavior excludes tasks in terminal states.
+Default behavior excludes tasks in terminal states but remains flat: matching children appear even when their parent is terminal or fails another filter. `--parent` and `--roots` are mutually exclusive; neither changes terminal filtering, so use `--all` to include terminal children. `--parent` requires a full ULID and selects direct children only; a missing selected parent is an error, not an empty root set.
 
 Filters combine with AND except repeated `--state`, which is an OR set. `--overdue` means a nonterminal task with `due_date < today`.
+
+`--query` treats all characters literally, not as regex, query syntax, paths, or shell input. Match a case-insensitive substring of the task name or full ID; empty query matches every otherwise eligible task. Apply all predicates to individual tasks, then the existing deterministic sort, then the optional limit. `--limit` without `--summary`, noninteger/out-of-range limits, and contradictory flags are usage errors. `--summary` without a limit returns all matching compact rows and `has_more: false`. Compact queries work in both supported store versions; v1 summary parents are null.
 
 Default sort:
 
@@ -676,7 +733,7 @@ Default sort:
 
 Human output SHOULD show an unambiguous ID prefix, state, due date, recurrence indicator, projects, and name. Human output is not a stable scripting interface.
 
-If any task is invalid, `list` MUST fail and identify it rather than silently omit it. Users run `validate` to see all errors.
+Before filtering, projection, sorting, or limiting, `list` MUST parse and validate the complete store's task identities, records, project references, and (v2) graph. Any invalid record or graph fault makes the command fail; limits MUST NOT hide errors or turn failure into partial success. Users run `validate` to see all errors. Ordinary full-list JSON stays unchanged except for the additive nullable `parent` field; only `--summary` uses compact rows and truncation metadata.
 
 ### 13.3 Show
 
@@ -685,6 +742,8 @@ otodo show <id-or-prefix>
 ```
 
 Human output shows all known properties, unknown properties, source path, and body. JSON output returns the normalized logical model plus unknown properties in a separate object.
+
+Well-typed graph faults MUST NOT make the affected task uninspectable: `show` returns its stored normalized parent rather than silently clearing it or failing solely because that edge is missing/self/cyclic. `validate` provides full graph diagnostics. Record syntax/type, identity, project, and safety checks remain unchanged.
 
 ### 13.4 Edit
 
@@ -701,6 +760,8 @@ Changes:
 --remove-project <slug>     repeatable
 --add-tag <tag>             repeatable
 --remove-tag <tag>          repeatable
+--parent <full-id>          v2 only; set or replace parent
+--clear-parent             v2 only; omit parent
 --due-date <date>
 --clear-due-date
 --recurrence <rule>
@@ -721,6 +782,7 @@ Rules:
 - Adding recurrence to a non-recurring task requires an existing or simultaneously supplied due date and an explicit recurrence mode.
 - Metadata-only edits preserve the body exactly.
 - All changes to one task are validated and written as one atomic replacement.
+- `--parent` and `--clear-parent` are mutually exclusive. Resolve a full-ID destination, exclude self/descendants, and validate the effective post-edit ancestry against the freshest store, rather than trusting a prior picker/show result. Setting a parent requires valid resulting ancestry; clearing an edge is an explicit repair even if unrelated faults remain. Reparent/detach changes only the selected task file, preserving every other field and its actual path. Setting the existing parent or clearing an already absent parent may succeed without creating a second edge.
 
 V1 does not open an interactive editor. Obsidian or a text editor remains the interactive editing surface.
 
@@ -752,6 +814,8 @@ For a recurring task:
 8. Write all changes as one atomic replacement.
 
 Completing a recurring task does not place it in `done`; it completes the current occurrence while keeping the series active.
+
+In v2, complete, direct state edits, finish-series, cancel, and reopen affect ONLY the selected task and preserve its parent. There is no child-state prerequisite for completion and no automatic parent completion. Children of terminal parents remain ordinary active tasks. Recurring parent and child series advance independently under section 12: never clone/reset/reopen relatives, inherit dates, or create subtree occurrences. Preserve current independent recurrence advancement in both Rust and Swift completion paths.
 
 ### 13.6 Finish a recurring series
 
@@ -787,6 +851,7 @@ Hard deletion is for mistakes, not normal completion. Requirements:
 
 - Require the full 26-character ID; prefixes are forbidden.
 - Require `--yes`; there is no interactive prompt in v1.
+- In v2, scan all direct inbound parent references, including terminal children, before deleting. If any exist, fail with `task_in_use` and sorted canonical child IDs; make no changes. The user must explicitly detach, reparent, or remove each child first. There is no force, cascade, or delete-and-detach mode.
 - Delete only the resolved task file.
 - Refuse to follow a symlink.
 - Human output warns that recovery depends on external Git history or backups.
@@ -811,6 +876,7 @@ otodo project show <slug>
 ```
 
 Project list sorts by display name and then slug. JSON output includes the number of currently referencing tasks.
+Children count once as ordinary tasks; project membership and counts are never inherited from parents.
 
 ### 14.3 Edit
 
@@ -846,6 +912,8 @@ Task commands accepting `<id-or-prefix>` MUST:
 6. Return ambiguous-ID and list matching full IDs for multiple matches.
 
 Scripts SHOULD use full IDs. Names are never identifiers.
+
+Every parent argument (`add --parent`, `edit --parent`, and `list --parent`) requires a full 26-character ULID, unlike the selected task's existing `<id-or-prefix>` syntax. Normalize valid ASCII case; reject prefixes, paths, names, empty strings, or invalid ULIDs as `invalid_parent_id`. A syntactically valid selected destination with no matching task uses existing `task_not_found`; a stored edge to an absent identity uses `missing_parent_reference`. Duplicate physical IDs remain `duplicate_task_id`, not an arbitrary match.
 
 Project commands require exact slugs and do not perform prefix matching.
 
@@ -892,6 +960,11 @@ Validation includes:
 - Project link syntax and referential integrity.
 - Conditional recurrence fields.
 - Safe unknown property values.
+- In v2, parent scalar/ULID shape, same-store existence, self references, and cycles across all tasks, including terminal and filtered-out records.
+
+Graph analysis MUST be a second pass over safely discovered identity/edge facts. Preserve physical identity facts even when a record has a separate content error; an existing malformed parent is not a missing file. Do not invent graph nodes from fallback IDs used to accumulate other diagnostics. Report duplicate identities before resolving ambiguous edges; suppress derivative missing/self/cycle claims that depend on choosing a duplicate. Other independently discoverable errors MUST still be reported.
+
+For graph diagnostics, a self edge yields `self_parent_reference` only. A cycle of two or more nodes yields `parent_cycle` on each cycle member, not every descendant that leads into that cycle. Missing edges yield `missing_parent_reference` on the referencing child. Diagnostics attach the child path and `field: parent`, with deterministic path/field/location/code ordering. Keep graph faults representable; only explicit user edits repair them.
 
 Unresolved conflict markers include the standard line-start forms:
 
@@ -942,15 +1015,17 @@ Sparse checkout is a convenience boundary, not security isolation. Repository cr
 
 ### 18.1 Sync ownership
 
-The CLI MUST NOT run Git commands. Obsidian Git or another external tool may commit, pull, merge or rebase, and push at any time.
+The CLI MUST NOT run Git commands. Obsidian Git or another external tool may commit, pull, merge or rebase, and push independently during ordinary operations. The explicit schema upgrade/resume is an exception requiring quiescence under section 7.3.
 
 The CLI MUST tolerate commits that mix todo files with unrelated vault files. No functional behavior may require one operation per Git commit.
 
 ### 18.2 Advisory process lock
 
-Mutating CLI commands SHOULD acquire an advisory exclusive lock on the open `.todo/config.toml` file for the duration of the operation. Read-only scans MAY acquire a shared lock. This coordinates multiple `otodo` processes without creating a lock file that Obsidian Git could commit.
+Mutating CLI commands MUST acquire an advisory exclusive lock on the open `.todo/config.toml` file for the duration of the operation. Read-only scans SHOULD acquire a shared lock. This coordinates cooperating `otodo` processes without creating a lock file that Obsidian Git could commit.
 
 Other editors and Git do not honor this lock, so it is not sufficient by itself.
+
+After acquiring an operation lock, new clients MUST recheck on-disk config and schema contents and the current config path's file identity against the generation loaded by `Store::open`. If either changed, fail as a concurrent modification before using cached config/paths or writing. A reopened unsupported or partial pair must not become a bypass around schema gating. Perform equivalent checks at the final publication boundary. This applies to stores opened before another process replaced config/schema, including clients waiting on an old config inode. It does not retrofit this behavior into old binaries; those writers MUST be stopped for upgrade.
 
 ### 18.3 Optimistic concurrency
 
@@ -964,6 +1039,10 @@ Before mutating an existing file, the CLI MUST:
 6. Abort with a concurrent-modification error if the hash differs.
 
 It MUST never use last-writer-wins after detecting an external change.
+
+V2 relation-sensitive operations MUST additionally snapshot and recheck the identity/edge dependencies used to validate their result immediately before publication. Add/reparent depends on destination existence and ancestor edges; delete depends on the absence of all direct inbound children. Detect additions, removals, moves, duplicate IDs, and changed edges, not just changes to files already in a hash set. A compact whole relation snapshot/re-scan is permitted; no persistent index or general transaction manager is required. Observed changes abort with the existing concurrent-modification class, preserve external bytes, and do not partially publish the task.
+
+These checks provide optimistic race detection, not a serializable filesystem snapshot against noncooperating editors. Another file can change after the final check; validation and external synchronization must expose resulting faults rather than promising impossible multi-file atomicity. Normal parent edits and lifecycle operations remain single-task writes.
 
 ### 18.4 Atomic file replacement
 
@@ -988,6 +1067,8 @@ A Git pull may leave conflict markers. The CLI must report those records as inva
 
 Different tasks normally merge as different files. Two writers editing the same task remain an explicit Git/file conflict; no hidden last-writer policy is allowed.
 
+Different-file changes can also combine into a missing reference or cycle. Such well-typed graph faults are explicit relationship diagnostics, not fabricated same-path conflicts; they remain visible and repairable. No import or reconciliation may silently delete descendants, clear parent IDs, or discard pending/conflict bytes to make a graph appear valid. A malformed record continues to fail import safely, retaining the previous durable state rather than silently skipping it.
+
 ## 19. Front-matter parsing and serialization
 
 The implementation MUST NOT parse YAML front matter with regular expressions.
@@ -1009,6 +1090,7 @@ Serializer requirements:
 - Emit list-valued core properties as block lists, except empty lists may be `[]`.
 - Quote Obsidian wikilinks.
 - Quote recurrence strings.
+- In v2, quote canonical uppercase parent ULIDs, place `parent` immediately after `tags`, and omit it for roots. V1 unknown `parent` properties retain unknown-property ordering and meaning.
 - Serialize dates as `YYYY-MM-DD`.
 - Never serialize an `id` property.
 - Preserve unknown values semantically.
@@ -1059,6 +1141,7 @@ A normalized task object contains at least:
   "terminal": false,
   "projects": ["personal-finance"],
   "tags": ["finance", "review"],
+  "parent": null,
   "due_date": "2026-09-06",
   "recurrence": "FREQ=WEEKLY;INTERVAL=1;BYDAY=SU",
   "recurrence_from": "schedule",
@@ -1069,6 +1152,7 @@ A normalized task object contains at least:
 ```
 
 Absent optional values MUST be JSON `null`, not omitted, in normalized task output. Arrays are always present.
+In v2 a child returns its canonical full parent ULID; a root returns null. In v1 normalized `parent` is always null, while any legacy key of that spelling stays in `extra_properties` with its original YAML meaning. CLI JSON envelope version `1` is independent of store schema versions and of client-local cache envelopes.
 
 List output:
 
@@ -1078,6 +1162,37 @@ List output:
   "tasks": []
 }
 ```
+
+`list --summary --query TEXT --limit N` returns exactly the compact row fields below and an explicit truncation flag; bodies, arbitrary properties, and inherited fields are not included:
+
+```json
+{
+  "version": 1,
+  "tasks": [
+    {
+      "id": "01K4B0ZSBZZV25T1K0D3TA8JHR",
+      "path": "Tasks/01K4B0ZSBZZV25T1K0D3TA8JHR.md",
+      "name": "Review weekly finances",
+      "state": "open",
+      "terminal": false,
+      "parent": null
+    }
+  ],
+  "has_more": false
+}
+```
+
+`has_more` is true exactly when additional matching tasks remain beyond the limit after full-store validation and sorting. Returning exactly N rows alone does not imply truncation.
+
+`otodo --format json capabilities` succeeds without a root, config, environment-selected store, or filesystem discovery and returns:
+
+```json
+{"version":1,"store_schema_versions":[1,2],"features":["subtasks","task_candidates","store_upgrade","attachments"]}
+```
+
+This describes the executable, not whether the user's current store enables parent operations. Unsupported stores and legacy-v1 parent operations still fail explicitly; callers MUST NOT silently retry a rejected child creation as a root.
+
+`upgrade --to 2` JSON success is `{"version":1,"upgrade":{"from":1,"to":2,"dry_run":false,"status":"upgraded"}}`. `status` is `planned` for a valid dry-run, `resumed` for a completed intermediate-pair resume, or `already_current` for a coherent v2 no-op (`from:2`). A dry-run uses `dry_run:true`; failures use the normal error envelope and no success object.
 
 Errors in JSON mode are a single JSON object on stderr:
 
@@ -1094,6 +1209,19 @@ Errors in JSON mode are a single JSON object on stderr:
 ```
 
 The stable scripting contract consists of documented JSON fields, error codes, and exit codes. Human wording and table formatting may evolve.
+
+Parent/version error codes:
+
+| Code | Exit | Meaning |
+|---|---:|---|
+| `invalid_parent_id` | 5 | Present parent value or parent argument is not a full valid string ULID. |
+| `missing_parent_reference` | 5 | A stored, well-typed parent ID has no physical task in this store. |
+| `self_parent_reference` | 5 | Canonical child and parent IDs are equal. |
+| `parent_cycle` | 5 | The task participates in a cycle of two or more nodes. |
+| `task_in_use` | 5 | Deletion refused because direct children still reference the task. |
+| `unsupported_schema` | 7 | Unsupported store/upgrade version, or a parent feature requested on legacy v1. |
+
+Parent errors SHOULD include child `path` and `field: parent` when available. Existing `task_not_found` (3), `duplicate_task_id` (5), usage (2), concurrent-modification (6), schema-mismatch validation, and aggregate validation conventions remain in force. An upgrade's legacy-parent collision is a validation failure (5) identifying `parent` and the affected path; it MUST NOT mislabel an arbitrary legacy value as a malformed v2 record.
 
 ### 20.3 Exit codes
 
@@ -1184,7 +1312,7 @@ Requirements:
 - Bound parser recursion and reject YAML constructs capable of alias expansion abuse.
 - Produce useful errors for oversized or pathological records rather than exhausting memory where the selected parser permits limits.
 - Never construct shell commands from task data.
-- Body-file reading is explicitly user-requested and may access outside the store; no other operation may do so.
+- Body-file and attachment-source reading are explicitly user-requested and may access outside the store; no other operation may do so.
 - Do not invoke `$EDITOR`, hooks, plugins, or arbitrary commands in v1.
 - Do not expose unrelated vault files in JSON output or diagnostics.
 - Resolve project links only against the configured in-store project directory.
@@ -1219,6 +1347,8 @@ Cover at least:
 - ID-prefix unique, absent, and ambiguous resolution.
 - Config path containment and symlink rejection.
 - Stable JSON serialization with null optional values.
+- Shared v1/v2 parent corpus: omission, case normalization, numeric ULID quotation, null/type/path/prefix/overflow refusal, legacy unknown-parent preservation, and exact untouched bodies.
+- Graph identity ambiguity, missing/self/multiple cycles, entering descendants, terminal parents, deep iterative traversal, and explicit repair without suppressing unrelated diagnostics.
 
 ### 23.2 Integration tests
 
@@ -1243,7 +1373,14 @@ Use isolated temporary directories. Cover at least:
 17. Run normal operations with no Git executable available.
 18. Copy only the store folder into a directory with no vault, `.obsidian`, or `.git`; run all normal commands successfully with `--root`.
 19. Verify every command leaves unrelated vault files byte-identical.
-20. Verify failed mutations leave no committed replacement and no persistent temporary file.
+20. Verify failed ordinary mutations leave no committed replacement and no persistent temporary file; explicit upgrade interruption follows section 7.3's fail-closed partial-state contract.
+21. Add/reparent/detach with full IDs under nested and terminal parents; verify independent metadata, stable paths, and unrelated task bytes.
+22. Refuse deletion with any direct child, including terminal children; allow explicit repair and later leaf deletion.
+23. Prove every lifecycle and both recurrence modes preserve parent links and never change relatives.
+24. Prove excluded records cannot hide a graph error from full or compact list; verify literal query/limit boundaries, sort, and exact `has_more`.
+25. Detect parent/ancestor changes, newly added children, and stale config/schema generations at the operation's snapshot boundaries.
+26. Exercise explicit v1/v2 support, no auto-upgrade, arbitrary v1 parent extras, collision refusal, dry-run, each resumable cutover state, unsupported/reversed pairs, unchanged record bytes, and custom Base preservation. Failed ordinary mutations remain no-write; an interrupted upgrade may leave only the documented fail-closed pair.
+27. Prove rootless capabilities ignores unusable store discovery inputs and unsupported versions still fail before mutation.
 
 ### 23.3 CLI contract tests
 
@@ -1324,27 +1461,34 @@ A pulled task contains conflict markers. `otodo validate` identifies the path an
 
 An agent can use only documented `--format json` output and full task IDs to create, find, update, and complete tasks. It never needs to parse human tables, Markdown front matter, Git logs, or commit messages.
 
+### Scenario K: Independent subtasks
+
+Create a terminal parent, an active child, and a grandchild in a v2 sparse store. Move the parent manually within the recursive task tree. The relation still resolves by ULID; default list shows the active child; roots/direct-child filters are explicit. Complete or recur one task without changing any relative. Deleting either parent with direct children refuses; explicit detach/reparent repairs the graph without rewriting relatives.
+
+### Scenario L: Invalid graph and repair
+
+Externally introduce an orphan, a self edge, and a cycle in otherwise readable records. `validate` reports all independently discoverable relationships; even bounded queries fail rather than hiding them. `show` preserves the faulty parent ID. Explicit clear/reparent repairs the selected edge while unrelated faults remain discoverable. Malformed records still fail safely without rewriting or silent omission.
+
+### Scenario M: Explicit format activation
+
+A new client edits a legacy v1 task containing arbitrary `parent` metadata without interpreting or losing it. Parent feature operations fail. After users explicitly handle every parent-key collision and quiesce writers, dry-run makes no changes, upgrade changes only config/schema, and a stopped intermediate cutover rejects normal writes until explicit resume completes. Every existing task/project and customized Base stays byte-identical. Newly launched old clients reject the completed v2 format; new clients reject stale generations. No claim is made that old already-running writers are safe without quiescence.
+
 ## 25. Recommended implementation order
 
-An implementation agent should proceed in this order because each stage supplies prerequisites for the next:
+The existing v1 implementation is the baseline; preserve its unrelated behavior rather than recreating the package. Implement the extension in dependency order:
 
-1. Create Cargo library/binary package, typed errors, and CLI shell.
-2. Implement config types, store discovery, contained paths, and initialization.
-3. Implement front-matter splitting, safe YAML model, task/project parsing, and serialization.
-4. Implement full read-only validation and store scanning.
-5. Implement project create/list/show/edit/delete.
-6. Implement task add/list/show/edit with JSON output.
-7. Implement atomic writes, advisory locking, and optimistic concurrency checks before enabling mutation commands broadly.
-8. Implement date and recurrence parser/calculator with exhaustive unit tests.
-9. Implement complete, finish-series, cancel, reopen, and delete.
-10. Add sparse-layout, external-change, full CLI contract, and acceptance tests.
-11. Run formatter, Clippy with warnings denied for project code, and the complete test suite.
+1. Freeze v1/v2 schemas, external parent/JSON/error semantics, and shared conformance fixtures.
+2. Add schema-aware codecs/models and pure iterative relation analysis, including legacy unknown-key preservation and representable graph faults.
+3. Integrate tolerant validation, locked single-task operations, explicit repair, deletion guards, and config/schema/relation snapshot checks.
+4. Add CLI parent flags, flat filters, compact candidates, rootless capabilities, and v2 initialization/Base generation.
+5. Add quiesced explicit upgrade/dry-run/resume without record rewrites or custom Base loss.
+6. Integrate cross-client compatibility and actual publication-subset safety, then execute focused behavior proofs and the repository's complete quality gate.
 
 Each stage must be production behavior, not a stub. Do not expose a command until its invariants, error handling, JSON contract, and behavioral tests are complete.
 
 ## 26. Definition of done
 
-The first release is done when:
+The v2 extension with explicit legacy-v1 support is done when:
 
 - Every product goal and acceptance scenario is implemented.
 - Every non-goal remains absent rather than partially scaffolded.
@@ -1354,9 +1498,38 @@ The first release is done when:
 - `cargo clippy --all-targets --all-features -- -D warnings` passes.
 - `cargo test --all-targets --all-features` passes.
 - The CLI demonstrably operates on an initialized store with no Git executable, no `.git`, no `.obsidian`, and no network.
-- No normal operation reads or changes files outside the selected store.
+- No normal operation changes files outside the selected store; only explicitly supplied body files and attachment import sources may be read externally.
 - Obsidian-created unknown properties survive known-field mutations.
 - Malformed or conflicted input produces an actionable error and no data loss.
 - JSON output and exit codes match this specification.
+- Legacy flat stores remain writable without interpreting their parent extras; v2 activation is explicit, fail-closed/resumable, and quiesced.
+- Subtask mutations, independent lifecycle/recurrence, graph repair, candidate discovery, and snapshot-race behavior satisfy the shared contract and conformance corpus.
 
 Any implementation that silently loses unknown properties, overwrites a concurrent edit, depends on Git history, mutates unrelated vault content, or accepts unsupported recurrence rules as if valid is incorrect.
+
+## 27. Ordinary file attachments (store schemas 1 and 2)
+
+Attachments MUST NOT require a store upgrade, new config key, or frontmatter property. A custom property named `attachments` remains unknown user metadata and MUST survive all attachment operations. CLI JSON stays at version 1 and rootless executable capabilities advertise `attachments` independently of `subtasks`, `task_candidates`, and the selected store schema.
+
+Files MUST live below fixed `Attachments/`. Each import MUST allocate a fresh ULID directory, sanitize a UTF-8 filename, and copy bytes unchanged. Each file MUST be at most 20 MiB (20 × 1024 × 1024 bytes), inclusive. `Attachments/` is created on first import. Imports read only explicitly selected external source files, reject symlinks and nonregular sources, and stage all inputs before publishing any task. Filenames retain Unicode; controls and `/\:*?"<>|` become `_`, leading/trailing whitespace and dots are trimmed, empty names become `attachment`, and names are bounded to 200 UTF-8 bytes.
+
+Canonical associations are relative Markdown links in a task body, generated from the task's actual parent directory. Images use embeds. Generated paths percent-encode non-ASCII and reserved bytes; labels escape Markdown brackets/backslashes. Inline Markdown links/images and explicit Obsidian wikilinks/embeds into `Attachments/` MUST be recognized, including manually placed files and nested tasks. Explicit `[[Attachments/...]]` paths are store-relative; an exact configured `obsidian_link_prefix` before `Attachments/` is also recognized for vault-qualified wikilinks; other relative paths resolve from the task file. Fragments and aliases do not change association identity. Fenced, indented, and inline code examples MUST be ignored. Shortened/ambiguous/unsupported attachment links remain untouched; diagnostics explain that an explicit path is required. References are deduplicated by normalized store-relative file path. The shared corpus is `tests/fixtures/attachments/links.json`.
+
+Selectors MUST be explicit normalized store-relative `Attachments/...` file paths. Absolute paths, traversal, symlink components, and nonregular targets MUST be refused. Missing targets MUST be reported without blocking ordinary task editing. If `Attachments/` overlaps configured task/project paths, only attachment operations are disabled; ordinary todo functionality remains available and tolerant validation emits a warning.
+
+Required commands:
+
+```text
+otodo add <name> --attach <source> [--attach <source> ...]
+otodo attachment add <task-id> <source> [<source> ...]
+otodo attachment link <task-id> Attachments/<path>
+otodo attachment list <task-id> --format json
+otodo attachment unlink <task-id> Attachments/<path>
+otodo attachment path <task-id> Attachments/<path>
+```
+
+Attachment add/link/list/unlink results contain `version: 1` and an `attachments` array. Each result contains `path`, `display_name`, `byte_size` (null when missing), and `availability` (`available` or `missing`). `attachment path` returns the existing linked file's absolute path; JSON uses `version: 1` and `path`. Existing task outputs MUST remain unchanged. Link is idempotent. Unlink removes all recognized occurrences from that task without changing unrelated body bytes; it never deletes files. Completing, recurring, or deleting a task MUST retain stored files. Multiple tasks may share one file; children inherit none.
+
+Attachment publications MUST use existing store locks, generation checks, and exclusive-create writes. Files publish before the task, and the task publishes once with its source snapshot and existing relationship checks. Failure before task publication MUST NOT create a task. Files may remain unreferenced after interruption or a later failed task write; no multi-file filesystem atomicity is promised. `attachment_source_invalid`, `attachment_too_large`, `unsafe_attachment_path`, and `attachments_disabled` from new-task imports guarantee that task publication did not occur. Clients MUST treat I/O and unrecognized errors as uncertain and MUST NOT blindly retry them.
+
+The explicit v1→v2 upgrader MUST preserve attachment bytes and task links through dry-run, upgrade, resume, and already-current no-op. Targets other than 2, including 3, remain unsupported. CLI Git operations remain forbidden. Desktop synchronization and sparse checkouts MUST include `Attachments/`. Documentation MUST explain Obsidian attachment-location settings without changing vault-wide preferences. File deletion, orphan cleanup, camera capture, and scanning are outside this release.

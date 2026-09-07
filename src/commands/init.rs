@@ -33,6 +33,8 @@ const TODOS_BASE_VIEW: &str = r#"formulas:
 properties:
   formula.todo:
     displayName: Todo
+  parent:
+    displayName: Parent
   due_date:
     displayName: Due
   recurrence_from:
@@ -48,6 +50,7 @@ views:
       - due_date
       - projects
       - tags
+      - parent
       - recurrence
       - recurrence_from
       - last_completed_date

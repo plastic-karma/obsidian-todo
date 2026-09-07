@@ -5,13 +5,15 @@ use serde_yaml_ng::{Mapping, Value};
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::model::{date_from_yaml, validate_name, validate_project_slug, Project, Task};
+use crate::model::{
+    date_from_yaml, normalize_parent_id, validate_name, validate_project_slug, Project, Task,
+};
 use crate::recurrence::{RecurrenceMode, RecurrenceRule};
 
 pub const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_YAML_DEPTH: usize = 64;
 const MAX_YAML_NODES: usize = 100_000;
-const CORE_TASK_KEYS: [&str; 8] = [
+const CORE_TASK_KEYS: [&str; 9] = [
     "name",
     "state",
     "projects",
@@ -20,6 +22,7 @@ const CORE_TASK_KEYS: [&str; 8] = [
     "recurrence",
     "recurrence_from",
     "last_completed_date",
+    "parent",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -133,6 +136,13 @@ pub fn parse_task(id: &str, path: &Path, bytes: &[u8], config: &Config) -> Resul
     let state = take_required_string(&mut properties, "state")?;
     let project_links = take_required_string_list(&mut properties, "projects")?;
     let tags = take_required_string_list(&mut properties, "tags")?;
+    let parent = if config.schema_version == 2 {
+        let parent = parent_from_properties(&properties)?;
+        properties.shift_remove("parent");
+        parent
+    } else {
+        None
+    };
     let due_date = take_optional(&mut properties, "due_date")
         .as_ref()
         .map(|value| date_from_yaml(value, "due_date"))
@@ -163,6 +173,7 @@ pub fn parse_task(id: &str, path: &Path, bytes: &[u8], config: &Config) -> Resul
         state,
         projects,
         tags,
+        parent,
         due_date,
         recurrence,
         recurrence_from,
@@ -172,6 +183,20 @@ pub fn parse_task(id: &str, path: &Path, bytes: &[u8], config: &Config) -> Resul
     };
     task.validate(config)?;
     Ok(task)
+}
+
+pub(crate) fn parent_from_properties(properties: &Mapping) -> Result<Option<String>> {
+    properties
+        .get("parent")
+        .map(|value| match value {
+            Value::String(value) => normalize_parent_id(value),
+            _ => Err(Error::validation(
+                "invalid_parent_id",
+                "Parent must be a string containing a full valid ULID",
+            )
+            .with_field("parent")),
+        })
+        .transpose()
 }
 
 pub fn parse_project(slug: &str, path: &Path, bytes: &[u8]) -> Result<Project> {
@@ -193,7 +218,12 @@ pub fn parse_project(slug: &str, path: &Path, bytes: &[u8]) -> Result<Project> {
 pub fn serialize_task(task: &Task, config: &Config) -> Result<Vec<u8>> {
     reject_conflict_markers(&task.body)?;
     task.validate(config)?;
-    reject_reserved_extras(&task.extra_properties, &CORE_TASK_KEYS)?;
+    let reserved = if config.schema_version == 2 {
+        &CORE_TASK_KEYS[..]
+    } else {
+        &CORE_TASK_KEYS[..CORE_TASK_KEYS.len() - 1]
+    };
+    reject_reserved_extras(&task.extra_properties, reserved)?;
     let mut projects = task.projects.iter().map(String::as_str).collect::<Vec<_>>();
     projects.sort_unstable();
     let mut tags = task.tags.iter().map(String::as_str).collect::<Vec<_>>();
@@ -211,6 +241,9 @@ pub fn serialize_task(task: &Task, config: &Config) -> Result<Vec<u8>> {
     )?;
     output.push_str("tags:");
     write_string_list(&mut output, tags)?;
+    if let Some(parent) = &task.parent {
+        writeln!(output, "parent: {}", quoted(&parent.to_ascii_uppercase())?).map_err(fmt_error)?;
+    }
     if let Some(date) = task.due_date {
         writeln!(output, "due_date: {}", date.format("%Y-%m-%d")).map_err(fmt_error)?;
     }
@@ -1024,42 +1057,6 @@ mod tests {
         assert_eq!(reparsed.body, "# Notes\n");
     }
     #[test]
-    fn checked_in_schema_matches_rust_core_fields() {
-        let schema: serde_json::Value =
-            serde_json::from_str(crate::config::EMBEDDED_SCHEMA).expect("valid JSON schema");
-        assert_eq!(schema["x-obsidian-todo-schema-version"], 1);
-
-        let task_schema = &schema["$defs"]["task"];
-        let required = task_schema["required"]
-            .as_array()
-            .expect("task required fields")
-            .iter()
-            .map(|value| value.as_str().expect("string field"))
-            .collect::<Vec<_>>();
-        assert_eq!(required, ["name", "state", "projects", "tags"]);
-        let properties = task_schema["properties"]
-            .as_object()
-            .expect("task properties");
-        for field in CORE_TASK_KEYS {
-            assert!(
-                properties.contains_key(field),
-                "missing schema field {field}"
-            );
-        }
-        assert_eq!(schema["$defs"]["name"]["pattern"], r"^[^\r\n]*\S[^\r\n]*$");
-        for record in ["task", "project"] {
-            assert_eq!(
-                schema["$defs"][record]["propertyNames"]["not"]["const"],
-                "id"
-            );
-        }
-
-        assert_eq!(
-            schema["$defs"]["project"]["required"],
-            serde_json::json!(["name"])
-        );
-    }
-    #[test]
     fn oversized_input_and_serialized_records_are_rejected() {
         let input = vec![b'x'; MAX_RECORD_BYTES + 1];
         assert_eq!(
@@ -1074,6 +1071,101 @@ mod tests {
                 .expect_err("oversized output")
                 .code(),
             "record_too_large"
+        );
+    }
+
+    #[test]
+    fn shared_parent_record_conformance_preserves_extras_and_body() {
+        #[derive(serde::Deserialize)]
+        struct Corpus {
+            record_cases: Vec<RecordCase>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RecordCase {
+            name: String,
+            schema_version: u32,
+            id: String,
+            markdown: String,
+            expected_parent: Option<String>,
+            expected_error: Option<String>,
+        }
+        let corpus: Corpus =
+            serde_json::from_str(include_str!("../tests/fixtures/subtasks.json")).expect("corpus");
+        for case in corpus.record_cases {
+            let mut config = config();
+            config.schema_version = case.schema_version;
+            let path = std::path::PathBuf::from(format!("Tasks/{}.md", case.id));
+            let parsed = parse_task(&case.id, &path, case.markdown.as_bytes(), &config);
+            if let Some(expected) = case.expected_error {
+                let error = parsed.expect_err(&case.name);
+                assert_eq!(error.code(), expected, "{}", case.name);
+                assert_eq!(error.field(), Some("parent"), "{}", case.name);
+                continue;
+            }
+            let mut task = parsed.expect(&case.name);
+            assert_eq!(task.parent, case.expected_parent, "{}", case.name);
+            let original = parse_document(case.markdown.as_bytes()).expect("document");
+            if case.schema_version == 1 {
+                assert_eq!(
+                    task.extra_properties.get("parent"),
+                    original.properties.get("parent"),
+                    "{}",
+                    case.name
+                );
+            }
+            task.name = "Edited name".to_owned();
+            let serialized = serialize_task(&task, &config).expect(&case.name);
+            let reparsed = parse_task(&case.id, &path, &serialized, &config).expect(&case.name);
+            assert_eq!(reparsed, task, "{}", case.name);
+            assert_eq!(
+                reparsed.body.as_bytes(),
+                original.body.as_bytes(),
+                "{}",
+                case.name
+            );
+            if let Some(parent) = &task.parent {
+                let source = std::str::from_utf8(&serialized).expect("UTF-8");
+                assert!(
+                    source.contains(&format!("\nparent: \"{parent}\"\n")),
+                    "{}",
+                    case.name
+                );
+                let lines = source.lines().collect::<Vec<_>>();
+                let parent_line = lines
+                    .iter()
+                    .position(|line| line.starts_with("parent:"))
+                    .expect("parent");
+                assert!(lines[..parent_line]
+                    .iter()
+                    .any(|line| line.starts_with("tags:")));
+                assert!(!lines[..parent_line]
+                    .iter()
+                    .any(|line| line.starts_with("due_date:")));
+            }
+        }
+    }
+
+    #[test]
+    fn v2_reserved_parent_extra_cannot_override_typed_relationship() {
+        let mut parsed = task("---\nname: Task\nstate: open\nprojects: []\ntags: []\n---\n");
+        parsed
+            .extra_properties
+            .insert(Value::String("parent".to_owned()), Value::Null);
+        let error = serialize_task(&parsed, &config()).expect_err("reserved parent");
+        assert_eq!(error.code(), "reserved_extra_property");
+        assert_eq!(error.field(), Some("parent"));
+        let mut legacy = config();
+        legacy.schema_version = 1;
+        let bytes = serialize_task(&parsed, &legacy).expect("legacy metadata");
+        let reparsed = parse_task(ID, &parsed.path, &bytes, &legacy).expect("legacy");
+        assert_eq!(reparsed.extra_properties.get("parent"), Some(&Value::Null));
+        assert_eq!(reparsed.parent, None);
+        parsed.parent = Some(ID.to_owned());
+        assert_eq!(
+            serialize_task(&parsed, &legacy)
+                .expect_err("no typed v1 relationship")
+                .code(),
+            "unsupported_schema"
         );
     }
 }

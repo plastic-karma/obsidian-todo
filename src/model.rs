@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{Local, NaiveDate};
@@ -6,7 +6,7 @@ use serde_yaml_ng::Mapping;
 use ulid::Ulid;
 
 use crate::config::Config;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, ValidationIssue};
 use crate::recurrence::{parse_date, validate_date_value, RecurrenceMode, RecurrenceRule};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -17,12 +17,132 @@ pub struct Task {
     pub state: String,
     pub projects: Vec<String>,
     pub tags: Vec<String>,
+    pub parent: Option<String>,
     pub due_date: Option<NaiveDate>,
     pub recurrence: Option<RecurrenceRule>,
     pub recurrence_from: Option<RecurrenceMode>,
     pub last_completed_date: Option<NaiveDate>,
     pub body: String,
     pub extra_properties: Mapping,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentRecord {
+    pub id: String,
+    pub path: PathBuf,
+    pub parent: Option<String>,
+}
+
+/// Analyze physical identities without choosing edges from duplicate records.
+#[must_use]
+pub fn analyze_parents(records: &[ParentRecord]) -> Vec<ValidationIssue> {
+    let ids = records
+        .iter()
+        .map(|record| record.id.to_ascii_uppercase())
+        .collect::<Vec<_>>();
+    let mut identities = HashMap::<&str, usize>::with_capacity(records.len());
+    let mut ambiguous = vec![false; records.len()];
+    for (index, id) in ids.iter().enumerate() {
+        if let Some(&first) = identities.get(id.as_str()) {
+            ambiguous[first] = true;
+            ambiguous[index] = true;
+            if records[index].path < records[first].path {
+                identities.insert(id, index);
+            }
+        } else {
+            identities.insert(id, index);
+        }
+    }
+
+    let mut issues = Vec::new();
+    let mut edges = vec![None; records.len()];
+    for (index, record) in records.iter().enumerate() {
+        if ambiguous[index] {
+            if identities[ids[index].as_str()] == index {
+                issues.push((
+                    index,
+                    ValidationIssue::error(
+                        "duplicate_task_id",
+                        format!("Task ID {} appears more than once", ids[index]),
+                    )
+                    .at_path(&record.path),
+                ));
+            }
+            continue;
+        }
+        let Some(parent) = &record.parent else {
+            continue;
+        };
+        let parent = parent.to_ascii_uppercase();
+        let fault = match identities.get(parent.as_str()) {
+            None => Some((
+                "missing_parent_reference",
+                format!("Parent task {parent} does not exist"),
+            )),
+            Some(&target) if ambiguous[target] => None,
+            Some(&target) if target == index => Some((
+                "self_parent_reference",
+                format!("Task {} cannot parent itself", ids[index]),
+            )),
+            Some(&target) => {
+                edges[index] = Some(target);
+                None
+            }
+        };
+        if let Some((code, message)) = fault {
+            issues.push((
+                index,
+                ValidationIssue::error(code, message)
+                    .at_path(&record.path)
+                    .at_field("parent"),
+            ));
+        }
+    }
+
+    // Each node is visited once. The current walk is explicit, so depth cannot
+    // exhaust the call stack and entering descendants are not cycle members.
+    let mut state = vec![0_u8; records.len()];
+    let mut positions = vec![0; records.len()];
+    let mut walk = Vec::<usize>::new();
+    for start in 0..records.len() {
+        if state[start] != 0 {
+            continue;
+        }
+        walk.clear();
+        let mut current = Some(start);
+        while let Some(index) = current {
+            if state[index] == 2 {
+                break;
+            }
+            if state[index] == 1 {
+                for &member in &walk[positions[index]..] {
+                    issues.push((
+                        member,
+                        ValidationIssue::error(
+                            "parent_cycle",
+                            format!("Task {} participates in a parent cycle", ids[member]),
+                        )
+                        .at_path(&records[member].path)
+                        .at_field("parent"),
+                    ));
+                }
+                break;
+            }
+            state[index] = 1;
+            positions[index] = walk.len();
+            walk.push(index);
+            current = edges[index];
+        }
+        for &index in &walk {
+            state[index] = 2;
+        }
+    }
+    issues.sort_by(|(left, left_issue), (right, right_issue)| {
+        ids[*left]
+            .cmp(&ids[*right])
+            .then_with(|| left_issue.code.cmp(&right_issue.code))
+    });
+    issues.into_iter().map(|(_, issue)| issue).collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,6 +188,16 @@ impl Clock for FixedClock {
 impl Task {
     pub fn validate(&self, config: &Config) -> Result<()> {
         validate_task_id(&self.id)?;
+        if let Some(parent) = &self.parent {
+            if config.schema_version != 2 {
+                return Err(Error::unsupported(
+                    "unsupported_schema",
+                    "Typed parent relationships require schema version 2",
+                )
+                .with_field("parent"));
+            }
+            normalize_parent_id(parent)?;
+        }
         validate_name(&self.name, "name")?;
         if config.state(&self.state).is_none() {
             return Err(Error::validation(
@@ -235,6 +365,17 @@ pub fn validate_task_id(value: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn normalize_parent_id(value: &str) -> Result<String> {
+    validate_task_id(value).map_err(|_| {
+        Error::validation(
+            "invalid_parent_id",
+            format!("Parent {value:?} must be a full valid ULID"),
+        )
+        .with_field("parent")
+    })?;
+    Ok(value.to_ascii_uppercase())
+}
+
 #[must_use]
 pub fn is_ulid_character(byte: u8) -> bool {
     matches!(
@@ -347,5 +488,164 @@ mod tests {
     fn supplied_bodies_get_lf_and_one_trailing_newline() {
         assert_eq!(normalize_body("one\r\ntwo\r\n\r\n"), "one\ntwo\n");
         assert_eq!(normalize_body(""), "");
+    }
+
+    #[test]
+    fn parent_arguments_require_full_unpadded_ulids() {
+        assert_eq!(
+            normalize_parent_id("01k4b0zsbzzv25t1k0d3ta8jhr").expect("parent"),
+            "01K4B0ZSBZZV25T1K0D3TA8JHR"
+        );
+        for invalid in [
+            "",
+            "none",
+            "01K4B0",
+            " 01K4B0ZSBZZV25T1K0D3TA8JHR",
+            "01K4B0ZSBZZV25T1K0D3TA8JHR ",
+            "[[01K4B0ZSBZZV25T1K0D3TA8JHR]]",
+            "Tasks/01K4B0ZSBZZV25T1K0D3TA8JHR.md",
+            "81K4B0ZSBZZV25T1K0D3TA8JHR",
+            "01K4B0ZSBZZV25T1K0D3TA8JRI",
+        ] {
+            let error = normalize_parent_id(invalid).expect_err(invalid);
+            assert_eq!(error.code(), "invalid_parent_id");
+            assert_eq!(error.field(), Some("parent"));
+            assert_eq!(error.exit_code(), 5);
+        }
+    }
+
+    #[test]
+    fn shared_parent_graph_conformance() {
+        #[derive(serde::Deserialize)]
+        struct Corpus {
+            graph_cases: Vec<GraphCase>,
+        }
+        #[derive(serde::Deserialize)]
+        struct GraphCase {
+            name: String,
+            tasks: Vec<GraphTask>,
+            expected_issues: Vec<GraphIssue>,
+        }
+        #[derive(serde::Deserialize)]
+        struct GraphTask {
+            id: String,
+            parent: Option<String>,
+        }
+        #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+        struct GraphIssue {
+            code: String,
+            task_id: String,
+        }
+        let corpus: Corpus =
+            serde_json::from_str(include_str!("../tests/fixtures/subtasks.json")).expect("corpus");
+        for case in corpus.graph_cases {
+            let mut records = case
+                .tasks
+                .into_iter()
+                .map(|task| ParentRecord {
+                    path: PathBuf::from(format!("Tasks/{}.md", task.id.to_ascii_uppercase())),
+                    id: task.id,
+                    parent: task.parent,
+                })
+                .collect::<Vec<_>>();
+            for _ in 0..2 {
+                let actual = analyze_parents(&records)
+                    .into_iter()
+                    .map(|issue| {
+                        if issue.code != "duplicate_task_id" {
+                            assert_eq!(issue.field.as_deref(), Some("parent"), "{}", case.name);
+                        }
+                        GraphIssue {
+                            task_id: issue
+                                .path
+                                .expect("child path")
+                                .file_stem()
+                                .expect("filename")
+                                .to_str()
+                                .expect("ULID")
+                                .to_owned(),
+                            code: issue.code,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, case.expected_issues, "{}", case.name);
+                records.reverse();
+                for record in &mut records {
+                    record.id.make_ascii_lowercase();
+                    if let Some(parent) = &mut record.parent {
+                        parent.make_ascii_lowercase();
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deep_parent_walk_reports_only_cycle_members_and_detach_repairs_it() {
+        const DEPTH: usize = 30_000;
+        let mut records = (0..DEPTH)
+            .map(|index| {
+                let id = Ulid::from(index as u128).to_string();
+                ParentRecord {
+                    path: PathBuf::from(format!("Tasks/{id}.md")),
+                    id,
+                    parent: (index + 1 < DEPTH)
+                        .then(|| Ulid::from((index + 1) as u128).to_string()),
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(analyze_parents(&records).is_empty());
+        records[DEPTH - 1].parent = Some(records[DEPTH / 2].id.clone());
+        let issues = analyze_parents(&records);
+        assert_eq!(issues.len(), DEPTH / 2);
+        for (issue, member) in issues.iter().zip(&records[DEPTH / 2..]) {
+            assert_eq!(issue.code, "parent_cycle");
+            assert_eq!(issue.path.as_ref(), Some(&member.path));
+        }
+        records[DEPTH / 2].parent = None;
+        assert!(analyze_parents(&records).is_empty());
+    }
+
+    #[test]
+    fn three_duplicate_paths_never_select_an_arbitrary_parent_edge() {
+        let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let child = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+        let missing = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
+        let mut records = vec![
+            ParentRecord {
+                id: id.to_owned(),
+                path: "Tasks/z.md".into(),
+                parent: Some(id.to_owned()),
+            },
+            ParentRecord {
+                id: id.to_ascii_lowercase(),
+                path: "Tasks/a.md".into(),
+                parent: Some(missing.to_owned()),
+            },
+            ParentRecord {
+                id: id.to_owned(),
+                path: "Tasks/b.md".into(),
+                parent: Some(child.to_owned()),
+            },
+            ParentRecord {
+                id: child.to_owned(),
+                path: "Tasks/child.md".into(),
+                parent: Some(id.to_owned()),
+            },
+        ];
+        for _ in 0..2 {
+            let actual = analyze_parents(&records)
+                .into_iter()
+                .map(|issue| (issue.code, issue.path))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual,
+                vec![(
+                    "duplicate_task_id".to_owned(),
+                    Some(PathBuf::from("Tasks/a.md")),
+                )]
+            );
+            records.reverse();
+        }
     }
 }

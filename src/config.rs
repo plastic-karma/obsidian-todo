@@ -5,11 +5,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result, ValidationIssue};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const CONFIG_PATH: &str = ".todo/config.toml";
 pub const SCHEMA_PATH: &str = ".todo/schema.json";
 pub const TODOS_BASE_PATH: &str = "todos.base";
 pub const EMBEDDED_SCHEMA: &str = include_str!("../assets/schema.json");
+
+pub fn embedded_schema(version: u32) -> Result<&'static str> {
+    match version {
+        1 => Ok(include_str!("../assets/schema-v1.json")),
+        2 => Ok(EMBEDDED_SCHEMA),
+        _ => Err(Error::unsupported(
+            "unsupported_schema",
+            format!("Schema version {version} is unsupported; supported versions are 1 and 2"),
+        )
+        .with_path(CONFIG_PATH)
+        .with_field("schema_version")),
+    }
+}
+
 pub(crate) fn source_location(source: &str, byte_offset: usize) -> (usize, usize) {
     let prefix = source.get(..byte_offset).unwrap_or(source);
     let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
@@ -95,11 +109,11 @@ impl Config {
             .get("schema_version")
             .and_then(toml::Value::as_integer)
         {
-            if version != i64::from(SCHEMA_VERSION) {
+            if !matches!(version, 1 | 2) {
                 return Err(Error::unsupported(
                     "unsupported_schema",
                     format!(
-                        "Schema version {version} is unsupported; this client requires version {SCHEMA_VERSION}"
+                        "Schema version {version} is unsupported; supported versions are 1 and 2"
                     ),
                 )
                 .with_path(CONFIG_PATH)
@@ -135,18 +149,11 @@ impl Config {
     #[must_use]
     pub fn validation_issues(&self) -> Vec<ValidationIssue> {
         let mut issues = Vec::new();
-        if self.schema_version != SCHEMA_VERSION {
-            let message = if self.schema_version > SCHEMA_VERSION {
-                format!(
-                    "Schema version {} is newer than supported version {SCHEMA_VERSION}",
-                    self.schema_version
-                )
-            } else {
-                format!(
-                    "Schema version {} is not supported; expected {SCHEMA_VERSION}",
-                    self.schema_version
-                )
-            };
+        if !matches!(self.schema_version, 1 | 2) {
+            let message = format!(
+                "Schema version {} is unsupported; supported versions are 1 and 2",
+                self.schema_version
+            );
             issues.push(
                 ValidationIssue::error("unsupported_schema", message)
                     .at_path(CONFIG_PATH)
@@ -514,7 +521,7 @@ mod tests {
     }
     #[test]
     fn every_unsupported_schema_version_uses_exit_seven() {
-        for version in [0, 2] {
+        for version in [0, 3, u32::MAX] {
             let mut config = Config::defaults("Todo".to_owned());
             config.schema_version = version;
             let source = config.to_toml().expect("serialize");
@@ -523,12 +530,39 @@ mod tests {
             assert_eq!(error.exit_code(), 7);
         }
     }
+
+    #[test]
+    fn supported_versions_select_distinct_exact_schemas() {
+        for version in [1, 2] {
+            let mut config = Config::defaults("Todo".to_owned());
+            config.schema_version = version;
+            let parsed = Config::parse(&config.to_toml().expect("serialize")).expect("supported");
+            assert_eq!(parsed.schema_version, version);
+            let schema: serde_json::Value =
+                serde_json::from_str(embedded_schema(version).expect("schema")).expect("JSON");
+            assert_eq!(schema["x-obsidian-todo-schema-version"], version);
+            assert_eq!(
+                schema["$defs"]["task"]["properties"]
+                    .get("parent")
+                    .is_some(),
+                version == 2
+            );
+        }
+        for version in [0, 3, u32::MAX] {
+            assert_eq!(
+                embedded_schema(version)
+                    .expect_err("unsupported")
+                    .exit_code(),
+                7
+            );
+        }
+    }
     #[test]
     fn newer_schema_wins_over_unknown_future_fields() {
         let source = Config::defaults("Todo".to_owned())
             .to_toml()
             .expect("serialize")
-            .replacen("schema_version = 1", "schema_version = 2", 1)
+            .replacen("schema_version = 2", "schema_version = 3", 1)
             + "\nfuture_field = true\n";
         let error = Config::parse(&source).expect_err("future schema");
         assert_eq!(error.code(), "unsupported_schema");

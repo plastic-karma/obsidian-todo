@@ -199,6 +199,9 @@ pub struct AddArguments {
     /// Full parent task ID (v2 stores only)
     #[arg(long)]
     pub parent: Option<String>,
+    /// Optional absolute HTTP or HTTPS link
+    #[arg(long)]
+    pub url: Option<String>,
     #[arg(long, value_parser = parse_cli_date)]
     pub due_date: Option<NaiveDate>,
     #[arg(long)]
@@ -273,6 +276,12 @@ pub struct EditArguments {
     /// Detach this task from its parent (v2 stores only)
     #[arg(long, conflicts_with = "parent")]
     pub clear_parent: bool,
+    /// Set or replace the HTTP or HTTPS link
+    #[arg(long, conflicts_with = "clear_url")]
+    pub url: Option<String>,
+    /// Remove the task link
+    #[arg(long, conflicts_with = "url")]
+    pub clear_url: bool,
     #[arg(long, value_parser = parse_cli_date, conflicts_with = "clear_due_date")]
     pub due_date: Option<NaiveDate>,
     #[arg(long)]
@@ -381,12 +390,12 @@ fn run_with_arguments(arguments: &[OsString], format: OutputFormat) -> u8 {
 pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<CommandOutput> {
     if matches!(cli.command, Command::Capabilities) {
         return Ok(CommandOutput::new(
-            "Store schema versions: 1, 2\nFeatures: subtasks, task_candidates, store_upgrade, attachments"
+            "Store schema versions: 1, 2\nFeatures: subtasks, task_candidates, store_upgrade, attachments, task_urls"
                 .to_owned(),
             json!({
                 "version": 1,
                 "store_schema_versions": [1, 2],
-                "features": ["subtasks", "task_candidates", "store_upgrade", "attachments"],
+                "features": ["subtasks", "task_candidates", "store_upgrade", "attachments", "task_urls"],
             }),
         ));
     }
@@ -523,6 +532,7 @@ pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<CommandOutput> {
                     projects: arguments.projects.clone(),
                     tags: arguments.tags.clone(),
                     parent: arguments.parent.clone(),
+                    url: arguments.url.clone(),
                     due_date: arguments.due_date,
                     recurrence,
                     recurrence_from,
@@ -631,6 +641,8 @@ pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<CommandOutput> {
                     remove_tags: arguments.remove_tags.clone(),
                     parent: arguments.parent.clone(),
                     clear_parent: arguments.clear_parent,
+                    url: arguments.url.clone(),
+                    clear_url: arguments.clear_url,
                     due_date: arguments.due_date,
                     clear_due_date: arguments.clear_due_date,
                     recurrence,
@@ -864,7 +876,7 @@ fn task_summary_output(store: &Store, tasks: &[Task], limit: Option<u32>) -> Com
 fn human_task_details(store: &Store, task: &Task) -> Result<String> {
     let view = TaskView::from_task(task, store)?;
     Ok(format!(
-        "id: {}\npath: {}\nname: {}\nstate: {}\nterminal: {}\nprojects: {}\ntags: {}\nparent: {}\ndue_date: {}\nrecurrence: {}\nrecurrence_from: {}\nlast_completed_date: {}\nextra_properties: {}\nbody:\n{}",
+        "id: {}\npath: {}\nname: {}\nstate: {}\nterminal: {}\nprojects: {}\ntags: {}\nparent: {}\nurl: {}\ndue_date: {}\nrecurrence: {}\nrecurrence_from: {}\nlast_completed_date: {}\nextra_properties: {}\nbody:\n{}",
         view.id,
         view.path,
         view.name,
@@ -873,6 +885,7 @@ fn human_task_details(store: &Store, task: &Task) -> Result<String> {
         view.projects.join(", "),
         view.tags.join(", "),
         task.parent.as_deref().unwrap_or("-"),
+        view.url.as_deref().unwrap_or("-"),
         view.due_date.as_deref().unwrap_or("-"),
         view.recurrence.as_deref().unwrap_or("-"),
         view.recurrence_from.as_deref().unwrap_or("-"),

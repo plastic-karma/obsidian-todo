@@ -5,6 +5,7 @@
 ## Features
 
 - Workflow states, projects, tags, due dates, and recurrence
+- Optional HTTP/HTTPS task links in both store versions
 - Ordinary file attachments in v1 and v2 stores, with Markdown links and image embeds
 - Arbitrarily nested subtasks with stable full-ULID parent identity
 - Recursive task discovery and deterministic filtering and sorting
@@ -37,6 +38,32 @@ otodo --root Todo validate
 Use `--format json` for scripts and `--today YYYY-MM-DD` for deterministic date-sensitive commands. Run `otodo --help` or `otodo <command> --help` for all options.
 
 The store contains `.todo/config.toml`, `.todo/schema.json`, `Tasks/**/*.md`, `Projects/*.md`, `todos.base`, and imported files below `Attachments/`. Other vault content is left untouched.
+
+## Task links
+
+Store an optional web link with a task:
+
+```sh
+otodo --root Todo add "Read proposal" --url 'https://example.com/proposal'
+otodo --root Todo show <task-id> --format json
+otodo --root Todo edit <task-id> --url 'https://example.com/revised'
+otodo --root Todo edit <task-id> --clear-url
+```
+
+Links work in schema 1 and 2 without an upgrade or schema/configuration changes.
+The existing extensible schemas remain byte-for-byte unchanged; the runtime
+validates the additive `url` field. Use an absolute HTTP or HTTPS URL with a
+nonempty host, no whitespace/control characters, and valid escapes/port syntax.
+The CLI trims surrounding whitespace on explicit add/edit input, preserves all
+remaining spelling, and never fetches or opens the link. Invalid values produce
+`invalid_url` with `field: url` and no mutation. Setting and clearing together is
+a usage error.
+
+Task JSON includes `url` as a string or null. Markdown stores a quoted `url`
+after `parent` and before `due_date`, omitting it when absent. Completion,
+recurrence, attachments, and unrelated edits retain it; children do not inherit
+their parent's link. Unknown YAML properties and untouched task bodies retain
+their existing preservation guarantees.
 
 ## Subtasks
 

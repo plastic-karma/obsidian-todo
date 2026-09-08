@@ -18,6 +18,7 @@ pub struct Task {
     pub projects: Vec<String>,
     pub tags: Vec<String>,
     pub parent: Option<String>,
+    pub url: Option<String>,
     pub due_date: Option<NaiveDate>,
     pub recurrence: Option<RecurrenceRule>,
     pub recurrence_from: Option<RecurrenceMode>,
@@ -198,6 +199,7 @@ impl Task {
             }
             normalize_parent_id(parent)?;
         }
+        validate_url(self.url.as_deref())?;
         validate_name(&self.name, "name")?;
         if config.state(&self.state).is_none() {
             return Err(Error::validation(
@@ -266,6 +268,119 @@ impl Task {
             .state(&self.state)
             .is_some_and(|state| state.terminal)
     }
+}
+
+/// Validate a web link without normalizing it or contacting its host.
+pub fn validate_url(value: Option<&str>) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let invalid = || {
+        Error::validation(
+            "invalid_url",
+            "URL must be an absolute HTTP or HTTPS URL with a valid host",
+        )
+        .with_field("url")
+    };
+    if value.chars().any(|character| {
+        character.is_whitespace()
+            || character.is_control()
+            || matches!(
+                character,
+                '\\' | '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`'
+            )
+    }) {
+        return Err(invalid());
+    }
+    let bytes = value.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'%'
+            && (bytes
+                .get(index + 1)
+                .is_none_or(|byte| !byte.is_ascii_hexdigit())
+                || bytes
+                    .get(index + 2)
+                    .is_none_or(|byte| !byte.is_ascii_hexdigit()))
+        {
+            return Err(invalid());
+        }
+    }
+    let (scheme, remainder) = value.split_once("://").ok_or_else(invalid)?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err(invalid());
+    }
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = match authority.rsplit_once('@') {
+        Some((userinfo, host_port)) => {
+            if userinfo.contains(['@', '[', ']']) {
+                return Err(invalid());
+            }
+            host_port
+        }
+        None => authority,
+    };
+    let port = if let Some(ipv6) = host_port.strip_prefix('[') {
+        let (host, suffix) = ipv6.split_once(']').ok_or_else(invalid)?;
+        host.parse::<std::net::Ipv6Addr>().map_err(|_| invalid())?;
+        if suffix.is_empty() {
+            None
+        } else {
+            Some(suffix.strip_prefix(':').ok_or_else(invalid)?)
+        }
+    } else {
+        let (host, port) = match host_port.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (host_port, None),
+        };
+        if host.is_empty()
+            || host.contains(['[', ']'])
+            || !host.chars().all(|character| {
+                !character.is_ascii()
+                    || character.is_ascii_alphanumeric()
+                    || "-._~%!$&'()*+,;=".contains(character)
+            })
+        {
+            return Err(invalid());
+        }
+        if host.contains('%') {
+            let host_bytes = host.as_bytes();
+            let mut decoded = Vec::with_capacity(host_bytes.len());
+            let mut index = 0;
+            while index < host_bytes.len() {
+                if host_bytes[index] == b'%' {
+                    // Escape shape was checked above.
+                    let high = (host_bytes[index + 1] as char)
+                        .to_digit(16)
+                        .unwrap_or_default();
+                    let low = (host_bytes[index + 2] as char)
+                        .to_digit(16)
+                        .unwrap_or_default();
+                    decoded.push((high * 16 + low) as u8);
+                    index += 3;
+                } else {
+                    decoded.push(host_bytes[index]);
+                    index += 1;
+                }
+            }
+            let decoded = std::str::from_utf8(&decoded).map_err(|_| invalid())?;
+            if decoded.chars().any(|character| {
+                character.is_whitespace()
+                    || character.is_control()
+                    || "/\\?#@:[]<>\"{}|^`".contains(character)
+            }) {
+                return Err(invalid());
+            }
+        }
+        port
+    };
+    if port.is_some_and(|port| {
+        port.is_empty()
+            || !port.bytes().all(|byte| byte.is_ascii_digit())
+            || port.parse::<u16>().is_err()
+    }) {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 pub fn validate_name(value: &str, field: &str) -> Result<()> {

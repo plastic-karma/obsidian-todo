@@ -723,6 +723,7 @@ mod tests {
                 projects: vec![],
                 tags: vec![],
                 parent: None,
+                url: None,
                 due_date: None,
                 recurrence: None,
                 recurrence_from: None,

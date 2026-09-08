@@ -164,6 +164,7 @@ views:
 
     let added = json_success(vault.path(), &["--root", "Todo", "add", "Minimal"]);
     assert_eq!(added["task"]["parent"], Value::Null);
+    assert_eq!(added["task"]["url"], Value::Null);
     assert_eq!(added["task"]["due_date"], Value::Null);
     assert_eq!(added["task"]["recurrence"], Value::Null);
     assert_eq!(added["task"]["recurrence_from"], Value::Null);
@@ -189,6 +190,121 @@ views:
         fs::read(vault.path().join(".obsidian/community-plugins.json")).expect("Obsidian config"),
         obsidian_before
     );
+}
+
+#[test]
+fn url_cli_round_trip_preserves_lifecycle_and_refuses_invalid_mutations() {
+    for legacy in [false, true] {
+        let vault = fake_vault();
+        let root = initialize(vault.path());
+        if legacy {
+            legacy_store(&root);
+        }
+        let config_before = fs::read(root.join(".todo/config.toml")).expect("config");
+        let schema_before = fs::read(root.join(".todo/schema.json")).expect("schema");
+        let url = "HTTPS://Example.COM/a%20b?q=One#Section";
+        let added = json_success(
+            &root,
+            &[
+                "add",
+                "Linked recurrence",
+                "--url",
+                &format!("  {url}  "),
+                "--due-date",
+                "2026-09-08",
+                "--recurrence",
+                "FREQ=DAILY",
+                "--recurrence-from",
+                "schedule",
+            ],
+        );
+        let id = task_id(&added);
+        let path = root.join(added["task"]["path"].as_str().expect("path"));
+        assert_eq!(added["task"]["url"], url);
+        let source = fs::read_to_string(&path).expect("source");
+        let source = source.replacen(
+            "\n---\n",
+            "\nplugin: {nested: [true, null, note]}\n---\nBody\r\n",
+            1,
+        );
+        fs::write(&path, source).expect("external metadata");
+        assert_eq!(json_success(&root, &["show", id])["task"]["url"], url);
+        assert!(human_success(&root, &["show", id]).contains(&format!("url: {url}\n")));
+        assert_eq!(json_success(&root, &["list"])["tasks"][0]["url"], url);
+        let completed = json_success(&root, &["complete", id, "--on", "2026-09-08"]);
+        assert_eq!(completed["task"]["due_date"], "2026-09-09");
+        assert_eq!(completed["task"]["url"], url);
+        for operation in ["finish-series", "reopen", "cancel", "reopen"] {
+            assert_eq!(json_success(&root, &[operation, id])["task"]["url"], url);
+        }
+        let edited = json_success(&root, &["edit", id, "--state", "active"]);
+        assert_eq!(edited["task"]["url"], url);
+        assert_eq!(edited["task"]["body"], "Body\r\n");
+        assert_eq!(
+            edited["task"]["extra_properties"]["plugin"],
+            serde_json::json!({"nested": [true, null, "note"]})
+        );
+
+        let before = store_bytes(&root);
+        for invalid in [
+            "javascript:alert(1)",
+            "https:///path",
+            "https://example.com/a b",
+            "https://example.com/%GG",
+        ] {
+            for args in [
+                vec!["add", "Invalid", "--url", invalid],
+                vec!["edit", id, "--name", "Must not change", "--url", invalid],
+            ] {
+                let error = json_failure(&root, &args, 5, "invalid_url");
+                assert_eq!(error["error"]["field"], "url");
+                assert_eq!(store_bytes(&root), before);
+            }
+        }
+        json_failure(
+            &root,
+            &["edit", id, "--url", url, "--clear-url"],
+            2,
+            "usage_error",
+        );
+        assert_eq!(store_bytes(&root), before);
+        let replacement = "http://[::1]:8080/reference";
+        assert_eq!(
+            json_success(&root, &["edit", id, "--url", replacement])["task"]["url"],
+            replacement
+        );
+        let cleared = json_success(&root, &["edit", id, "--clear-url"]);
+        assert_eq!(cleared["task"]["url"], Value::Null);
+        assert_eq!(cleared["task"]["body"], "Body\r\n");
+        assert!(!fs::read_to_string(&path)
+            .expect("cleared file")
+            .contains("\nurl:"));
+        json_success(&root, &["validate"]);
+        assert_eq!(
+            fs::read(root.join(".todo/config.toml")).expect("config"),
+            config_before
+        );
+        assert_eq!(
+            fs::read(root.join(".todo/schema.json")).expect("schema"),
+            schema_before
+        );
+
+        let malformed = fs::read_to_string(&path).expect("source").replacen(
+            "\n---\n",
+            "\nurl: 'mailto:person@example.com'\n---\n",
+            1,
+        );
+        fs::write(&path, malformed).expect("external malformed link");
+        let before = store_bytes(&root);
+        let report = json_failure(&root, &["validate"], 5, "validation_failed");
+        assert!(report["error"]["issues"]
+            .as_array()
+            .expect("issues")
+            .iter()
+            .any(|issue| { issue["code"] == "invalid_url" && issue["field"] == "url" }));
+        json_failure(&root, &["edit", id, "--state", "open"], 5, "invalid_url");
+        assert_eq!(store_bytes(&root), before);
+    }
 }
 
 #[test]
@@ -1177,7 +1293,7 @@ fn capabilities_bypasses_invalid_explicit_and_environment_roots() {
             serde_json::json!({
                 "version": 1,
                 "store_schema_versions": [1, 2],
-                "features": ["subtasks", "task_candidates", "store_upgrade", "attachments"],
+                "features": ["subtasks", "task_candidates", "store_upgrade", "attachments", "task_urls"],
             })
         );
     }

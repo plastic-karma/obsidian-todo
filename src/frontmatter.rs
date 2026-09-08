@@ -13,11 +13,12 @@ use crate::recurrence::{RecurrenceMode, RecurrenceRule};
 pub const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_YAML_DEPTH: usize = 64;
 const MAX_YAML_NODES: usize = 100_000;
-const CORE_TASK_KEYS: [&str; 9] = [
+const CORE_TASK_KEYS: [&str; 10] = [
     "name",
     "state",
     "projects",
     "tags",
+    "url",
     "due_date",
     "recurrence",
     "recurrence_from",
@@ -143,6 +144,13 @@ pub fn parse_task(id: &str, path: &Path, bytes: &[u8], config: &Config) -> Resul
     } else {
         None
     };
+    let url = match take_optional(&mut properties, "url") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value),
+        Some(_) => {
+            return Err(Error::validation("invalid_url", "URL must be a string").with_field("url"));
+        }
+    };
     let due_date = take_optional(&mut properties, "due_date")
         .as_ref()
         .map(|value| date_from_yaml(value, "due_date"))
@@ -174,6 +182,7 @@ pub fn parse_task(id: &str, path: &Path, bytes: &[u8], config: &Config) -> Resul
         projects,
         tags,
         parent,
+        url,
         due_date,
         recurrence,
         recurrence_from,
@@ -243,6 +252,9 @@ pub fn serialize_task(task: &Task, config: &Config) -> Result<Vec<u8>> {
     write_string_list(&mut output, tags)?;
     if let Some(parent) = &task.parent {
         writeln!(output, "parent: {}", quoted(&parent.to_ascii_uppercase())?).map_err(fmt_error)?;
+    }
+    if let Some(url) = &task.url {
+        writeln!(output, "url: {}", quoted(url)?).map_err(fmt_error)?;
     }
     if let Some(date) = task.due_date {
         writeln!(output, "due_date: {}", date.format("%Y-%m-%d")).map_err(fmt_error)?;
@@ -788,6 +800,79 @@ mod tests {
             &config(),
         )
         .expect("valid task")
+    }
+
+    #[test]
+    fn url_round_trip_is_additive_in_both_store_versions() {
+        let url = "HTTPS://Example.COM:443/a%20b?q=One#Section";
+        for version in [1, 2] {
+            let mut config = config();
+            config.schema_version = version;
+            let parent = if version == 2 {
+                "parent: \"01ARZ3NDEKTSV4RRFFQ69G5FAV\"\n"
+            } else {
+                "parent: [legacy, metadata]\n"
+            };
+            let source = format!(
+                "---\nname: Link\nstate: open\nprojects: []\ntags: []\n{parent}url: \"{url}\"\ndue_date: 2026-09-08\nplugin: {{nested: [true, null, text]}}\n---\nBody\r\n[[unchanged]]\r\n"
+            );
+            let mut parsed = parse_task(ID, Path::new("Tasks/link.md"), source.as_bytes(), &config)
+                .expect("URL supported without upgrade");
+            assert_eq!(parsed.url.as_deref(), Some(url));
+            assert!(!parsed.extra_properties.contains_key("url"));
+            parsed.state = "active".to_owned();
+            let output = serialize_task(&parsed, &config).expect("metadata edit");
+            let text = std::str::from_utf8(&output).expect("UTF-8");
+            assert!(text.contains(&format!("url: \"{url}\"\ndue_date:")));
+            if version == 2 {
+                assert!(text.contains(&format!("{parent}url:")));
+            }
+            let reparsed = parse_task(ID, &parsed.path, &output, &config).expect("round trip");
+            assert_eq!(reparsed, parsed);
+            assert_eq!(reparsed.body, "Body\r\n[[unchanged]]\r\n");
+            parsed.url = None;
+            let cleared = serialize_task(&parsed, &config).expect("clear");
+            assert!(!std::str::from_utf8(&cleared)
+                .expect("UTF-8")
+                .contains("\nurl:"));
+        }
+    }
+
+    #[test]
+    fn malformed_url_metadata_has_stable_field_and_code() {
+        for value in [
+            "42",
+            "[]",
+            "{}",
+            "\"\"",
+            "\"file:///tmp/note\"",
+            "\"https:///missing-host\"",
+            "\"https://example.com/a b\"",
+            "\"https://example.com/%GG\"",
+            "\"https://[not-ipv6]/\"",
+            "\"https://example.com:65536/\"",
+            "\"https://example.com:/\"",
+            "\"https://example%20.com/\"",
+            "\"https://example.com\\\\path\"",
+            "\"https://%FF.example/\"",
+            "\"https://example%C2%A0.com/\"",
+        ] {
+            let source = format!(
+                "---\nname: Link\nstate: open\nprojects: []\ntags: []\nurl: {value}\n---\n"
+            );
+            for version in [1, 2] {
+                let mut config = config();
+                config.schema_version = version;
+                let error = parse_task(ID, Path::new("Tasks/link.md"), source.as_bytes(), &config)
+                    .expect_err(value);
+                assert_eq!(error.code(), "invalid_url", "{value}");
+                assert_eq!(error.field(), Some("url"), "{value}");
+            }
+        }
+        assert_eq!(
+            task("---\nname: Link\nstate: open\nprojects: []\ntags: []\nurl: null\n---\n").url,
+            None
+        );
     }
 
     #[test]

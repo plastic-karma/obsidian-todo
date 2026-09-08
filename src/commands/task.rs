@@ -21,6 +21,7 @@ pub struct AddTask {
     pub projects: Vec<String>,
     pub tags: Vec<String>,
     pub parent: Option<String>,
+    pub url: Option<String>,
     pub due_date: Option<NaiveDate>,
     pub recurrence: Option<RecurrenceRule>,
     pub recurrence_from: Option<RecurrenceMode>,
@@ -43,6 +44,8 @@ pub struct EditTask {
     pub body: Option<String>,
     pub parent: Option<String>,
     pub clear_parent: bool,
+    pub url: Option<String>,
+    pub clear_url: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -72,6 +75,7 @@ pub struct TaskView {
     pub projects: Vec<String>,
     pub tags: Vec<String>,
     pub parent: Option<String>,
+    pub url: Option<String>,
     pub due_date: Option<String>,
     pub recurrence: Option<String>,
     pub recurrence_from: Option<String>,
@@ -102,6 +106,7 @@ impl TaskView {
             projects,
             tags,
             parent: task.parent.clone(),
+            url: task.url.clone(),
             due_date: task
                 .due_date
                 .map(|date| date.format("%Y-%m-%d").to_string()),
@@ -168,6 +173,7 @@ pub fn add_with_attachments(
                 projects: request.projects.clone(),
                 tags: request.tags.clone(),
                 parent: parent.clone(),
+                url: request.url.as_ref().map(|value| value.trim().to_owned()),
                 due_date: request.due_date,
                 recurrence: request.recurrence.clone(),
                 recurrence_from: request.recurrence_from,
@@ -423,6 +429,11 @@ fn apply_edit(task: &mut Task, changes: &EditTask, known_projects: &HashSet<Stri
     } else if let Some(parent) = &changes.parent {
         task.parent = Some(normalize_parent_id(parent)?);
     }
+    if changes.clear_url {
+        task.url = None;
+    } else if let Some(url) = &changes.url {
+        task.url = Some(url.trim().to_owned());
+    }
     if let Some(name) = &changes.name {
         let name = name.trim().to_owned();
         validate_name(&name, "name")?;
@@ -509,6 +520,8 @@ fn validate_edit_request(changes: &EditTask) -> Result<()> {
     let has_change = changes.name.is_some()
         || changes.parent.is_some()
         || changes.clear_parent
+        || changes.url.is_some()
+        || changes.clear_url
         || changes.state.is_some()
         || !changes.add_projects.is_empty()
         || !changes.remove_projects.is_empty()
@@ -530,6 +543,12 @@ fn validate_edit_request(changes: &EditTask) -> Result<()> {
         return Err(Error::usage(
             "conflicting_changes",
             "--parent conflicts with --clear-parent",
+        ));
+    }
+    if changes.url.is_some() && changes.clear_url {
+        return Err(Error::usage(
+            "conflicting_changes",
+            "--url conflicts with --clear-url",
         ));
     }
     if changes.due_date.is_some() && changes.clear_due_date {
@@ -835,6 +854,7 @@ mod tests {
             projects: Vec::new(),
             tags: Vec::new(),
             parent: None,
+            url: None,
             due_date: None,
             recurrence: None,
             recurrence_from: None,
@@ -855,6 +875,7 @@ mod tests {
         let object = value.as_object().expect("object");
         for field in [
             "parent",
+            "url",
             "due_date",
             "recurrence",
             "recurrence_from",

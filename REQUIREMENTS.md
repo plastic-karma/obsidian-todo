@@ -302,6 +302,8 @@ Configuration validation:
 
 `schema.json` is a machine-readable description of record shapes. Its parsed document MUST equal the exact supported asset selected by `schema_version`; merely matching a version marker is insufficient. The Rust validation code remains authoritative for cross-record checks, recurrence semantics, path containment, and duplicate-key rejection that JSON Schema cannot fully express. Checked-in schemas and Rust models MUST remain in agreement, including explicit v1/v2 support and rejection of versions such as 0 and 3; tests MUST NOT continue treating v2 as an unsupported future version.
 
+The optional `url` task field is an additive runtime-validated extension in BOTH schema versions. The historical `schema-v1.json` and `schema.json` asset bytes MUST remain unchanged: their extensible `additionalProperties` already permits this field. URL support MUST NOT upgrade a store or rewrite its schema/configuration.
+
 ## 9. Task storage schema
 
 ### 9.1 Path and identity
@@ -360,6 +362,7 @@ Review transactions, reconcile accounts, and update the monthly budget.
 | `projects` | list of strings | yes | Zero or more project wikilinks. |
 | `tags` | list of strings | yes | Zero or more Obsidian tags without `#`. |
 | `parent` | quoted string | no; v2 only | Full ULID of one task in the same store; omission means root. In v1 this spelling remains an unknown property. |
+| `url` | string | no; v1 and v2 | Absolute HTTP or HTTPS link with a nonempty host; null is accepted as absent and canonical writers omit absent values. |
 | `due_date` | date scalar | no | Local calendar date in `YYYY-MM-DD`. |
 | `recurrence` | string | conditional | Supported RRULE subset. |
 | `recurrence_from` | string | conditional | `schedule` or `completion`. |
@@ -368,6 +371,10 @@ Review transactions, reconcile accounts, and update the monthly budget.
 The body after the closing delimiter is the task's `body` in API and JSON output.
 
 CLI-created tasks MUST contain a string property named `base` whose value is an Obsidian wikilink to the generated `todos.base`. The link target MUST include `obsidian_link_prefix` when it is nonempty. This integration property is returned in `extra_properties` and follows the unknown-property preservation rules in section 9.9; externally authored tasks without it remain valid.
+
+The `url` key is reserved in both versions and decoded into the logical task, never duplicated in `extra_properties`. Validation MUST reject nonstring/non-null values, non-web or relative URLs, missing hosts, whitespace/control characters, backslashes, raw RFC-invalid punctuation (`<`, `>`, `"`, `{`, `}`, `|`, `^`, and backtick), malformed percent escapes, malformed bracketed IPv6 hosts, and empty/nondecimal/out-of-range ports (0–65535). Percent-encoded ASCII host whitespace, controls, and authority delimiters are invalid; encoded spaces in a path are valid. Schemes are case-insensitive. CLI add/edit trims surrounding whitespace explicitly before validation; record parsing MUST NOT trim or normalize URL spelling. All remaining spelling, including host case, escapes, query, and fragment, MUST be preserved. Invalid values fail with `invalid_url`, exit 5, and `field: url`, without mutation. The CLI MUST NOT fetch or open links.
+
+Completion, recurrence advancement, state changes, reparenting, attachments, and unrelated edits MUST retain a task's URL. Child tasks MUST NOT inherit their parent's URL.
 
 ### 9.4 Name
 
@@ -464,6 +471,7 @@ state
 projects
 tags
 parent
+url
 due_date
 recurrence
 recurrence_from
@@ -671,6 +679,7 @@ Options:
 --project <slug>            repeatable
 --tag <tag>                 repeatable
 --parent <full-id>          v2 only
+--url <http-or-https-url>
 --due-date <YYYY-MM-DD>
 --recurrence <rule>
 --recurrence-from <schedule|completion>
@@ -762,6 +771,8 @@ Changes:
 --remove-tag <tag>          repeatable
 --parent <full-id>          v2 only; set or replace parent
 --clear-parent             v2 only; omit parent
+--url <http-or-https-url>    set or replace link
+--clear-url                omit link
 --due-date <date>
 --clear-due-date
 --recurrence <rule>
@@ -775,6 +786,7 @@ Rules:
 
 - At least one change is required.
 - Conflicting changes to the same field are usage errors.
+- `--url` and `--clear-url` are mutually exclusive. Clearing an already absent URL is valid; an empty `--url` is invalid, not a clear operation.
 - Removing a missing project or tag is a domain error rather than a silent no-op.
 - Adding an existing project or tag is a domain error rather than producing a duplicate.
 - `--clear-due-date` is invalid while recurrence remains configured.
@@ -957,6 +969,7 @@ Validation includes:
 - Duplicate YAML keys.
 - Core property presence and types.
 - Name, state, tags, projects, dates, and recurrence rules.
+- Optional URL type and absolute HTTP(S)/host validation in both versions.
 - Project link syntax and referential integrity.
 - Conditional recurrence fields.
 - Safe unknown property values.
@@ -1091,6 +1104,7 @@ Serializer requirements:
 - Quote Obsidian wikilinks.
 - Quote recurrence strings.
 - In v2, quote canonical uppercase parent ULIDs, place `parent` immediately after `tags`, and omit it for roots. V1 unknown `parent` properties retain unknown-property ordering and meaning.
+- Quote a present URL after `parent` (after `tags` when no typed parent) and before `due_date`; omit absent URLs.
 - Serialize dates as `YYYY-MM-DD`.
 - Never serialize an `id` property.
 - Preserve unknown values semantically.
@@ -1142,6 +1156,7 @@ A normalized task object contains at least:
   "projects": ["personal-finance"],
   "tags": ["finance", "review"],
   "parent": null,
+  "url": null,
   "due_date": "2026-09-06",
   "recurrence": "FREQ=WEEKLY;INTERVAL=1;BYDAY=SU",
   "recurrence_from": "schedule",
@@ -1153,6 +1168,7 @@ A normalized task object contains at least:
 
 Absent optional values MUST be JSON `null`, not omitted, in normalized task output. Arrays are always present.
 In v2 a child returns its canonical full parent ULID; a root returns null. In v1 normalized `parent` is always null, while any legacy key of that spelling stays in `extra_properties` with its original YAML meaning. CLI JSON envelope version `1` is independent of store schema versions and of client-local cache envelopes.
+Normalized task JSON always includes `url` as the original validated string or null in both store versions. Compact `--summary` projections remain unchanged.
 
 List output:
 
@@ -1187,7 +1203,7 @@ List output:
 `otodo --format json capabilities` succeeds without a root, config, environment-selected store, or filesystem discovery and returns:
 
 ```json
-{"version":1,"store_schema_versions":[1,2],"features":["subtasks","task_candidates","store_upgrade","attachments"]}
+{"version":1,"store_schema_versions":[1,2],"features":["subtasks","task_candidates","store_upgrade","attachments","task_urls"]}
 ```
 
 This describes the executable, not whether the user's current store enables parent operations. Unsupported stores and legacy-v1 parent operations still fail explicitly; callers MUST NOT silently retry a rejected child creation as a root.
@@ -1215,6 +1231,7 @@ Parent/version error codes:
 | Code | Exit | Meaning |
 |---|---:|---|
 | `invalid_parent_id` | 5 | Present parent value or parent argument is not a full valid string ULID. |
+| `invalid_url` | 5 | URL type or HTTP(S)/host syntax is invalid; includes `field: url`. |
 | `missing_parent_reference` | 5 | A stored, well-typed parent ID has no physical task in this store. |
 | `self_parent_reference` | 5 | Canonical child and parent IDs are equal. |
 | `parent_cycle` | 5 | The task participates in a cycle of two or more nodes. |

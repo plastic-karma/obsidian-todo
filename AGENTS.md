@@ -97,6 +97,10 @@ Use `cargo build --release` for the optimized binary. Automation may add `--lock
 
 Tests use standard Rust `#[test]`, `assert_cmd`, `TempDir`, and Criterion; no snapshot, mocking, async-test, or property-testing framework is present.
 
+Choose checks for the changed behavior during iteration, then run the required repository QA gate for implementation changes. Once checks pass, repeat or broaden them only for new changes, failures, or unresolved concerns. For instruction/documentation-only changes, validate the affected content and references without running unrelated Rust builds, benchmarks, or tests.
+
+Complete authorized work using the current specification and repository context for routine choices; ask only when an unresolved choice materially changes the outcome. Delegate substantial independent slices when useful, with disjoint ownership and one integration owner who runs shared verification after integration. Explicit user scope takes precedence over skill defaults; reading a workflow is not a request to execute it.
+
 - Colocated `#[cfg(test)]` modules cover private parser, model, recurrence, storage, validation, output, and command invariants.
 - `tests/cli.rs` runs the compiled binary against real temporary vaults and verifies streams, exit codes, JSON shapes, exact files, preservation, containment, concurrency refusal, discovery, and no-Git behavior.
 - Keep tests deterministic with fixed ULIDs where identity is incidental, `FixedClock`/`--today` for dates, local fixture builders, and per-test `TempDir`s. Do not mutate process-global environment when command-local injection works.

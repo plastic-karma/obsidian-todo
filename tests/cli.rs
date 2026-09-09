@@ -7,7 +7,9 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 fn command() -> Command {
-    cargo_bin_cmd!("otodo")
+    let mut command = cargo_bin_cmd!("otodo");
+    command.env_remove("OBSIDIAN_TODO_ROOT");
+    command
 }
 
 fn fake_vault() -> TempDir {
@@ -1293,7 +1295,7 @@ fn capabilities_bypasses_invalid_explicit_and_environment_roots() {
             serde_json::json!({
                 "version": 1,
                 "store_schema_versions": [1, 2],
-                "features": ["subtasks", "task_candidates", "store_upgrade", "attachments", "task_urls"],
+                "features": ["subtasks", "task_candidates", "store_upgrade", "attachments", "task_urls", "task_due_times", "task_input"],
             })
         );
     }
@@ -2356,4 +2358,215 @@ fn attachment_symlink_sources_targets_and_traversal_are_refused() {
         );
     }
     assert_eq!(fs::read(source).expect("source preserved"), b"private");
+}
+
+#[test]
+fn input_captures_dates_metadata_and_urls_in_both_store_versions() {
+    for legacy in [false, true] {
+        let vault = fake_vault();
+        let root = initialize(vault.path());
+        if legacy {
+            legacy_store(&root);
+        }
+        for slug in ["personal", "work"] {
+            json_success(&root, &["project", "create", slug, "--name", slug]);
+        }
+        let config = fs::read(root.join(".todo/config.toml")).unwrap();
+        let schema = fs::read(root.join(".todo/schema.json")).unwrap();
+        let output = command().current_dir(&root)
+            .args(["input", "--today", "2026-09-09", "--format", "json"])
+            .write_stdin("\r\nCall Plumber tom 9am #personal @chores\r\nfollow up with John about  https://github.com/issues/124 #work @prs")
+            .output().unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+        assert!(!output.stdout.contains(&0x1b));
+        let tasks = serde_json::Deserializer::from_slice(&output.stdout)
+            .into_iter::<Value>()
+            .map(|value| value.unwrap()["task"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0]["name"], "Call Plumber");
+        assert_eq!(tasks[0]["projects"], serde_json::json!(["personal"]));
+        assert_eq!(tasks[0]["tags"], serde_json::json!(["chores"]));
+        assert_eq!(tasks[0]["due_date"], "2026-09-10");
+        assert_eq!(tasks[0]["due_time"], "09:00");
+        assert_eq!(
+            tasks[1]["name"],
+            "follow up with John about https://github.com/issues/124"
+        );
+        assert_eq!(tasks[1]["url"], "https://github.com/issues/124");
+        assert_eq!(tasks[1]["projects"], serde_json::json!(["work"]));
+        assert_eq!(tasks[1]["tags"], serde_json::json!(["prs"]));
+        for task in &tasks {
+            assert_eq!(
+                json_success(&root, &["show", task["id"].as_str().unwrap()])["task"],
+                *task
+            );
+        }
+        let markdown = fs::read_to_string(root.join(tasks[0]["path"].as_str().unwrap())).unwrap();
+        assert!(markdown.contains("due_date: 2026-09-10\ndue_time: \"09:00\"\n"));
+        assert_eq!(fs::read(root.join(".todo/config.toml")).unwrap(), config);
+        assert_eq!(fs::read(root.join(".todo/schema.json")).unwrap(), schema);
+        assert_eq!(
+            fs::read(vault.path().join("unrelated.md")).unwrap(),
+            b"unrelated\r\ncontent\n"
+        );
+        json_success(&root, &["validate"]);
+    }
+}
+
+#[test]
+fn input_failure_stops_at_that_line_and_retains_only_earlier_saves() {
+    let vault = fake_vault();
+    let root = initialize(vault.path());
+    let output = command()
+        .current_dir(&root)
+        .args(["input", "--format=json"])
+        .write_stdin("Saved first @new/nested\n\nMissing project #unknown\nMust not be saved\n")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let saved: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(saved["task"]["name"], "Saved first");
+    assert_eq!(error["error"]["code"], "project_not_found");
+    assert_eq!(error["error"]["line"], 3);
+    assert_eq!(error["error"]["path"], "-");
+    assert_eq!(
+        json_success(&root, &["list", "--all"])["tasks"],
+        serde_json::json!([saved["task"]])
+    );
+    let before = store_bytes(&root);
+    for (input, code) in [
+        (vec![0xff, b'\n'], "invalid_input"),
+        (vec![b'x'; 16 * 1024 + 1], "input_too_large"),
+        (b"tom 9am @only-metadata\n".to_vec(), "invalid_name"),
+    ] {
+        let output = command()
+            .current_dir(&root)
+            .args(["input", "--format=json"])
+            .write_stdin(input)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(5));
+        assert!(output.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["code"], code);
+        assert_eq!(error["error"]["line"], 1);
+        assert_eq!(store_bytes(&root), before);
+    }
+}
+
+#[test]
+fn input_relative_hours_follow_local_daylight_saving() {
+    let vault = fake_vault();
+    let root = initialize(vault.path());
+    let output = command()
+        .current_dir(&root)
+        .env("TZ", "America/New_York")
+        .args(["input", "--today", "2026-03-08", "--format=json"])
+        .write_stdin("Call in 3 hours\n")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["task"]["name"], "Call");
+    assert_eq!(value["task"]["due_date"], "2026-03-08");
+    assert_eq!(value["task"]["due_time"], "04:00");
+}
+
+#[test]
+fn due_time_cli_preserves_lifecycle_and_validates_external_times() {
+    for legacy in [false, true] {
+        let vault = fake_vault();
+        let root = initialize(vault.path());
+        if legacy {
+            legacy_store(&root);
+        }
+        let added = json_success(
+            &root,
+            &[
+                "add",
+                "Timed recurrence",
+                "--due-date",
+                "2026-09-09",
+                "--due-time",
+                "09:15",
+                "--recurrence",
+                "FREQ=DAILY",
+                "--recurrence-from",
+                "schedule",
+            ],
+        );
+        let id = task_id(&added);
+        let path = root.join(added["task"]["path"].as_str().unwrap());
+        assert_eq!(added["task"]["due_time"], "09:15");
+        assert!(human_success(&root, &["show", id]).contains("due_time: 09:15\n"));
+        assert!(human_success(&root, &["list"]).contains("2026-09-09 09:15"));
+        let completed = json_success(&root, &["complete", id, "--on", "2026-09-09"]);
+        assert_eq!(completed["task"]["due_date"], "2026-09-10");
+        assert_eq!(completed["task"]["due_time"], "09:15");
+        for operation in ["finish-series", "reopen", "cancel", "reopen"] {
+            assert_eq!(
+                json_success(&root, &[operation, id])["task"]["due_time"],
+                "09:15"
+            );
+        }
+        let before = store_bytes(&root);
+        for args in [
+            vec!["edit", id, "--due-time", "24:00"],
+            vec!["edit", id, "--due-time", "10:00", "--clear-due-time"],
+            vec!["edit", id, "--due-time", "10:00", "--clear-due-date"],
+            vec!["add", "Orphan", "--due-time", "10:00"],
+        ] {
+            json_failure(&root, &args, 2, "usage_error");
+            assert_eq!(store_bytes(&root), before);
+        }
+        assert_eq!(
+            json_success(&root, &["edit", id, "--due-time", "23:59"])["task"]["due_time"],
+            "23:59"
+        );
+        let cleared = json_success(&root, &["edit", id, "--clear-due-time"]);
+        assert_eq!(cleared["task"]["due_date"], "2026-09-10");
+        assert_eq!(cleared["task"]["due_time"], Value::Null);
+        json_success(&root, &["edit", id, "--due-time", "00:00"]);
+        let cleared = json_success(
+            &root,
+            &["edit", id, "--clear-recurrence", "--clear-due-date"],
+        );
+        assert_eq!(cleared["task"]["due_time"], Value::Null);
+        let before = store_bytes(&root);
+        json_failure(
+            &root,
+            &["edit", id, "--due-time", "09:00"],
+            5,
+            "due_time_requires_due_date",
+        );
+        assert_eq!(store_bytes(&root), before);
+        let source = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            source.replacen(
+                "\n---\n",
+                "\ndue_date: 2026-09-10\ndue_time: '25:00'\n---\n",
+                1,
+            ),
+        )
+        .unwrap();
+        let before = store_bytes(&root);
+        let report = json_failure(&root, &["validate"], 5, "validation_failed");
+        assert!(report["error"]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["code"] == "invalid_due_time" && issue["field"] == "due_time"));
+        json_failure(
+            &root,
+            &["edit", id, "--name", "Must not change"],
+            5,
+            "invalid_due_time",
+        );
+        assert_eq!(store_bytes(&root), before);
+    }
 }

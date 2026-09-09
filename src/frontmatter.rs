@@ -6,20 +6,22 @@ use serde_yaml_ng::{Mapping, Value};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::model::{
-    date_from_yaml, normalize_parent_id, validate_name, validate_project_slug, Project, Task,
+    date_from_yaml, normalize_parent_id, parse_time, validate_name, validate_project_slug, Project,
+    Task,
 };
 use crate::recurrence::{RecurrenceMode, RecurrenceRule};
 
 pub const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_YAML_DEPTH: usize = 64;
 const MAX_YAML_NODES: usize = 100_000;
-const CORE_TASK_KEYS: [&str; 10] = [
+const CORE_TASK_KEYS: [&str; 11] = [
     "name",
     "state",
     "projects",
     "tags",
     "url",
     "due_date",
+    "due_time",
     "recurrence",
     "recurrence_from",
     "last_completed_date",
@@ -155,6 +157,17 @@ pub fn parse_task(id: &str, path: &Path, bytes: &[u8], config: &Config) -> Resul
         .as_ref()
         .map(|value| date_from_yaml(value, "due_date"))
         .transpose()?;
+    let due_time = match take_optional(&mut properties, "due_time") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(parse_time(&value)?),
+        Some(_) => {
+            return Err(Error::validation(
+                "invalid_due_time",
+                "due_time must be an HH:MM time string",
+            )
+            .with_field("due_time"));
+        }
+    };
     let recurrence = take_optional(&mut properties, "recurrence")
         .map(|value| value_as_string(value, "recurrence"))
         .transpose()?
@@ -184,6 +197,7 @@ pub fn parse_task(id: &str, path: &Path, bytes: &[u8], config: &Config) -> Resul
         parent,
         url,
         due_date,
+        due_time,
         recurrence,
         recurrence_from,
         last_completed_date,
@@ -258,6 +272,9 @@ pub fn serialize_task(task: &Task, config: &Config) -> Result<Vec<u8>> {
     }
     if let Some(date) = task.due_date {
         writeln!(output, "due_date: {}", date.format("%Y-%m-%d")).map_err(fmt_error)?;
+    }
+    if let Some(time) = task.due_time {
+        writeln!(output, "due_time: \"{}\"", time.format("%H:%M")).map_err(fmt_error)?;
     }
     if let Some(rule) = &task.recurrence {
         writeln!(output, "recurrence: {}", quoted(&rule.to_string())?).map_err(fmt_error)?;
@@ -800,6 +817,110 @@ mod tests {
             &config(),
         )
         .expect("valid task")
+    }
+
+    #[test]
+    fn due_time_round_trip_preserves_metadata_in_both_versions() {
+        for version in [1, 2] {
+            let mut config = config();
+            config.schema_version = version;
+            let source = "---\nname: Timed\nstate: open\nprojects: []\ntags: []\nurl: https://example.com/task\ndue_date: 2026-09-08\ndue_time: 09:05\nplugin: {nested: [true, null, text]}\n---\nBody\r\n";
+            let mut parsed =
+                parse_task(ID, Path::new("Tasks/timed.md"), source.as_bytes(), &config)
+                    .expect("time supported without upgrade");
+            assert_eq!(parsed.due_time, Some(parse_time("09:05").expect("time")));
+            assert!(!parsed.extra_properties.contains_key("due_time"));
+            let extras = parsed.extra_properties.clone();
+            parsed.name = "Edited".to_owned();
+            let output = serialize_task(&parsed, &config).expect("serialize");
+            assert!(std::str::from_utf8(&output)
+                .expect("UTF-8")
+                .contains("due_date: 2026-09-08\ndue_time: \"09:05\"\n"));
+            let reparsed = parse_task(ID, &parsed.path, &output, &config).expect("round trip");
+            assert_eq!(reparsed, parsed);
+            assert_eq!(reparsed.extra_properties, extras);
+            assert_eq!(reparsed.body, "Body\r\n");
+            assert_eq!(reparsed.url.as_deref(), Some("https://example.com/task"));
+
+            for suffix in ["", "due_time: null\n"] {
+                let source = format!(
+                    "---\nname: Untimed\nstate: open\nprojects: []\ntags: []\n{suffix}---\n"
+                );
+                let absent = parse_task(ID, &parsed.path, source.as_bytes(), &config)
+                    .expect("absent time requires no date");
+                assert_eq!(absent.due_time, None);
+                let output = serialize_task(&absent, &config).expect("serialize absent");
+                assert!(!std::str::from_utf8(&output)
+                    .expect("UTF-8")
+                    .contains("\ndue_time:"));
+            }
+            parsed
+                .extra_properties
+                .insert(Value::String("due_time".to_owned()), Value::Null);
+            let error = serialize_task(&parsed, &config).expect_err("reserved typed field");
+            assert_eq!(error.code(), "reserved_extra_property");
+            assert_eq!(error.field(), Some("due_time"));
+        }
+    }
+
+    #[test]
+    fn due_time_rejects_invalid_scalars_orphans_and_subminute_domain_values() {
+        for version in [1, 2] {
+            let mut config = config();
+            config.schema_version = version;
+            for value in [
+                "42",
+                "true",
+                "[]",
+                "{}",
+                "\"\"",
+                "\"9:00\"",
+                "\"24:00\"",
+                "\"23:60\"",
+                "\"12:34:00\"",
+                "\"12:34:00.001\"",
+                "\" 09:00\"",
+                "\"０９:00\"",
+            ] {
+                let source = format!("---\nname: Timed\nstate: open\nprojects: []\ntags: []\ndue_date: 2026-09-08\ndue_time: {value}\n---\n");
+                let error = parse_task(ID, Path::new("Tasks/timed.md"), source.as_bytes(), &config)
+                    .expect_err(value);
+                assert_eq!(error.code(), "invalid_due_time", "{value}");
+                assert_eq!(error.field(), Some("due_time"));
+            }
+            let source = b"---\nname: Orphan\nstate: open\nprojects: []\ntags: []\ndue_time: \"09:00\"\n---\n";
+            let error = parse_task(ID, Path::new("Tasks/timed.md"), source, &config)
+                .expect_err("orphan time");
+            assert_eq!(error.code(), "due_time_requires_due_date");
+            assert_eq!(error.field(), Some("due_time"));
+            let mut parsed = task("---\nname: Timed\nstate: open\nprojects: []\ntags: []\ndue_date: 2026-09-08\n---\n");
+            for time in [
+                chrono::NaiveTime::from_hms_opt(12, 34, 1).expect("seconds"),
+                chrono::NaiveTime::from_hms_nano_opt(12, 34, 0, 1).expect("nanoseconds"),
+                chrono::NaiveTime::from_hms_nano_opt(12, 34, 59, 1_000_000_000)
+                    .expect("leap second"),
+            ] {
+                parsed.due_time = Some(time);
+                let error = serialize_task(&parsed, &config).expect_err("no silent truncation");
+                assert_eq!(error.code(), "invalid_due_time");
+                assert_eq!(error.field(), Some("due_time"));
+            }
+            for value in ["00:00", "23:59"] {
+                parsed.due_time = Some(parse_time(value).expect("boundary time"));
+                let output = serialize_task(&parsed, &config).expect("boundary");
+                assert_eq!(
+                    parse_task(ID, &parsed.path, &output, &config).expect("boundary round trip"),
+                    parsed
+                );
+            }
+            parsed.due_date = None;
+            assert_eq!(
+                serialize_task(&parsed, &config)
+                    .expect_err("typed orphan")
+                    .code(),
+                "due_time_requires_due_date"
+            );
+        }
     }
 
     #[test]

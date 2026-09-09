@@ -6,6 +6,7 @@ pub mod config;
 pub mod discovery;
 pub mod error;
 pub mod frontmatter;
+pub mod input;
 pub mod model;
 pub mod recurrence;
 pub mod store;

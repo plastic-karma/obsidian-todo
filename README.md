@@ -4,8 +4,9 @@
 
 ## Features
 
-- Workflow states, projects, tags, due dates, and recurrence
+- Workflow states, projects, tags, local due dates/times, and recurrence
 - Optional HTTP/HTTPS task links in both store versions
+- Interactive one-line task capture with natural dates and project/tag completion
 - Ordinary file attachments in v1 and v2 stores, with Markdown links and image embeds
 - Arbitrarily nested subtasks with stable full-ULID parent identity
 - Recursive task discovery and deterministic filtering and sorting
@@ -38,6 +39,105 @@ otodo --root Todo validate
 Use `--format json` for scripts and `--today YYYY-MM-DD` for deterministic date-sensitive commands. Run `otodo --help` or `otodo <command> --help` for all options.
 
 The store contains `.todo/config.toml`, `.todo/schema.json`, `Tasks/**/*.md`, `Projects/*.md`, `todos.base`, and imported files below `Attachments/`. Other vault content is left untouched.
+
+## Interactive input
+
+Open the task-entry TUI:
+
+```sh
+otodo --root Todo input
+```
+
+Enter one task per line:
+
+```text
+Call Plumber tom 9am #personal @chores
+follow up with John about https://github.com/issues/124 #work @prs
+```
+
+The first saves `Call Plumber`, due tomorrow at `09:00`, in project `personal`
+with tag `chores`. The second keeps the URL in the title and also sets the
+task's `url`, project `work`, and tag `prs`. Title case and Unicode are preserved;
+redundant whitespace is collapsed.
+
+- `#slug` associates an **existing** project; it does not create one. Use
+  `otodo project create personal --name Personal` first if needed.
+- `@tag` adds a tag. New tags and nested tags such as `@home/chores` are allowed.
+  Multiple projects/tags are supported; repeated identical values are deduplicated.
+  Metadata must be separate whitespace-delimited tokens.
+- Suggestions appear as you type `#` or `@`. Use **Up/Down** to select and
+  **Tab** to accept. Tags come from all tasks, including completed tasks and
+  tasks saved in this session. **F5** reloads projects/tags from disk.
+- **Enter** saves the current line. A rejected line stays editable.
+  Multiline paste queues drafts for review: press Enter for each, rather than
+  publishing the entire paste immediately.
+  Pasted tabs become spaces, and CRLF/CR become line breaks. Other control
+  characters are rejected without changing the draft.
+- **Left/Right**, **Home/End**, **Backspace/Delete**, and **Ctrl-U** edit the
+  line. **Esc** or **Ctrl-C** exits; **Ctrl-D** exits when no drafts remain.
+  Unsaved drafts are discarded; successful saves are retained.
+
+Date/time recognition follows `otodo-app`'s capture grammar, with `tom` added
+as a tomorrow alias:
+
+| Input | Meaning |
+|---|---|
+| `today`, `tod`, `tomorrow`, `tom` | Local today/tomorrow |
+| `Monday`, `mon`, `tue`, `wed`, etc. | Strictly next occurrence of that weekday |
+| `next week`, `next month` | One calendar week/month later |
+| `in 3 days`, `in 2 weeks`, `in 1 month` | Calendar offsets; month-end is clamped |
+| `9am`, `3:05 pm`, `at 14:30` | Local clock time; time alone uses today |
+| `in 2 hours`, `in 15 minutes` | Elapsed time, including DST changes; rounds up to a minute |
+
+Recognition is case-insensitive. The last date and last time win independently;
+only contributing phrases are removed. URL/email/path text and metadata are not
+parsed as dates. Unsupported expressions remain title text; use `add --due-date`
+for explicit `YYYY-MM-DD` dates. The first valid explicit HTTP(S) link is captured;
+surrounding sentence punctuation is excluded from the field, but remains in the
+title. No links are fetched or opened.
+
+Pipes and `--format json` use plain stdin without the TUI:
+
+```sh
+printf '%s\n' \
+  'Call Plumber tom 9am #personal @chores' \
+  'Review PR https://github.com/issues/124 #work @prs' |
+  otodo --root Todo --format json input
+```
+
+JSON output is one version-1 task envelope per saved line (JSON Lines).
+Blank lines are skipped; LF, CRLF, and a final line without a newline work.
+The first invalid line stops piped input with an error on stderr; earlier saves
+remain committed and later lines are not processed. Input is UTF-8, bounded to
+16 KiB per raw line or queued paste. No history file is written. Terminal control
+sequences are used only for the human TUI, which requires terminal stdin/stderr
+and a non-dumb `TERM`.
+
+`--today YYYY-MM-DD` anchors capture to **local midnight** on that date, including
+relative hours/minutes, for deterministic input. Without it, each submission
+uses the current local timestamp.
+
+### Stored due times
+
+Times use the app-compatible additive `due_time` field in both store versions.
+It is a minute-granularity local civil time, not a timestamp or reminder.
+There is no schema upgrade or schema/configuration rewrite.
+
+```sh
+otodo --root Todo add "Call plumber" --due-date 2026-09-10 --due-time 09:00
+otodo --root Todo edit <task-id> --due-time 14:30
+otodo --root Todo edit <task-id> --clear-due-time
+```
+
+A time requires a due date. Markdown emits `due_time: "09:00"` immediately
+after `due_date`; normalized task JSON includes `due_time` as `HH:MM` or null.
+Clearing the date clears the time too. Recurrence advances the date and retains
+the time; other lifecycle operations and unrelated edits retain it, and children
+do not inherit it. Existing date-based filtering/sorting stays unchanged.
+`validate` rejects malformed/orphan times; previously unknown `due_time`
+metadata is now subject to this contract. Historical schema asset bytes and
+customized Obsidian Bases remain untouched. `capabilities` advertises
+`task_input` and `task_due_times`.
 
 ## Task links
 

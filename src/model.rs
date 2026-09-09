@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use chrono::{Local, NaiveDate};
+use chrono::{Local, NaiveDate, NaiveTime, Timelike};
 use serde_yaml_ng::Mapping;
 use ulid::Ulid;
 
@@ -20,6 +20,7 @@ pub struct Task {
     pub parent: Option<String>,
     pub url: Option<String>,
     pub due_date: Option<NaiveDate>,
+    pub due_time: Option<NaiveTime>,
     pub recurrence: Option<RecurrenceRule>,
     pub recurrence_from: Option<RecurrenceMode>,
     pub last_completed_date: Option<NaiveDate>,
@@ -216,6 +217,16 @@ impl Task {
         if let Some(due_date) = self.due_date {
             validate_date_value(due_date, "due_date")?;
         }
+        if let Some(due_time) = self.due_time {
+            validate_time_value(due_time)?;
+            if self.due_date.is_none() {
+                return Err(Error::validation(
+                    "due_time_requires_due_date",
+                    "A task with due_time must have due_date",
+                )
+                .with_field("due_time"));
+            }
+        }
         if let Some(last_completed_date) = self.last_completed_date {
             validate_date_value(last_completed_date, "last_completed_date")?;
         }
@@ -268,6 +279,37 @@ impl Task {
             .state(&self.state)
             .is_some_and(|state| state.terminal)
     }
+}
+
+/// Parse an exact minute-granularity civil time from 00:00 through 23:59.
+pub fn parse_time(value: &str) -> Result<NaiveTime> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 5
+        || bytes[2] != b':'
+        || ![bytes[0], bytes[1], bytes[3], bytes[4]]
+            .iter()
+            .all(u8::is_ascii_digit)
+    {
+        return Err(invalid_time());
+    }
+    let hour = u32::from(bytes[0] - b'0') * 10 + u32::from(bytes[1] - b'0');
+    let minute = u32::from(bytes[3] - b'0') * 10 + u32::from(bytes[4] - b'0');
+    NaiveTime::from_hms_opt(hour, minute, 0).ok_or_else(invalid_time)
+}
+
+fn validate_time_value(value: NaiveTime) -> Result<()> {
+    if value.second() != 0 || value.nanosecond() != 0 {
+        return Err(invalid_time());
+    }
+    Ok(())
+}
+
+fn invalid_time() -> Error {
+    Error::validation(
+        "invalid_due_time",
+        "due_time must be an HH:MM time from 00:00 through 23:59",
+    )
+    .with_field("due_time")
 }
 
 /// Validate a web link without normalizing it or contacting its host.

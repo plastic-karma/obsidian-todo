@@ -63,9 +63,9 @@ Neither supported store version introduces:
 - GitHub Issues or GitHub Projects synchronization.
 - Automatic `git add`, commit, pull, rebase, merge, or push.
 - Branch management or pull-request creation.
-- A TUI or graphical desktop application.
+- A general-purpose TUI task manager or graphical desktop application. The focused input TUI in section 28 is authorized.
 - Notifications, alarms, or a background scheduler.
-- Timed due dates; v1 due values are calendar dates only.
+- Timestamp/timezone persistence or scheduling. Local calendar due dates with optional civil due times are authorized by sections 11 and 28.
 - Assignments, priorities, dependencies, comments, or attachments as frontmatter domain fields. File attachments and body links are explicitly authorized by section 27 below. Subtasks are authorized only by the v2 parent contract below; v1 remains flat.
 - Full historical occurrence tracking for recurring tasks.
 - Arbitrary RFC 5545 recurrence features beyond the subset defined here.
@@ -302,7 +302,7 @@ Configuration validation:
 
 `schema.json` is a machine-readable description of record shapes. Its parsed document MUST equal the exact supported asset selected by `schema_version`; merely matching a version marker is insufficient. The Rust validation code remains authoritative for cross-record checks, recurrence semantics, path containment, and duplicate-key rejection that JSON Schema cannot fully express. Checked-in schemas and Rust models MUST remain in agreement, including explicit v1/v2 support and rejection of versions such as 0 and 3; tests MUST NOT continue treating v2 as an unsupported future version.
 
-The optional `url` task field is an additive runtime-validated extension in BOTH schema versions. The historical `schema-v1.json` and `schema.json` asset bytes MUST remain unchanged: their extensible `additionalProperties` already permits this field. URL support MUST NOT upgrade a store or rewrite its schema/configuration.
+The optional `url` and `due_time` task fields are additive runtime-validated extensions in BOTH schema versions. The historical `schema-v1.json` and `schema.json` asset bytes MUST remain unchanged: their extensible `additionalProperties` already permits these fields. URL/time support MUST NOT upgrade a store or rewrite its schema/configuration. Runtime codecs, model validation, tolerant validation, and behavioral tests enforce their additional constraints.
 
 ## 9. Task storage schema
 
@@ -364,6 +364,7 @@ Review transactions, reconcile accounts, and update the monthly budget.
 | `parent` | quoted string | no; v2 only | Full ULID of one task in the same store; omission means root. In v1 this spelling remains an unknown property. |
 | `url` | string | no; v1 and v2 | Absolute HTTP or HTTPS link with a nonempty host; null is accepted as absent and canonical writers omit absent values. |
 | `due_date` | date scalar | no | Local calendar date in `YYYY-MM-DD`. |
+| `due_time` | string | no; v1 and v2 | Minute-granularity local civil time `HH:MM` (00:00–23:59), requiring `due_date`; null is accepted as absent. |
 | `recurrence` | string | conditional | Supported RRULE subset. |
 | `recurrence_from` | string | conditional | `schedule` or `completion`. |
 | `last_completed_date` | date scalar | no | Most recent completion date for a recurring series. |
@@ -473,6 +474,7 @@ tags
 parent
 url
 due_date
+due_time
 recurrence
 recurrence_from
 last_completed_date
@@ -552,6 +554,10 @@ Global option:
 ```
 
 This overrides the current date for deterministic automation, previews, tests, overdue filtering, and default completion dates. It does not rewrite stored dates by itself.
+
+Optional `due_time` in both store versions is a local civil time, serialized quoted as exactly `HH:MM`. It MUST require `due_date`, reject nonstring/non-null YAML and invalid hours/minutes, and reject seconds/subseconds in typed API values. Absent or null time is logically absent and canonical writers omit it. The key is reserved, not unknown metadata. Its meaning is independent of timezone storage; no timezone is persisted and no alarm is scheduled. Existing date-only recurrence calculations, filtering, overdue checks, and sort precedence remain unchanged.
+
+All lifecycle operations, recurrence advancement, attachments, and unrelated edits MUST preserve a present time; children MUST NOT inherit it. Clearing the due date MUST clear the due time. Clearing only the time MUST retain the date. `input --today` uses local midnight on the supplied date as its injected reference timestamp, choosing the earlier occurrence of an ambiguous midnight and rejecting a nonexistent midnight; without the override input resolves each line from the local current timestamp.
 
 ## 12. Recurrence schema and grammar
 
@@ -681,6 +687,7 @@ Options:
 --parent <full-id>          v2 only
 --url <http-or-https-url>
 --due-date <YYYY-MM-DD>
+--due-time <HH:MM>          requires --due-date
 --recurrence <rule>
 --recurrence-from <schedule|completion>
 --body <text>
@@ -775,6 +782,8 @@ Changes:
 --clear-url                omit link
 --due-date <date>
 --clear-due-date
+--due-time <HH:MM>          requires an existing or simultaneously supplied date
+--clear-due-time
 --recurrence <rule>
 --recurrence-from <mode>
 --clear-recurrence
@@ -787,6 +796,7 @@ Rules:
 - At least one change is required.
 - Conflicting changes to the same field are usage errors.
 - `--url` and `--clear-url` are mutually exclusive. Clearing an already absent URL is valid; an empty `--url` is invalid, not a clear operation.
+- `--due-time` conflicts with `--clear-due-time` and `--clear-due-date`. Clearing a date also clears its time; clearing a time alone retains the date.
 - Removing a missing project or tag is a domain error rather than a silent no-op.
 - Adding an existing project or tag is a domain error rather than producing a duplicate.
 - `--clear-due-date` is invalid while recurrence remains configured.
@@ -796,7 +806,7 @@ Rules:
 - All changes to one task are validated and written as one atomic replacement.
 - `--parent` and `--clear-parent` are mutually exclusive. Resolve a full-ID destination, exclude self/descendants, and validate the effective post-edit ancestry against the freshest store, rather than trusting a prior picker/show result. Setting a parent requires valid resulting ancestry; clearing an edge is an explicit repair even if unrelated faults remain. Reparent/detach changes only the selected task file, preserving every other field and its actual path. Setting the existing parent or clearing an already absent parent may succeed without creating a second edge.
 
-V1 does not open an interactive editor. Obsidian or a text editor remains the interactive editing surface.
+`edit` does not open an interactive editor. Obsidian or a text editor remains the record-editing surface; section 28 authorizes a focused task-creation TUI in both versions.
 
 ### 13.5 Complete
 
@@ -970,6 +980,7 @@ Validation includes:
 - Core property presence and types.
 - Name, state, tags, projects, dates, and recurrence rules.
 - Optional URL type and absolute HTTP(S)/host validation in both versions.
+- Optional `due_time` type, exact HH:MM syntax and required date in both versions.
 - Project link syntax and referential integrity.
 - Conditional recurrence fields.
 - Safe unknown property values.
@@ -1106,6 +1117,7 @@ Serializer requirements:
 - In v2, quote canonical uppercase parent ULIDs, place `parent` immediately after `tags`, and omit it for roots. V1 unknown `parent` properties retain unknown-property ordering and meaning.
 - Quote a present URL after `parent` (after `tags` when no typed parent) and before `due_date`; omit absent URLs.
 - Serialize dates as `YYYY-MM-DD`.
+- Quote a present `due_time` immediately after `due_date`; omit absent times.
 - Never serialize an `id` property.
 - Preserve unknown values semantically.
 - Preserve an untouched body byte-for-byte during metadata-only changes.
@@ -1158,6 +1170,7 @@ A normalized task object contains at least:
   "parent": null,
   "url": null,
   "due_date": "2026-09-06",
+  "due_time": null,
   "recurrence": "FREQ=WEEKLY;INTERVAL=1;BYDAY=SU",
   "recurrence_from": "schedule",
   "last_completed_date": "2026-08-30",
@@ -1168,7 +1181,7 @@ A normalized task object contains at least:
 
 Absent optional values MUST be JSON `null`, not omitted, in normalized task output. Arrays are always present.
 In v2 a child returns its canonical full parent ULID; a root returns null. In v1 normalized `parent` is always null, while any legacy key of that spelling stays in `extra_properties` with its original YAML meaning. CLI JSON envelope version `1` is independent of store schema versions and of client-local cache envelopes.
-Normalized task JSON always includes `url` as the original validated string or null in both store versions. Compact `--summary` projections remain unchanged.
+Normalized task JSON always includes `url` as the original validated string or null, and `due_time` as `HH:MM` or null, in both store versions. Compact `--summary` projections remain unchanged.
 
 List output:
 
@@ -1232,6 +1245,11 @@ Parent/version error codes:
 |---|---:|---|
 | `invalid_parent_id` | 5 | Present parent value or parent argument is not a full valid string ULID. |
 | `invalid_url` | 5 | URL type or HTTP(S)/host syntax is invalid; includes `field: url`. |
+| `invalid_due_time` | 5 | Invalid stored/API due time type, precision or range; includes `field: due_time`. Invalid explicit CLI flag values are usage errors. |
+| `due_time_requires_due_date` | 5 | A due time has no effective due date; includes `field: due_time`. |
+| `invalid_input` | 5 | Input is not single-line UTF-8 or contains control characters. |
+| `input_too_large` | 5 | A raw stdin line or queued TUI paste exceeds 16 KiB. |
+| `invalid_input_date` | 5 | The selected `--today` has no local midnight for input capture. |
 | `missing_parent_reference` | 5 | A stored, well-typed parent ID has no physical task in this store. |
 | `self_parent_reference` | 5 | Canonical child and parent IDs are equal. |
 | `parent_cycle` | 5 | The task participates in a cycle of two or more nodes. |
@@ -1550,3 +1568,30 @@ Attachment add/link/list/unlink results contain `version: 1` and an `attachments
 Attachment publications MUST use existing store locks, generation checks, and exclusive-create writes. Files publish before the task, and the task publishes once with its source snapshot and existing relationship checks. Failure before task publication MUST NOT create a task. Files may remain unreferenced after interruption or a later failed task write; no multi-file filesystem atomicity is promised. `attachment_source_invalid`, `attachment_too_large`, `unsafe_attachment_path`, and `attachments_disabled` from new-task imports guarantee that task publication did not occur. Clients MUST treat I/O and unrecognized errors as uncertain and MUST NOT blindly retry them.
 
 The explicit v1→v2 upgrader MUST preserve attachment bytes and task links through dry-run, upgrade, resume, and already-current no-op. Targets other than 2, including 3, remain unsupported. CLI Git operations remain forbidden. Desktop synchronization and sparse checkouts MUST include `Attachments/`. Documentation MUST explain Obsidian attachment-location settings without changing vault-wide preferences. File deletion, orphan cleanup, camera capture, and scanning are outside this release.
+
+## 28. One-line task input
+
+```text
+otodo input
+otodo --format json input
+```
+
+Human input with terminal stdin/stderr and a non-dumb `TERM` MUST open a focused terminal UI with an editable line, parsed preview, project/tag suggestions, and save/error status. Other input, including JSON mode, MUST read stdin as one task per line without terminal control sequences. No editor, shell, subprocess, Git command, network request, history file, or hidden database may be invoked/created by this mode.
+
+`#slug` and `@tag` MUST be recognized only as whole whitespace-delimited metadata tokens and removed from the name. Projects MUST already exist, using existing slug/reference validation; tags MAY be new and MUST retain case, Unicode and nested `/` spelling. Repeated exact metadata values MUST be deduplicated. Name case and Unicode MUST remain unchanged, with redundant whitespace collapsed and existing name validation applied after removing metadata/date phrases. Default state, root-parent behavior, URL validation, locking, generation checks and contained create-new publication MUST use the normal task-creation operation for every line.
+
+Natural date recognition MUST be case-insensitive and support:
+
+- `today`/`tod`, `tomorrow`/`tom`.
+- Full weekday names and `sun`, `mon`, `tue`/`tues`, `wed`, `thu`/`thur`/`thurs`, `fri`, `sat`; resolve to the strictly next occurrence, including seven days ahead on that weekday.
+- `next week`, `next month`, and `in N day(s)/week(s)/month(s)` with positive decimal integers, calendar arithmetic, and month-end clamping.
+- 24-hour `HH:MM` and 12-hour `h[:MM] am/pm` with optional spacing and leading `at`. Time alone supplies local today even when that clock has passed.
+- `in N hour(s)/minute(s)` as elapsed local-timezone-aware arithmetic, including DST transitions, rounded upward to minute precision.
+
+The last date and last time MUST win independently. Only contributing phrases and adjacent separator punctuation/whitespace are removed; superseded phrases remain name text. Invalid/unsupported phrases, including ISO date literals, MUST remain name text rather than being partially consumed. Resolved calendar overflow MUST fail. Dates/times embedded in metadata, URLs, emails, paths and identifiers MUST NOT be consumed. The first valid explicit absolute HTTP(S) URL MUST also populate `url`, preserving its spelling and retaining the URL in the title. Sentence punctuation and unbalanced closing delimiters are excluded from the captured field; balanced URL punctuation, query strings and fragments are retained. Invalid candidates remain name text; no bare-domain guessing occurs.
+
+Suggestions MUST use existing project slugs and tags across all tasks, including terminal tasks, with case-insensitive prefix matching and original spelling on acceptance. Up/Down selects and Tab accepts the whole token at the cursor without corrupting surrounding Unicode text. New saved tags MUST be immediately available; F5 explicitly refreshes from disk. Store locks MUST NOT remain held while waiting for keyboard input. Enter saves exactly the current line; failed validation retains the draft for correction. Multiline paste MUST queue drafts for individual Enter confirmation. Esc/Ctrl-C exits and discards unsaved drafts; Ctrl-D exits when all drafts are empty. Successful saves remain committed. Terminal raw mode, bracketed paste, cursor visibility and alternate-screen state MUST be restored on normal/error exits. I/O, concurrency and unsupported-generation errors MUST exit rather than invite an uncertain creation retry.
+
+Plain stdin MUST accept UTF-8 LF/CRLF lines and a final unterminated line, skip blank lines, and bound each raw line to 16 KiB. TUI input and queued paste together are bounded to 16 KiB. Pasted tabs MUST normalize to spaces and CRLF/CR to line breaks; other control characters MUST be rejected without losing the draft. Plain input MUST stop at the first failure; earlier saves remain durable and later lines are not processed. Parser/metadata errors MUST identify the stdin line in structured diagnostics. Each success goes to stdout as an ID/name line or a version-1 `task` JSON envelope; JSON mode is JSON Lines with no summary document or progress noise. Human TUI exits with a created-task count on stdout; its interactive surface uses stderr.
+
+Rootless executable capabilities MUST include `task_input` and `task_due_times`. Tests MUST defend requested examples, URL/title preservation, metadata and date/time boundaries, precedence, local/DST arithmetic, Unicode completion/editing, rejected-draft preservation, partial-stream failure, both store versions, time lifecycle/clear invariants, and unchanged schema/configuration bytes.

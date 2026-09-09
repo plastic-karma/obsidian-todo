@@ -725,6 +725,7 @@ mod tests {
                 parent: None,
                 url: None,
                 due_date: None,
+                due_time: None,
                 recurrence: None,
                 recurrence_from: None,
                 body: String::new(),

@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveTime};
 use clap::{error::ErrorKind as ClapErrorKind, Args, Parser, Subcommand};
 use serde_json::json;
 
@@ -102,6 +102,12 @@ pub enum Command {
         after_help = "Example:\n  otodo --root Todo add \"Review plan\" --project work --tag review"
     )]
     Add(AddArguments),
+
+    /// Enter tasks interactively, or read one task per line from piped stdin
+    #[command(
+        after_help = "Enter saves one task; Tab completes #projects and @tags; Esc or Ctrl-C exits. Projects must exist; tags may be new. Piped input (or --format json) uses plain lines, stops at the first error, and retains earlier saves. JSON emits one task envelope per saved line.\n\nExamples:\n  otodo --root Todo input\n  printf '%s\\n' 'Call Plumber tom 9am #personal @chores' | otodo --root Todo input --format json"
+    )]
+    Input,
 
     /// List tasks with composable filters
     #[command(after_help = "Example:\n  otodo --root Todo list --state active --format json")]
@@ -204,6 +210,9 @@ pub struct AddArguments {
     pub url: Option<String>,
     #[arg(long, value_parser = parse_cli_date)]
     pub due_date: Option<NaiveDate>,
+    /// Local 24-hour time HH:MM; requires a due date
+    #[arg(long, value_parser = parse_cli_time, requires = "due_date")]
+    pub due_time: Option<NaiveTime>,
     #[arg(long)]
     pub recurrence: Option<String>,
     #[arg(long)]
@@ -286,6 +295,12 @@ pub struct EditArguments {
     pub due_date: Option<NaiveDate>,
     #[arg(long)]
     pub clear_due_date: bool,
+    /// Local 24-hour time HH:MM; the task must have a due date
+    #[arg(long, value_parser = parse_cli_time, conflicts_with_all = ["clear_due_time", "clear_due_date"])]
+    pub due_time: Option<NaiveTime>,
+    /// Remove the due time, retaining the date
+    #[arg(long, conflicts_with = "due_time")]
+    pub clear_due_time: bool,
     #[arg(long, conflicts_with = "clear_recurrence")]
     pub recurrence: Option<String>,
     #[arg(long, conflicts_with = "clear_recurrence")]
@@ -354,16 +369,7 @@ fn run_with_arguments(arguments: &[OsString], format: OutputFormat) -> u8 {
         Ok(cli) => {
             let selected_format = cli.format;
             match execute(&cli, &SystemClock) {
-                Ok(output) => {
-                    if let Err(error) =
-                        write_success(&output, selected_format, &mut io::stdout().lock())
-                    {
-                        write_error(&error, selected_format, &mut io::stderr().lock());
-                        error.exit_code()
-                    } else {
-                        0
-                    }
-                }
+                Ok(()) => 0,
                 Err(error) => {
                     write_error(&error, selected_format, &mut io::stderr().lock());
                     error.exit_code()
@@ -387,15 +393,26 @@ fn run_with_arguments(arguments: &[OsString], format: OutputFormat) -> u8 {
     }
 }
 
-pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<CommandOutput> {
+pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<()> {
+    if matches!(cli.command, Command::Input) {
+        let current_directory = env::current_dir()
+            .map_err(|source| Error::io("read the current directory", Path::new("."), &source))?;
+        let store = Store::open(discover_root(cli, &current_directory)?)?;
+        return crate::input_ui::run(&store, cli.today, cli.format);
+    }
+    let output = command_output(cli, clock)?;
+    write_success(&output, cli.format, &mut io::stdout().lock())
+}
+
+fn command_output(cli: &Cli, clock: &dyn Clock) -> Result<CommandOutput> {
     if matches!(cli.command, Command::Capabilities) {
         return Ok(CommandOutput::new(
-            "Store schema versions: 1, 2\nFeatures: subtasks, task_candidates, store_upgrade, attachments, task_urls"
+            "Store schema versions: 1, 2\nFeatures: subtasks, task_candidates, store_upgrade, attachments, task_urls, task_due_times, task_input"
                 .to_owned(),
             json!({
                 "version": 1,
                 "store_schema_versions": [1, 2],
-                "features": ["subtasks", "task_candidates", "store_upgrade", "attachments", "task_urls"],
+                "features": ["subtasks", "task_candidates", "store_upgrade", "attachments", "task_urls", "task_due_times", "task_input"],
             }),
         ));
     }
@@ -496,8 +513,9 @@ pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<CommandOutput> {
         Command::Init { .. }
         | Command::Validate
         | Command::Capabilities
+        | Command::Input
         | Command::Upgrade { .. } => {
-            unreachable!("handled before store opening")
+            unreachable!("handled before command output dispatch")
         }
         Command::Root => {
             let paths = store.paths();
@@ -534,6 +552,7 @@ pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<CommandOutput> {
                     parent: arguments.parent.clone(),
                     url: arguments.url.clone(),
                     due_date: arguments.due_date,
+                    due_time: arguments.due_time,
                     recurrence,
                     recurrence_from,
                     body,
@@ -645,6 +664,8 @@ pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<CommandOutput> {
                     clear_url: arguments.clear_url,
                     due_date: arguments.due_date,
                     clear_due_date: arguments.clear_due_date,
+                    due_time: arguments.due_time,
+                    clear_due_time: arguments.clear_due_time,
                     recurrence,
                     recurrence_from,
                     clear_recurrence: arguments.clear_recurrence,
@@ -815,10 +836,14 @@ fn task_list_output(store: &Store, tasks: &[Task]) -> Result<CommandOutput> {
     let human = tasks
         .iter()
         .map(|task| {
-            let due = task.due_date.map_or_else(
+            let mut due = task.due_date.map_or_else(
                 || "-".to_owned(),
                 |date| date.format("%Y-%m-%d").to_string(),
             );
+            if let Some(time) = task.due_time {
+                use std::fmt::Write as _;
+                write!(due, " {}", time.format("%H:%M")).expect("writing to String");
+            }
             let recurring = if task.recurrence.is_some() {
                 " ↻"
             } else {
@@ -876,7 +901,7 @@ fn task_summary_output(store: &Store, tasks: &[Task], limit: Option<u32>) -> Com
 fn human_task_details(store: &Store, task: &Task) -> Result<String> {
     let view = TaskView::from_task(task, store)?;
     Ok(format!(
-        "id: {}\npath: {}\nname: {}\nstate: {}\nterminal: {}\nprojects: {}\ntags: {}\nparent: {}\nurl: {}\ndue_date: {}\nrecurrence: {}\nrecurrence_from: {}\nlast_completed_date: {}\nextra_properties: {}\nbody:\n{}",
+        "id: {}\npath: {}\nname: {}\nstate: {}\nterminal: {}\nprojects: {}\ntags: {}\nparent: {}\nurl: {}\ndue_date: {}\ndue_time: {}\nrecurrence: {}\nrecurrence_from: {}\nlast_completed_date: {}\nextra_properties: {}\nbody:\n{}",
         view.id,
         view.path,
         view.name,
@@ -887,6 +912,7 @@ fn human_task_details(store: &Store, task: &Task) -> Result<String> {
         task.parent.as_deref().unwrap_or("-"),
         view.url.as_deref().unwrap_or("-"),
         view.due_date.as_deref().unwrap_or("-"),
+        view.due_time.as_deref().unwrap_or("-"),
         view.recurrence.as_deref().unwrap_or("-"),
         view.recurrence_from.as_deref().unwrap_or("-"),
         view.last_completed_date.as_deref().unwrap_or("-"),
@@ -955,6 +981,10 @@ fn parse_cli_date(value: &str) -> std::result::Result<NaiveDate, String> {
     parse_date(value, "date").map_err(|error| error.message().to_owned())
 }
 
+fn parse_cli_time(value: &str) -> std::result::Result<NaiveTime, String> {
+    obsidian_todo::model::parse_time(value).map_err(|error| error.message().to_owned())
+}
+
 fn requested_format(arguments: &[OsString]) -> OutputFormat {
     let mut requested = OutputFormat::Human;
     let mut arguments = arguments.iter().skip(1);
@@ -1019,6 +1049,7 @@ mod tests {
             vec!["otodo", "upgrade", "--help"],
             vec!["otodo", "root", "--help"],
             vec!["otodo", "add", "--help"],
+            vec!["otodo", "input", "--help"],
             vec!["otodo", "list", "--help"],
             vec!["otodo", "show", "--help"],
             vec!["otodo", "edit", "--help"],

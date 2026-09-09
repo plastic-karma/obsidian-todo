@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveTime};
 use serde::Serialize;
 use serde_yaml_ng::{Mapping, Value};
 use ulid::Ulid;
@@ -23,6 +23,7 @@ pub struct AddTask {
     pub parent: Option<String>,
     pub url: Option<String>,
     pub due_date: Option<NaiveDate>,
+    pub due_time: Option<NaiveTime>,
     pub recurrence: Option<RecurrenceRule>,
     pub recurrence_from: Option<RecurrenceMode>,
     pub body: String,
@@ -38,6 +39,8 @@ pub struct EditTask {
     pub remove_tags: Vec<String>,
     pub due_date: Option<NaiveDate>,
     pub clear_due_date: bool,
+    pub due_time: Option<NaiveTime>,
+    pub clear_due_time: bool,
     pub recurrence: Option<RecurrenceRule>,
     pub recurrence_from: Option<RecurrenceMode>,
     pub clear_recurrence: bool,
@@ -77,6 +80,7 @@ pub struct TaskView {
     pub parent: Option<String>,
     pub url: Option<String>,
     pub due_date: Option<String>,
+    pub due_time: Option<String>,
     pub recurrence: Option<String>,
     pub recurrence_from: Option<String>,
     pub last_completed_date: Option<String>,
@@ -110,6 +114,7 @@ impl TaskView {
             due_date: task
                 .due_date
                 .map(|date| date.format("%Y-%m-%d").to_string()),
+            due_time: task.due_time.map(|time| time.format("%H:%M").to_string()),
             recurrence: task.recurrence.as_ref().map(ToString::to_string),
             recurrence_from: task.recurrence_from.map(|mode| mode.as_str().to_owned()),
             last_completed_date: task
@@ -175,6 +180,7 @@ pub fn add_with_attachments(
                 parent: parent.clone(),
                 url: request.url.as_ref().map(|value| value.trim().to_owned()),
                 due_date: request.due_date,
+                due_time: request.due_time,
                 recurrence: request.recurrence.clone(),
                 recurrence_from: request.recurrence_from,
                 last_completed_date: None,
@@ -507,8 +513,14 @@ fn apply_edit(task: &mut Task, changes: &EditTask, known_projects: &HashSet<Stri
     }
     if changes.clear_due_date {
         task.due_date = None;
+        task.due_time = None;
     } else if let Some(due_date) = changes.due_date {
         task.due_date = Some(due_date);
+    }
+    if changes.clear_due_time {
+        task.due_time = None;
+    } else if let Some(due_time) = changes.due_time {
+        task.due_time = Some(due_time);
     }
     if let Some(body) = &changes.body {
         task.body = normalize_body(body);
@@ -529,6 +541,8 @@ fn validate_edit_request(changes: &EditTask) -> Result<()> {
         || !changes.remove_tags.is_empty()
         || changes.due_date.is_some()
         || changes.clear_due_date
+        || changes.due_time.is_some()
+        || changes.clear_due_time
         || changes.recurrence.is_some()
         || changes.recurrence_from.is_some()
         || changes.clear_recurrence
@@ -556,6 +570,20 @@ fn validate_edit_request(changes: &EditTask) -> Result<()> {
             "conflicting_changes",
             "--due-date conflicts with --clear-due-date",
         ));
+    }
+    if changes.due_time.is_some() && changes.clear_due_time {
+        return Err(Error::usage(
+            "conflicting_changes",
+            "--due-time conflicts with --clear-due-time",
+        )
+        .with_field("due_time"));
+    }
+    if changes.due_time.is_some() && changes.clear_due_date {
+        return Err(Error::validation(
+            "due_time_requires_due_date",
+            "Cannot set due_time while clearing due_date",
+        )
+        .with_field("due_time"));
     }
     if changes.clear_recurrence
         && (changes.recurrence.is_some() || changes.recurrence_from.is_some())
@@ -856,6 +884,7 @@ mod tests {
             parent: None,
             url: None,
             due_date: None,
+            due_time: None,
             recurrence: None,
             recurrence_from: None,
             body: String::new(),
@@ -877,6 +906,7 @@ mod tests {
             "parent",
             "url",
             "due_date",
+            "due_time",
             "recurrence",
             "recurrence_from",
             "last_completed_date",
@@ -888,6 +918,143 @@ mod tests {
         assert_eq!(
             object["extra_properties"],
             serde_json::json!({"base": "[[Todo/todos.base]]"})
+        );
+    }
+
+    #[test]
+    fn due_time_edits_and_transitions_preserve_or_explicitly_clear_schedule() {
+        let (temp, store) = store();
+        let time = crate::model::parse_time("09:05").expect("time");
+        let mut request = minimal("Timed");
+        request.due_time = Some(time);
+        let error = add(&store, &request).expect_err("time requires date");
+        assert_eq!(error.code(), "due_time_requires_due_date");
+        assert_eq!(error.field(), Some("due_time"));
+        request.due_date = Some(date("2026-09-08"));
+        let attachment = temp.path().join("receipt.txt");
+        fs::write(&attachment, "receipt").expect("source");
+        let task =
+            add_with_attachments(&store, &request, &[attachment]).expect("timed attachment task");
+        let saved = show(&store, &task.id).expect("stored task");
+        assert_eq!(saved.due_time, Some(time));
+        assert_eq!(crate::attachments::links(&saved.body, &saved.path).len(), 1);
+        let json =
+            serde_json::to_value(TaskView::from_task(&saved, &store).expect("view")).expect("JSON");
+        assert_eq!(json["due_time"], "09:05");
+
+        let mut child = minimal("Child");
+        child.parent = Some(task.id.clone());
+        assert_eq!(add(&store, &child).expect("child").due_time, None);
+        let edited = edit(
+            &store,
+            &task.id,
+            &EditTask {
+                name: Some("Renamed".to_owned()),
+                due_date: Some(date("2026-09-09")),
+                ..EditTask::default()
+            },
+        )
+        .expect("reschedule date only");
+        assert_eq!(edited.due_time, Some(time));
+        let completed = complete(&store, &task.id, None, &FixedClock::new(date("2026-09-09")))
+            .expect("complete");
+        assert_eq!(completed.due_time, Some(time));
+        assert_eq!(
+            reopen(&store, &task.id).expect("reopen").due_time,
+            Some(time)
+        );
+        assert_eq!(
+            cancel(&store, &task.id).expect("cancel").due_time,
+            Some(time)
+        );
+        assert_eq!(
+            reopen(&store, &task.id).expect("reopen cancelled").due_time,
+            Some(time)
+        );
+
+        let before = fs::read(store.root().join(&task.path)).expect("snapshot");
+        for (changes, code) in [
+            (
+                EditTask {
+                    due_time: Some(time),
+                    clear_due_time: true,
+                    ..EditTask::default()
+                },
+                "conflicting_changes",
+            ),
+            (
+                EditTask {
+                    due_time: Some(time),
+                    clear_due_date: true,
+                    ..EditTask::default()
+                },
+                "due_time_requires_due_date",
+            ),
+            (
+                EditTask {
+                    due_time: chrono::NaiveTime::from_hms_opt(9, 5, 1),
+                    ..EditTask::default()
+                },
+                "invalid_due_time",
+            ),
+        ] {
+            let error = edit(&store, &task.id, &changes).expect_err("invalid change");
+            assert_eq!(error.code(), code);
+            assert_eq!(error.field(), Some("due_time"));
+            assert_eq!(
+                fs::read(store.root().join(&task.path)).expect("unchanged"),
+                before
+            );
+        }
+        let cleared = edit(
+            &store,
+            &task.id,
+            &EditTask {
+                clear_due_time: true,
+                ..EditTask::default()
+            },
+        )
+        .expect("clear time only");
+        assert_eq!(cleared.due_time, None);
+        assert_eq!(cleared.due_date, Some(date("2026-09-09")));
+        let restored = edit(
+            &store,
+            &task.id,
+            &EditTask {
+                due_time: Some(time),
+                ..EditTask::default()
+            },
+        )
+        .expect("set time only");
+        assert_eq!(restored.due_time, Some(time));
+        let undated = edit(
+            &store,
+            &task.id,
+            &EditTask {
+                clear_due_date: true,
+                ..EditTask::default()
+            },
+        )
+        .expect("clear date and time");
+        assert_eq!(undated.due_date, None);
+        assert_eq!(
+            show(&store, &task.id).expect("persisted clear").due_time,
+            None
+        );
+        let before = fs::read(store.root().join(&task.path)).expect("undated snapshot");
+        let error = edit(
+            &store,
+            &task.id,
+            &EditTask {
+                due_time: Some(time),
+                ..EditTask::default()
+            },
+        )
+        .expect_err("cannot orphan");
+        assert_eq!(error.code(), "due_time_requires_due_date");
+        assert_eq!(
+            fs::read(store.root().join(&task.path)).expect("unchanged undated"),
+            before
         );
     }
 
@@ -956,29 +1123,41 @@ mod tests {
         let clock = FixedClock::new(date("2026-09-09"));
         let mut scheduled = minimal("Scheduled");
         scheduled.due_date = Some(date("2026-09-07"));
+        scheduled.due_time = Some(crate::model::parse_time("09:05").expect("time"));
         scheduled.recurrence =
             Some(RecurrenceRule::parse("FREQ=WEEKLY;BYDAY=MO").expect("weekly recurrence"));
         scheduled.recurrence_from = Some(RecurrenceMode::Schedule);
         let scheduled = add(&store, &scheduled).expect("scheduled");
         let scheduled = complete(&store, &scheduled.id, None, &clock).expect("complete");
         assert_eq!(scheduled.due_date, Some(date("2026-09-14")));
+        assert_eq!(
+            scheduled.due_time,
+            Some(crate::model::parse_time("09:05").expect("time"))
+        );
         assert_eq!(scheduled.state, "open");
         assert_eq!(scheduled.last_completed_date, Some(date("2026-09-09")));
 
         let mut relative = minimal("Relative");
         relative.due_date = Some(date("2026-09-07"));
+        relative.due_time = Some(crate::model::parse_time("23:59").expect("time"));
         relative.recurrence =
             Some(RecurrenceRule::parse("FREQ=DAILY;INTERVAL=3").expect("daily recurrence"));
         relative.recurrence_from = Some(RecurrenceMode::Completion);
         let relative = add(&store, &relative).expect("relative");
         let relative = complete(&store, &relative.id, None, &clock).expect("complete");
         assert_eq!(relative.due_date, Some(date("2026-09-12")));
+        assert_eq!(
+            relative.due_time,
+            Some(crate::model::parse_time("23:59").expect("time"))
+        );
         let finished = finish_series(&store, &relative.id).expect("finish");
         assert_eq!(finished.state, "done");
         assert!(finished.recurrence.is_some());
+        assert_eq!(finished.due_time, relative.due_time);
         let reopened = reopen(&store, &relative.id).expect("reopen");
         assert_eq!(reopened.state, "open");
         assert_eq!(reopened.due_date, Some(date("2026-09-12")));
+        assert_eq!(reopened.due_time, relative.due_time);
     }
 
     #[test]

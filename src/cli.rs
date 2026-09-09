@@ -399,7 +399,7 @@ pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<()> {
         let current_directory = env::current_dir()
             .map_err(|source| Error::io("read the current directory", Path::new("."), &source))?;
         let store = Store::open(discover_root(cli, &current_directory)?)?;
-        return crate::input_ui::run(&store, cli.today, cli.format);
+        return crate::input_ui::run(&store, cli.today, cli.format, cli.color);
     }
     let output = command_output(cli, clock)?;
     write_success(&output, cli.format, &mut io::stdout().lock())

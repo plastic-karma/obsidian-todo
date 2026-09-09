@@ -8,8 +8,9 @@ use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
 };
+use crossterm::style::{Attribute, Color, ContentStyle, Print, SetAttribute, SetStyle, Stylize};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::{execute, queue, style::Print};
+use crossterm::{execute, queue};
 use serde_json::json;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -20,19 +21,27 @@ use obsidian_todo::input::{parse_line, ParsedInput, ParsedTaskInput};
 use obsidian_todo::model::Task;
 use obsidian_todo::store::Store;
 
-use crate::output::{human_task_row, task_list_output, write_success, CommandOutput, OutputFormat};
+use crate::output::{
+    human_task_row, task_list_output, write_success, ColorChoice, CommandOutput, OutputFormat,
+};
 
 // Bound a line and a queued paste independently of the potentially much larger record body.
 const MAX_INPUT_BYTES: usize = 16 * 1024;
+const INPUT_PROMPT: &str = "│ › ";
 
-pub fn run(store: &Store, today: Option<NaiveDate>, format: OutputFormat) -> Result<()> {
+pub fn run(
+    store: &Store,
+    today: Option<NaiveDate>,
+    format: OutputFormat,
+    color: ColorChoice,
+) -> Result<()> {
     let fixed_reference = today.map(reference_at_midnight).transpose()?;
     if format == OutputFormat::Human
         && io::stdin().is_terminal()
         && io::stderr().is_terminal()
         && std::env::var_os("TERM").is_some_and(|term| term != "dumb")
     {
-        let created = run_terminal(store, fixed_reference)?;
+        let created = run_terminal(store, fixed_reference, color)?;
         writeln!(io::stdout().lock(), "Created {created} task(s)")
             .map_err(|source| Error::io("write input summary", Path::new("-"), &source))
     } else {
@@ -347,15 +356,30 @@ fn page_size(height: u16) -> usize {
     usize::from(height.saturating_sub(13)).max(1)
 }
 
+enum Status {
+    Ready,
+    Info(String),
+    Saved(String),
+    Error(String),
+}
+
 struct Terminal {
-    output: io::Stderr,
+    output: io::BufWriter<io::Stderr>,
+    color: bool,
 }
 
 impl Terminal {
-    fn open() -> io::Result<Self> {
+    fn open(color: ColorChoice) -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         let mut terminal = Self {
-            output: io::stderr(),
+            output: io::BufWriter::new(io::stderr()),
+            color: match color {
+                ColorChoice::Always => true,
+                ColorChoice::Never => false,
+                ColorChoice::Auto => {
+                    !std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
+                }
+            },
         };
         execute!(
             terminal.output,
@@ -369,6 +393,9 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
+        if self.color {
+            let _ = queue!(self.output, SetAttribute(Attribute::Reset));
+        }
         let _ = execute!(
             self.output,
             DisableBracketedPaste,
@@ -383,18 +410,21 @@ fn terminal_error(source: io::Error) -> Error {
     Error::io("use the input terminal", Path::new("<terminal>"), &source)
 }
 
-fn run_terminal(store: &Store, reference: Option<DateTime<Local>>) -> Result<usize> {
+fn run_terminal(
+    store: &Store,
+    reference: Option<DateTime<Local>>,
+    color: ColorChoice,
+) -> Result<usize> {
     let mut catalog = Catalog::load(store)?;
-    let mut terminal = Terminal::open().map_err(terminal_error)?;
+    let mut terminal = Terminal::open(color).map_err(terminal_error)?;
     let mut editor = Editor::default();
-    let mut status =
-        "Ready. Nothing is saved until Enter; pasted lines are reviewed one at a time.".to_owned();
+    let mut status = Status::Ready;
     let mut created = 0;
     let mut results: Option<ListResults> = None;
     loop {
         let now = reference.unwrap_or_else(Local::now);
         draw(
-            &mut terminal.output,
+            &mut terminal,
             &editor,
             &catalog,
             &now,
@@ -503,7 +533,9 @@ fn run_terminal(store: &Store, reference: Option<DateTime<Local>>) -> Result<usi
                         KeyCode::F(5) => {
                             catalog = Catalog::load(store)?;
                             editor.selected = 0;
-                            status = "Reloaded projects, tags, and states from disk.".to_owned();
+                            status = Status::Info(
+                                "Reloaded projects, tags, and states from disk.".into(),
+                            );
                             Ok(())
                         }
                         KeyCode::Enter if editor.line.trim().is_empty() => {
@@ -516,7 +548,8 @@ fn run_terminal(store: &Store, reference: Option<DateTime<Local>>) -> Result<usi
                                 ParsedInput::Task(parsed) => {
                                     let task = create_task(store, parsed)?;
                                     created += 1;
-                                    status = format!("Saved {}  {}", task.id, task.name);
+                                    status =
+                                        Status::Saved(format!("{}  ·  {}", task.name, task.id));
                                     catalog
                                         .tags
                                         .extend(task.tags.into_iter().map(|tag| format!("@{tag}")));
@@ -524,10 +557,10 @@ fn run_terminal(store: &Store, reference: Option<DateTime<Local>>) -> Result<usi
                                 }
                                 ParsedInput::List(filter) => {
                                     let tasks = task::list(store, &filter, now.date_naive())?;
-                                    status = format!(
+                                    status = Status::Info(format!(
                                         "Listed {} task(s); no tasks created.",
                                         tasks.len()
-                                    );
+                                    ));
                                     results = Some(ListResults {
                                         command: editor.line.trim().to_owned(),
                                         rows: tasks.iter().map(human_task_row).collect(),
@@ -553,11 +586,11 @@ fn run_terminal(store: &Store, reference: Option<DateTime<Local>>) -> Result<usi
             ) {
                 return Err(error);
             }
-            status = format!(
+            status = Status::Error(format!(
                 "{}: {} (not submitted; edit this line)",
                 error.code(),
                 error.message()
-            );
+            ));
         }
     }
     Ok(created)
@@ -582,63 +615,170 @@ fn clipped(value: &str, width: usize) -> String {
     result
 }
 
-fn row(output: &mut impl Write, y: u16, width: u16, height: u16, text: &str) -> io::Result<()> {
-    if y < height {
-        queue!(
-            output,
-            MoveTo(0, y),
-            Print(clipped(text, usize::from(width.saturating_sub(1))))
-        )?;
+// Use the terminal's ANSI palette: Omarchy themes already tune these colors
+// together. Leave the canvas and ordinary text at the terminal defaults.
+#[derive(Clone, Copy)]
+enum Ink {
+    Plain,
+    Muted,
+    Accent,
+    Key,
+    Project,
+    Tag,
+    Date,
+    Success,
+    Error,
+    Selected,
+}
+
+impl Ink {
+    fn style(self) -> ContentStyle {
+        let plain = ContentStyle::default();
+        match self {
+            Self::Plain => plain,
+            Self::Muted => plain.dim(),
+            Self::Accent => plain.with(Color::DarkBlue).bold(),
+            Self::Key => plain.bold(),
+            Self::Project => plain.with(Color::DarkMagenta),
+            Self::Tag => plain.with(Color::DarkCyan),
+            Self::Date => plain.with(Color::DarkYellow),
+            Self::Success => plain.with(Color::DarkGreen),
+            Self::Error => plain.with(Color::DarkRed).bold(),
+            Self::Selected => plain.reverse().bold(),
+        }
     }
-    Ok(())
+}
+
+struct Screen<'a, W> {
+    output: &'a mut W,
+    width: u16,
+    height: u16,
+    color: bool,
+}
+
+impl<W: Write> Screen<'_, W> {
+    fn row(&mut self, y: u16, spans: &[(&str, Ink)]) -> io::Result<()> {
+        if y >= self.height || self.width <= 2 {
+            return Ok(());
+        }
+        queue!(self.output, MoveTo(1, y))?;
+        let mut remaining = usize::from(self.width - 2);
+        'spans: for (text, ink) in spans {
+            if self.color {
+                queue!(
+                    self.output,
+                    SetAttribute(Attribute::Reset),
+                    SetStyle(ink.style())
+                )?;
+            }
+            // Clip visible cells, never styled escape sequences; sanitize all
+            // store-derived strings just as strictly as the editable draft.
+            for grapheme in text.graphemes(true) {
+                let safe = if grapheme.chars().any(char::is_control) {
+                    "�"
+                } else {
+                    grapheme
+                };
+                let cells = safe.width();
+                if cells > remaining {
+                    break 'spans;
+                }
+                queue!(self.output, Print(safe))?;
+                remaining -= cells;
+            }
+        }
+        if self.color {
+            queue!(self.output, SetAttribute(Attribute::Reset))?;
+        }
+        Ok(())
+    }
 }
 
 fn draw(
-    output: &mut impl Write,
+    terminal: &mut Terminal,
     editor: &Editor,
     catalog: &Catalog,
     reference: &DateTime<Local>,
-    status: &str,
+    status: &Status,
     created: usize,
     results: Option<&ListResults>,
 ) -> io::Result<()> {
     let (width, height) = terminal::size()?;
-    queue!(output, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
-    if width < 32 || height < 14 {
-        row(
-            output,
-            0,
-            width,
-            height,
-            "Resize to at least 32 x 14. Esc exits.",
-        )?;
-        return output.flush();
+    let mut screen = Screen {
+        output: &mut terminal.output,
+        width,
+        height,
+        color: terminal.color,
+    };
+    if screen.color {
+        queue!(screen.output, SetAttribute(Attribute::Reset))?;
     }
-    row(
-        output,
+    queue!(screen.output, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
+    if width < 32 || height < 14 {
+        screen.row(0, &[("Resize to at least 32 x 14. Esc exits.", Ink::Date)])?;
+        return screen.output.flush();
+    }
+    screen.row(
         0,
-        width,
-        height,
-        &format!(
-            "otodo input  |  {created} saved  |  {} queued",
-            editor.queued.len()
-        ),
+        &[
+            (" otodo ", Ink::Selected),
+            (" input", Ink::Accent),
+            (
+                &format!(" {created} saved"),
+                if created == 0 {
+                    Ink::Muted
+                } else {
+                    Ink::Success
+                },
+            ),
+            (
+                &format!(" {} queued", editor.queued.len()),
+                if editor.queued.is_empty() {
+                    Ink::Muted
+                } else {
+                    Ink::Date
+                },
+            ),
+        ],
     )?;
-    row(
-        output,
+    screen.row(
         1,
-        width,
-        height,
-        "Enter: submit  Tab: complete  Up/Down: select  F5: reload",
+        &[
+            ("Enter", Ink::Key),
+            (" submit   ", Ink::Muted),
+            ("Tab", Ink::Key),
+            (" complete   ", Ink::Muted),
+            ("↑/↓", Ink::Key),
+            (" select   ", Ink::Muted),
+            ("F5", Ink::Key),
+            (" reload", Ink::Muted),
+        ],
     )?;
-    row(
-        output,
+    screen.row(
         2,
-        width,
-        height,
-        "Esc/Ctrl-C: exit  Ctrl-D: exit empty  Ctrl-U: clear line",
+        &[
+            ("Esc/Ctrl-C", Ink::Key),
+            (" exit   ", Ink::Muted),
+            ("Ctrl-D", Ink::Key),
+            (" exit empty   ", Ink::Muted),
+            ("Ctrl-U", Ink::Key),
+            (" clear", Ink::Muted),
+        ],
     )?;
-    let available = usize::from(width - 4);
+
+    let rule = "─".repeat(usize::from(width - 4));
+    screen.row(
+        3,
+        &[("╭", Ink::Accent), (&rule, Ink::Muted), ("╮", Ink::Accent)],
+    )?;
+    screen.row(3, &[("╭─ capture ", Ink::Accent)])?;
+    screen.row(
+        5,
+        &[("╰", Ink::Accent), (&rule, Ink::Muted), ("╯", Ink::Accent)],
+    )?;
+    let input_x = 1 + INPUT_PROMPT.width() as u16;
+    // Reserve the right border, its inner padding, and the outer margin.
+    let available = usize::from(width - input_x - 3);
     let mut start = 0;
     let mut cursor_width = editor.line[..editor.cursor].width();
     for (index, grapheme) in editor.line[..editor.cursor].grapheme_indices(true) {
@@ -648,76 +788,125 @@ fn draw(
         cursor_width = cursor_width.saturating_sub(grapheme.width());
         start = index + grapheme.len();
     }
-    row(
-        output,
+    let visible = clipped(
+        if editor.line.is_empty() {
+            "What needs doing?"
+        } else {
+            &editor.line[start..]
+        },
+        available,
+    );
+    screen.row(
         4,
-        width,
-        height,
-        &format!("> {}", clipped(&editor.line[start..], available)),
+        &[
+            (INPUT_PROMPT, Ink::Accent),
+            (
+                &visible,
+                if editor.line.is_empty() {
+                    Ink::Muted
+                } else {
+                    Ink::Plain
+                },
+            ),
+        ],
     )?;
+    queue!(screen.output, MoveTo(width - 2, 4))?;
+    if screen.color {
+        queue!(screen.output, SetStyle(Ink::Accent.style()))?;
+    }
+    queue!(screen.output, Print("│"))?;
+    if screen.color {
+        queue!(screen.output, SetAttribute(Attribute::Reset))?;
+    }
+
     match parse_line(&editor.line, reference) {
         Ok(ParsedInput::Task(parsed)) => {
-            row(output, 6, width, height, &format!("Name: {}", parsed.name))?;
+            screen.row(6, &[("Name  ", Ink::Muted), (&parsed.name, Ink::Plain)])?;
             let due = parsed
                 .due_date
                 .map_or_else(|| "none".to_owned(), |date| date.to_string());
             let time = parsed
                 .due_time
                 .map_or_else(String::new, |time| format!(" {}", time.format("%H:%M")));
-            row(
-                output,
+            screen.row(
                 7,
-                width,
-                height,
-                &format!(
-                    "Due: {due}{time}   Projects: {}   Tags: {}",
-                    parsed.projects.join(", "),
-                    parsed.tags.join(", ")
-                ),
+                &[
+                    ("Due ", Ink::Muted),
+                    (
+                        &due,
+                        if parsed.due_date.is_some() {
+                            Ink::Date
+                        } else {
+                            Ink::Muted
+                        },
+                    ),
+                    (&time, Ink::Date),
+                    ("  Projects ", Ink::Muted),
+                    (&parsed.projects.join(", "), Ink::Project),
+                    ("  Tags ", Ink::Muted),
+                    (&parsed.tags.join(", "), Ink::Tag),
+                ],
             )?;
-            row(
-                output,
+            screen.row(
                 8,
-                width,
-                height,
-                &format!("URL: {}", parsed.url.as_deref().unwrap_or("none")),
+                &[
+                    ("URL   ", Ink::Muted),
+                    (
+                        parsed.url.as_deref().unwrap_or("none"),
+                        if parsed.url.is_some() {
+                            Ink::Accent
+                        } else {
+                            Ink::Muted
+                        },
+                    ),
+                ],
             )?;
         }
         Ok(ParsedInput::List(filter)) => {
-            row(
-                output,
+            screen.row(
                 6,
-                width,
-                height,
-                "List tasks (read-only; includes terminal states)",
+                &[
+                    ("List tasks", Ink::Accent),
+                    ("  read-only · all states unless filtered", Ink::Muted),
+                ],
             )?;
-            row(
-                output,
+            screen.row(
                 7,
-                width,
-                height,
-                &format!(
-                    "Projects: {}   Tags: {}   States: {}",
-                    filter.projects.join(", "),
-                    filter.tags.join(", "),
-                    filter.states.join(", ")
-                ),
+                &[
+                    ("Projects ", Ink::Muted),
+                    (&filter.projects.join(", "), Ink::Project),
+                    ("  Tags ", Ink::Muted),
+                    (&filter.tags.join(", "), Ink::Tag),
+                    ("  States ", Ink::Muted),
+                    (&filter.states.join(", "), Ink::Accent),
+                ],
             )?;
         }
-        Err(error) if !editor.line.trim().is_empty() => row(
-            output,
-            6,
-            width,
-            height,
-            &format!("Preview: {}", error.message()),
-        )?,
-        Err(_) => row(
-            output,
-            6,
-            width,
-            height,
-            "Type a task or /list #personal @chores !open",
-        )?,
+        Err(error) if !editor.line.trim().is_empty() => {
+            screen.row(6, &[("Preview  ", Ink::Date), (error.message(), Ink::Date)])?
+        }
+        Err(_) => {
+            screen.row(
+                6,
+                &[
+                    ("Try  ", Ink::Muted),
+                    ("Call Plumber ", Ink::Plain),
+                    ("tom 9am ", Ink::Date),
+                    ("#project ", Ink::Project),
+                    ("@tag", Ink::Tag),
+                ],
+            )?;
+            screen.row(
+                7,
+                &[
+                    ("Or   ", Ink::Muted),
+                    ("/list ", Ink::Accent),
+                    ("#project ", Ink::Project),
+                    ("@tag ", Ink::Tag),
+                    ("!open", Ink::Accent),
+                ],
+            )?;
+        }
     }
     let suggestions = catalog.suggestions(editor);
     let slots = page_size(height);
@@ -725,48 +914,120 @@ fn draw(
         if let Some(results) = results {
             let first = results.offset.min(results.rows.len().saturating_sub(slots));
             let end = (first + slots).min(results.rows.len());
-            row(
-                output,
+            screen.row(
                 9,
-                width,
-                height,
-                &format!(
-                    "{}-{} of {}  PgUp/PgDn: scroll  {}",
-                    usize::from(!results.rows.is_empty()) + first,
-                    end,
-                    results.rows.len(),
-                    results.command
-                ),
+                &[
+                    ("Results  ", Ink::Accent),
+                    (
+                        &format!(
+                            "{}–{} / {}",
+                            usize::from(!results.rows.is_empty()) + first,
+                            end,
+                            results.rows.len(),
+                        ),
+                        Ink::Plain,
+                    ),
+                    ("  PgUp/PgDn", Ink::Key),
+                    (" scroll  ", Ink::Muted),
+                    (&results.command, Ink::Muted),
+                ],
             )?;
             if results.rows.is_empty() {
-                row(output, 10, width, height, "No matching tasks.")?;
+                screen.row(10, &[("No matching tasks.", Ink::Muted)])?;
             }
             for (index, task) in results.rows[first..end].iter().enumerate() {
-                row(output, 10 + index as u16, width, height, task)?;
+                screen.row(10 + index as u16, &[(task, Ink::Plain)])?;
             }
         }
     } else {
+        let (label, ink) = match suggestions[0].as_bytes().first() {
+            Some(b'#') => ("Projects", Ink::Project),
+            Some(b'@') => ("Tags", Ink::Tag),
+            Some(b'!') => ("States", Ink::Accent),
+            _ => ("Commands", Ink::Accent),
+        };
+        screen.row(
+            9,
+            &[
+                (label, ink),
+                (
+                    &format!("  {} / {}  ", editor.selected + 1, suggestions.len()),
+                    Ink::Muted,
+                ),
+                ("Tab", Ink::Key),
+                (" accept", Ink::Muted),
+            ],
+        )?;
         let first = editor.selected.saturating_sub(slots - 1);
         for (index, suggestion) in suggestions.iter().enumerate().skip(first).take(slots) {
-            let marker = if index == editor.selected { ">" } else { " " };
-            row(
-                output,
+            let selected = index == editor.selected;
+            let ink = if selected { Ink::Selected } else { ink };
+            screen.row(
                 10 + (index - first) as u16,
-                width,
-                height,
-                &format!("{marker} {suggestion}"),
+                &[
+                    (if selected { " › " } else { "   " }, ink),
+                    (suggestion, ink),
+                    (" ", ink),
+                ],
             )?;
         }
     }
-    row(output, height - 2, width, height, status)?;
-    let x = 2 + cursor_width as u16;
-    queue!(output, MoveTo(x, 4), Show)?;
-    output.flush()
+    let (label, message, ink) = match status {
+        Status::Ready => (
+            "ready",
+            "Enter submits · pasted lines are reviewed one at a time",
+            Ink::Muted,
+        ),
+        Status::Info(message) => ("info", message.as_str(), Ink::Accent),
+        Status::Saved(message) => ("saved", message.as_str(), Ink::Success),
+        Status::Error(message) => ("error", message.as_str(), Ink::Error),
+    };
+    screen.row(
+        height - 2,
+        &[(label, ink), ("  ", Ink::Plain), (message, Ink::Plain)],
+    )?;
+    let x = input_x + cursor_width as u16;
+    queue!(screen.output, MoveTo(x, 4), Show)?;
+    screen.output.flush()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn styled_rows_clip_visible_graphemes_and_sanitize_store_text() {
+        let controls = regex::Regex::new(r"\x1b\[[0-9;]*[Hm]").unwrap();
+        let styles = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+        for color in [false, true] {
+            let mut output = Vec::new();
+            Screen {
+                output: &mut output,
+                width: 8,
+                height: 1,
+                color,
+            }
+            .row(
+                0,
+                &[
+                    ("A", Ink::Accent),
+                    ("界e\u{301}\u{1b}", Ink::Tag),
+                    ("界\u{301}", Ink::Project),
+                    ("must not skip past the clipped grapheme", Ink::Plain),
+                ],
+            )
+            .unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert_eq!(controls.replace_all(&output, ""), "A界e\u{301}�");
+            if !color {
+                assert!(
+                    !styles.is_match(&output),
+                    "monochrome rows must not emit SGR"
+                );
+            }
+        }
+    }
+
     #[test]
     fn slash_and_state_completion_respect_command_and_unicode_token_boundaries() {
         let catalog = Catalog {

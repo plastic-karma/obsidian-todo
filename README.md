@@ -78,6 +78,14 @@ redundant whitespace is collapsed.
   line. **Esc** or **Ctrl-C** exits; **Ctrl-D** exits when no drafts remain.
   Unsaved drafts are discarded; successful saves are retained.
 
+The TUI uses a restrained, Omarchy-inspired palette: blue focus, violet projects,
+teal tags, amber dates, and green/red save/error feedback. It inherits the
+terminal's ANSI colors and background, so it follows your terminal theme without
+reading desktop configuration. Selection markers and status labels also work
+without color. Use `--color never` for an unstyled TUI; auto mode also respects a
+nonempty `NO_COLOR`. `--color always` overrides that opt-out for the TUI, never
+for piped input or JSON.
+
 Date/time recognition follows `otodo-app`'s capture grammar, with `tom` added
 as a tomorrow alias:
 

@@ -2374,7 +2374,7 @@ fn input_captures_dates_metadata_and_urls_in_both_store_versions() {
         let config = fs::read(root.join(".todo/config.toml")).unwrap();
         let schema = fs::read(root.join(".todo/schema.json")).unwrap();
         let output = command().current_dir(&root)
-            .args(["input", "--today", "2026-09-09", "--format", "json"])
+            .args(["input", "--today", "2026-09-09", "--format", "json", "--color", "always"])
             .write_stdin("\r\nCall Plumber tom 9am #personal @chores\r\nfollow up with John about  https://github.com/issues/124 #work @prs")
             .output().unwrap();
         assert_eq!(output.status.code(), Some(0));

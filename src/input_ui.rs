@@ -16,11 +16,11 @@ use unicode_width::UnicodeWidthStr;
 
 use obsidian_todo::commands::task::{self, AddTask, TaskView};
 use obsidian_todo::error::{Error, ErrorKind, Result};
-use obsidian_todo::input::{parse_line, ParsedInput};
+use obsidian_todo::input::{parse_line, ParsedInput, ParsedTaskInput};
 use obsidian_todo::model::Task;
 use obsidian_todo::store::Store;
 
-use crate::output::{write_success, CommandOutput, OutputFormat};
+use crate::output::{human_task_row, task_list_output, write_success, CommandOutput, OutputFormat};
 
 // Bound a line and a queued paste independently of the potentially much larger record body.
 const MAX_INPUT_BYTES: usize = 16 * 1024;
@@ -67,7 +67,7 @@ fn input_too_large() -> Error {
     .with_field("input")
 }
 
-fn create_task(store: &Store, parsed: ParsedInput) -> Result<Task> {
+fn create_task(store: &Store, parsed: ParsedTaskInput) -> Result<Task> {
     task::add(
         store,
         &AddTask {
@@ -121,19 +121,22 @@ fn run_lines(
             if line.trim().is_empty() {
                 return Ok(());
             }
-            let task = create_task(
-                store,
-                parse_line(line, &reference.unwrap_or_else(Local::now))?,
-            )?;
-            let view = TaskView::from_task(&task, store)?;
-            write_success(
-                &CommandOutput::new(
-                    format!("{} {}", task.id, task.name),
-                    json!({ "version": 1, "task": view }),
-                ),
-                format,
-                writer,
-            )?;
+            let now = reference.unwrap_or_else(Local::now);
+            let output = match parse_line(line, &now)? {
+                ParsedInput::Task(parsed) => {
+                    let task = create_task(store, parsed)?;
+                    let view = TaskView::from_task(&task, store)?;
+                    CommandOutput::new(
+                        format!("{} {}", task.id, task.name),
+                        json!({ "version": 1, "task": view }),
+                    )
+                }
+                ParsedInput::List(filter) => {
+                    let tasks = task::list(store, &filter, now.date_naive())?;
+                    task_list_output(store, &tasks)?
+                }
+            };
+            write_success(&output, format, writer)?;
             writer
                 .flush()
                 .map_err(|source| Error::io("flush task output", Path::new("-"), &source))
@@ -152,6 +155,7 @@ fn run_lines(
 struct Catalog {
     projects: Vec<String>,
     tags: BTreeSet<String>,
+    states: Vec<String>,
 }
 
 impl Catalog {
@@ -168,14 +172,29 @@ impl Catalog {
             .flat_map(|task| task.tags)
             .map(|tag| format!("@{tag}"))
             .collect();
-        Ok(Self { projects, tags })
+        let states = store
+            .config()
+            .states
+            .iter()
+            .map(|state| format!("!{}", state.id))
+            .collect();
+        Ok(Self {
+            projects,
+            tags,
+            states,
+        })
     }
 
     fn suggestions(&self, editor: &Editor) -> Vec<&str> {
         let range = editor.token_range();
         let prefix = &editor.line[range.start..editor.cursor];
         let normalized = prefix.to_lowercase();
+        let list_command = editor.line.split_whitespace().next() == Some("/list");
         match prefix.as_bytes().first() {
+            Some(b'/') if editor.line[..range.start].trim().is_empty() => ["/list"]
+                .into_iter()
+                .filter(|command| command.starts_with(&normalized))
+                .collect(),
             Some(b'#') => self
                 .projects
                 .iter()
@@ -187,6 +206,12 @@ impl Catalog {
                 .iter()
                 .map(String::as_str)
                 .filter(|value| value.to_lowercase().starts_with(&normalized))
+                .collect(),
+            Some(b'!') if list_command => self
+                .states
+                .iter()
+                .map(String::as_str)
+                .filter(|value| value.starts_with(&normalized))
                 .collect(),
             _ => Vec::new(),
         }
@@ -312,6 +337,16 @@ impl Editor {
     }
 }
 
+struct ListResults {
+    command: String,
+    rows: Vec<String>,
+    offset: usize,
+}
+
+fn page_size(height: u16) -> usize {
+    usize::from(height.saturating_sub(13)).max(1)
+}
+
 struct Terminal {
     output: io::Stderr,
 }
@@ -355,6 +390,7 @@ fn run_terminal(store: &Store, reference: Option<DateTime<Local>>) -> Result<usi
     let mut status =
         "Ready. Nothing is saved until Enter; pasted lines are reviewed one at a time.".to_owned();
     let mut created = 0;
+    let mut results: Option<ListResults> = None;
     loop {
         let now = reference.unwrap_or_else(Local::now);
         draw(
@@ -364,6 +400,7 @@ fn run_terminal(store: &Store, reference: Option<DateTime<Local>>) -> Result<usi
             &now,
             &status,
             created,
+            results.as_ref(),
         )
         .map_err(terminal_error)?;
         let event = event::read().map_err(terminal_error)?;
@@ -442,6 +479,19 @@ fn run_terminal(store: &Store, reference: Option<DateTime<Local>>) -> Result<usi
                             }
                             Ok(())
                         }
+                        KeyCode::PageUp | KeyCode::PageDown => {
+                            if let Some(results) = &mut results {
+                                let slots = page_size(terminal::size().map_err(terminal_error)?.1);
+                                let last = results.rows.len().saturating_sub(slots);
+                                let first = results.offset.min(last);
+                                results.offset = if key.code == KeyCode::PageDown {
+                                    first.saturating_add(slots).min(last)
+                                } else {
+                                    first.saturating_sub(slots)
+                                };
+                            }
+                            Ok(())
+                        }
                         KeyCode::Tab => {
                             let suggestions = catalog.suggestions(&editor);
                             if let Some(suggestion) = suggestions.get(editor.selected) {
@@ -453,29 +503,41 @@ fn run_terminal(store: &Store, reference: Option<DateTime<Local>>) -> Result<usi
                         KeyCode::F(5) => {
                             catalog = Catalog::load(store)?;
                             editor.selected = 0;
-                            status = "Reloaded projects and tags from disk.".to_owned();
+                            status = "Reloaded projects, tags, and states from disk.".to_owned();
                             Ok(())
                         }
                         KeyCode::Enter if editor.line.trim().is_empty() => {
                             editor.advance();
                             Ok(())
                         }
-                        KeyCode::Enter => {
-                            match parse_line(&editor.line, &reference.unwrap_or_else(Local::now))
-                                .and_then(|parsed| create_task(store, parsed))
-                            {
-                                Ok(task) => {
+                        KeyCode::Enter => (|| {
+                            let now = reference.unwrap_or_else(Local::now);
+                            match parse_line(&editor.line, &now)? {
+                                ParsedInput::Task(parsed) => {
+                                    let task = create_task(store, parsed)?;
                                     created += 1;
                                     status = format!("Saved {}  {}", task.id, task.name);
                                     catalog
                                         .tags
                                         .extend(task.tags.into_iter().map(|tag| format!("@{tag}")));
-                                    editor.advance();
-                                    Ok(())
+                                    results = None;
                                 }
-                                Err(error) => Err(error),
+                                ParsedInput::List(filter) => {
+                                    let tasks = task::list(store, &filter, now.date_naive())?;
+                                    status = format!(
+                                        "Listed {} task(s); no tasks created.",
+                                        tasks.len()
+                                    );
+                                    results = Some(ListResults {
+                                        command: editor.line.trim().to_owned(),
+                                        rows: tasks.iter().map(human_task_row).collect(),
+                                        offset: 0,
+                                    });
+                                }
                             }
-                        }
+                            editor.advance();
+                            Ok(())
+                        })(),
                         _ => Ok(()),
                     }
                 }
@@ -492,7 +554,7 @@ fn run_terminal(store: &Store, reference: Option<DateTime<Local>>) -> Result<usi
                 return Err(error);
             }
             status = format!(
-                "{}: {} (not saved; edit this line)",
+                "{}: {} (not submitted; edit this line)",
                 error.code(),
                 error.message()
             );
@@ -538,6 +600,7 @@ fn draw(
     reference: &DateTime<Local>,
     status: &str,
     created: usize,
+    results: Option<&ListResults>,
 ) -> io::Result<()> {
     let (width, height) = terminal::size()?;
     queue!(output, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
@@ -566,7 +629,7 @@ fn draw(
         1,
         width,
         height,
-        "Enter: save  Tab: complete  Up/Down: select  F5: reload",
+        "Enter: submit  Tab: complete  Up/Down: select  F5: reload",
     )?;
     row(
         output,
@@ -593,7 +656,7 @@ fn draw(
         &format!("> {}", clipped(&editor.line[start..], available)),
     )?;
     match parse_line(&editor.line, reference) {
-        Ok(parsed) => {
+        Ok(ParsedInput::Task(parsed)) => {
             row(output, 6, width, height, &format!("Name: {}", parsed.name))?;
             let due = parsed
                 .due_date
@@ -620,6 +683,27 @@ fn draw(
                 &format!("URL: {}", parsed.url.as_deref().unwrap_or("none")),
             )?;
         }
+        Ok(ParsedInput::List(filter)) => {
+            row(
+                output,
+                6,
+                width,
+                height,
+                "List tasks (read-only; includes terminal states)",
+            )?;
+            row(
+                output,
+                7,
+                width,
+                height,
+                &format!(
+                    "Projects: {}   Tags: {}   States: {}",
+                    filter.projects.join(", "),
+                    filter.tags.join(", "),
+                    filter.states.join(", ")
+                ),
+            )?;
+        }
         Err(error) if !editor.line.trim().is_empty() => row(
             output,
             6,
@@ -632,21 +716,47 @@ fn draw(
             6,
             width,
             height,
-            "Type a task, e.g. Call Plumber tom 9am #personal @chores",
+            "Type a task or /list #personal @chores !open",
         )?,
     }
     let suggestions = catalog.suggestions(editor);
-    let slots = usize::from(height.saturating_sub(13)).max(1);
-    let first = editor.selected.saturating_sub(slots - 1);
-    for (index, suggestion) in suggestions.iter().enumerate().skip(first).take(slots) {
-        let marker = if index == editor.selected { ">" } else { " " };
-        row(
-            output,
-            10 + (index - first) as u16,
-            width,
-            height,
-            &format!("{marker} {suggestion}"),
-        )?;
+    let slots = page_size(height);
+    if suggestions.is_empty() {
+        if let Some(results) = results {
+            let first = results.offset.min(results.rows.len().saturating_sub(slots));
+            let end = (first + slots).min(results.rows.len());
+            row(
+                output,
+                9,
+                width,
+                height,
+                &format!(
+                    "{}-{} of {}  PgUp/PgDn: scroll  {}",
+                    usize::from(!results.rows.is_empty()) + first,
+                    end,
+                    results.rows.len(),
+                    results.command
+                ),
+            )?;
+            if results.rows.is_empty() {
+                row(output, 10, width, height, "No matching tasks.")?;
+            }
+            for (index, task) in results.rows[first..end].iter().enumerate() {
+                row(output, 10 + index as u16, width, height, task)?;
+            }
+        }
+    } else {
+        let first = editor.selected.saturating_sub(slots - 1);
+        for (index, suggestion) in suggestions.iter().enumerate().skip(first).take(slots) {
+            let marker = if index == editor.selected { ">" } else { " " };
+            row(
+                output,
+                10 + (index - first) as u16,
+                width,
+                height,
+                &format!("{marker} {suggestion}"),
+            )?;
+        }
     }
     row(output, height - 2, width, height, status)?;
     let x = 2 + cursor_width as u16;
@@ -657,16 +767,45 @@ fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn slash_and_state_completion_respect_command_and_unicode_token_boundaries() {
+        let catalog = Catalog {
+            states: vec!["!open".into(), "!done".into(), "!waiting_review".into()],
+            ..Catalog::default()
+        };
+        let mut editor = Editor::default();
+        editor.insert("  /LI").unwrap();
+        assert_eq!(catalog.suggestions(&editor), ["/list"]);
+        editor.complete("/list").unwrap();
+        editor.insert("@Équipe/Été !OPx").unwrap();
+        editor.cursor -= 1;
+        assert_eq!(catalog.suggestions(&editor), ["!open"]);
+        editor.complete("!open").unwrap();
+        assert_eq!(editor.line, "  /list @Équipe/Été !open ");
+        editor.insert("!w").unwrap();
+        assert_eq!(catalog.suggestions(&editor), ["!waiting_review"]);
+        for line in [
+            "Review /li",
+            "Review !op",
+            "/listing !op",
+            "https://example.test/",
+        ] {
+            let mut editor = Editor::default();
+            editor.insert(line).unwrap();
+            assert!(catalog.suggestions(&editor).is_empty(), "{line}");
+        }
+    }
 
     #[test]
     fn completion_replaces_whole_token_at_unicode_cursor_and_ignores_urls() {
         let catalog = Catalog {
             projects: vec!["#personal".into(), "#work".into()],
             tags: BTreeSet::from(["@Chörés/home".into()]),
+            states: Vec::new(),
         };
         let mut editor = Editor::default();
-        editor.insert("Call Zoë #pex tomorrow").unwrap();
-        editor.cursor = "Call Zoë #pe".len();
+        editor.insert("Call Zoë #PERx tomorrow").unwrap();
+        editor.cursor = "Call Zoë #PER".len();
         assert_eq!(catalog.suggestions(&editor), ["#personal"]);
         editor.complete("#personal").unwrap();
         assert_eq!(editor.line, "Call Zoë #personal tomorrow");

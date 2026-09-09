@@ -1,7 +1,10 @@
 use std::io::Write;
 use std::path::Path;
 
+use obsidian_todo::commands::task::TaskView;
 use obsidian_todo::error::{Error, ErrorKind, IssueSeverity, Result, ValidationIssue};
+use obsidian_todo::model::Task;
+use obsidian_todo::store::Store;
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -32,6 +35,48 @@ impl CommandOutput {
         }
     }
 }
+
+pub(crate) fn task_list_output(store: &Store, tasks: &[Task]) -> Result<CommandOutput> {
+    let views = tasks
+        .iter()
+        .map(|task| TaskView::from_task(task, store))
+        .collect::<Result<Vec<_>>>()?;
+    let human = tasks
+        .iter()
+        .map(human_task_row)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(CommandOutput::new(
+        human,
+        json!({ "version": 1, "tasks": views }),
+    ))
+}
+
+pub(crate) fn human_task_row(task: &Task) -> String {
+    let mut due = task.due_date.map_or_else(
+        || "-".to_owned(),
+        |date| date.format("%Y-%m-%d").to_string(),
+    );
+    if let Some(time) = task.due_time {
+        use std::fmt::Write as _;
+        write!(due, " {}", time.format("%H:%M")).expect("writing to String");
+    }
+    let recurring = if task.recurrence.is_some() {
+        " ↻"
+    } else {
+        ""
+    };
+    let projects = if task.projects.is_empty() {
+        "-".to_owned()
+    } else {
+        task.projects.join(",")
+    };
+    format!(
+        "{}  {:<10}  {}{}  [{}]  {}",
+        task.id, task.state, due, recurring, projects, task.name
+    )
+}
+
 #[must_use]
 pub fn json_path(path: &Path) -> String {
     path.to_string_lossy()

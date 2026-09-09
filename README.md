@@ -6,7 +6,7 @@
 
 - Workflow states, projects, tags, local due dates/times, and recurrence
 - Optional HTTP/HTTPS task links in both store versions
-- Interactive one-line task capture with natural dates and project/tag completion
+- Interactive one-line task capture with natural dates, completion, and filtered `/list` commands
 - Ordinary file attachments in v1 and v2 stores, with Markdown links and image embeds
 - Arbitrarily nested subtasks with stable full-ULID parent identity
 - Recursive task discovery and deterministic filtering and sorting
@@ -65,12 +65,13 @@ redundant whitespace is collapsed.
 - `@tag` adds a tag. New tags and nested tags such as `@home/chores` are allowed.
   Multiple projects/tags are supported; repeated identical values are deduplicated.
   Metadata must be separate whitespace-delimited tokens.
-- Suggestions appear as you type `#` or `@`. Use **Up/Down** to select and
+- Suggestions complete `/list` at the start of a line, `#projects`, `@tags`,
+  and configured `!states` in `/list` commands. Use **Up/Down** to select and
   **Tab** to accept. Tags come from all tasks, including completed tasks and
-  tasks saved in this session. **F5** reloads projects/tags from disk.
-- **Enter** saves the current line. A rejected line stays editable.
-  Multiline paste queues drafts for review: press Enter for each, rather than
-  publishing the entire paste immediately.
+  tasks saved in this session. **F5** reloads the suggestion catalog from disk.
+- **Enter** submits the current line: save a task or run a slash command.
+  A rejected line stays editable. Multiline paste queues drafts for review:
+  press Enter for each, rather than submitting the entire paste immediately.
   Pasted tabs become spaces, and CRLF/CR become line breaks. Other control
   characters are rejected without changing the draft.
 - **Left/Right**, **Home/End**, **Backspace/Delete**, and **Ctrl-U** edit the
@@ -96,16 +97,39 @@ for explicit `YYYY-MM-DD` dates. The first valid explicit HTTP(S) link is captur
 surrounding sentence punctuation is excluded from the field, but remains in the
 title. No links are fetched or opened.
 
+Slash commands query the store without creating tasks:
+
+```text
+/list
+/list #personal @chores !open
+/list !open !active
+```
+
+Bare `/list` includes **all tasks, including completed and cancelled tasks**.
+The second example returns open tasks tagged `chores` in project `personal`.
+Projects and tags combine with AND; repeated states match any of those states.
+Repeated identical filters are deduplicated. Projects/states must exist; tags
+match exact spelling, including case and nested `/` names. Dates are not parsed
+inside commands. Results use the ordinary list validation and sort order.
+**PgUp/PgDn** scroll results in the TUI; listing does not increase the saved count.
+
+Commands are lowercase, whole tokens at the beginning of the line (leading
+whitespace is allowed). Unknown slash commands and arguments other than
+`#project`, `@tag`, or `!state` are errors, never task titles. Slashes and `!state`
+inside ordinary task titles remain text.
+
 Pipes and `--format json` use plain stdin without the TUI:
 
 ```sh
 printf '%s\n' \
   'Call Plumber tom 9am #personal @chores' \
-  'Review PR https://github.com/issues/124 #work @prs' |
+  'Review PR https://github.com/issues/124 #work @prs' \
+  '/list #personal @chores !open' |
   otodo --root Todo --format json input
 ```
 
-JSON output is one version-1 task envelope per saved line (JSON Lines).
+JSON output is one version-1 `task` envelope per saved task or `tasks` envelope
+per `/list`, including an empty array when nothing matches (JSON Lines).
 Blank lines are skipped; LF, CRLF, and a final line without a newline work.
 The first invalid line stops piped input with an error on stderr; earlier saves
 remain committed and later lines are not processed. Input is UTF-8, bounded to

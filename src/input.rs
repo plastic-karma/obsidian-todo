@@ -6,14 +6,22 @@ use chrono::{
 use regex::Regex;
 
 use crate::{
+    commands::task::TaskFilter,
     error::{Error, Result},
     model::{validate_name, validate_project_slug, validate_tag, validate_url},
     recurrence::validate_date_value,
 };
 
-/// A capture line resolved without consulting or changing the task store.
+/// A task or read-only command resolved without consulting the task store.
+#[derive(Debug, Clone)]
+pub enum ParsedInput {
+    Task(ParsedTaskInput),
+    List(TaskFilter),
+}
+
+/// A captured task with resolved metadata and local due date/time.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedInput {
+pub struct ParsedTaskInput {
     pub name: String,
     pub projects: Vec<String>,
     pub tags: Vec<String>,
@@ -60,10 +68,10 @@ enum DateMeaning {
     Resolved(NaiveDate),
 }
 
-/// Parse whitespace-delimited `#project` and `@tag` metadata, explicit web links,
-/// and case-insensitive natural date/clock phrases. Only the last contributing
-/// date and time phrases leave the title; earlier phrases remain ordinary text.
-/// The injected timestamp's timezone determines today and relative clock values.
+/// Parse a task capture or a leading `/list` command. List filters use `#project`,
+/// `@tag`, and `!state` tokens; unknown commands and bare arguments are errors.
+/// Task captures recognize metadata, explicit web links and natural date/clock
+/// phrases. The injected timestamp determines today and relative clock values.
 pub fn parse_line<Tz: TimeZone>(line: &str, reference: &DateTime<Tz>) -> Result<ParsedInput> {
     if line
         .chars()
@@ -71,12 +79,52 @@ pub fn parse_line<Tz: TimeZone>(line: &str, reference: &DateTime<Tz>) -> Result<
     {
         return Err(Error::validation(
             "invalid_input",
-            "Task input must be a single line without control characters",
+            "Input must be a single line without control characters",
         )
         .with_field("input"));
     }
+    let mut tokens = line.split_whitespace();
+    if let Some(command) = tokens.next().filter(|token| token.starts_with('/')) {
+        if command != "/list" {
+            return Err(Error::usage(
+                "unknown_input_command",
+                format!("Unknown input command {command:?}; use /list"),
+            )
+            .with_field("input"));
+        }
+        let mut filter = TaskFilter {
+            include_terminal: true,
+            ..TaskFilter::default()
+        };
+        for token in tokens {
+            let (values, value) = if let Some(project) = token.strip_prefix('#') {
+                validate_project_slug(project)?;
+                (&mut filter.projects, project)
+            } else if let Some(tag) = token.strip_prefix('@') {
+                validate_tag(tag)?;
+                (&mut filter.tags, tag)
+            } else if let Some(state) = token.strip_prefix('!').filter(|state| !state.is_empty()) {
+                // Membership in the configured workflow is checked by task::list.
+                (&mut filter.states, state)
+            } else {
+                return Err(Error::usage(
+                    "invalid_input_filter",
+                    format!("Invalid list filter {token:?}; use #project, @tag, or !state"),
+                )
+                .with_field("input"));
+            };
+            if !values.iter().any(|existing| existing == value) {
+                values.push(value.to_owned());
+            }
+        }
+        return Ok(ParsedInput::List(filter));
+    }
+    parse_task_line(line, reference).map(ParsedInput::Task)
+}
+
+fn parse_task_line<Tz: TimeZone>(line: &str, reference: &DateTime<Tz>) -> Result<ParsedTaskInput> {
     validate_name(line, "name")?;
-    let mut parsed = ParsedInput {
+    let mut parsed = ParsedTaskInput {
         name: String::new(),
         projects: Vec::new(),
         tags: Vec::new(),
@@ -480,8 +528,15 @@ mod tests {
         DateTime::parse_from_rfc3339("2026-09-04T12:00:00+00:00").unwrap()
     }
 
-    fn parse(value: &str) -> ParsedInput {
-        parse_line(value, &reference()).unwrap()
+    fn parse(value: &str) -> ParsedTaskInput {
+        parse_at(value, &reference())
+    }
+
+    fn parse_at<Tz: TimeZone>(value: &str, reference: &DateTime<Tz>) -> ParsedTaskInput {
+        match parse_line(value, reference).unwrap() {
+            ParsedInput::Task(task) => task,
+            ParsedInput::List(_) => panic!("expected a task capture"),
+        }
     }
 
     fn date(value: &str) -> NaiveDate {
@@ -490,6 +545,49 @@ mod tests {
 
     fn time(value: &str) -> NaiveTime {
         NaiveTime::parse_from_str(value, "%H:%M").unwrap()
+    }
+
+    #[test]
+    fn slash_list_filters_are_literal_and_deduplicated() {
+        let ParsedInput::List(filter) = parse_line(
+            "  /list #personal #personal @Chörés/home @Chörés/home @tomorrow !open !done !open  ",
+            &reference(),
+        )
+        .unwrap() else {
+            panic!("expected a list command");
+        };
+        assert_eq!(filter.projects, ["personal"]);
+        assert_eq!(filter.tags, ["Chörés/home", "tomorrow"]);
+        assert_eq!(filter.states, ["open", "done"]);
+        assert!(filter.include_terminal);
+        assert!(matches!(
+            parse_line("/list", &reference()).unwrap(),
+            ParsedInput::List(_)
+        ));
+    }
+
+    #[test]
+    fn slash_commands_require_a_leading_whole_token_and_never_fall_back_to_tasks() {
+        for (line, code) in [
+            ("/", "unknown_input_command"),
+            ("/delete #personal", "unknown_input_command"),
+            ("/list#personal", "unknown_input_command"),
+            ("/list tomorrow", "invalid_input_filter"),
+            ("/list !", "invalid_input_filter"),
+            ("/list !open\n", "invalid_input"),
+        ] {
+            assert_eq!(
+                parse_line(line, &reference()).unwrap_err().code(),
+                code,
+                "{line:?}"
+            );
+        }
+        for line in ["/list #", "/list @", "/list @bad,tag"] {
+            assert!(parse_line(line, &reference()).is_err(), "{line}");
+        }
+        let task = parse("Review /list !open");
+        assert_eq!(task.name, "Review /list !open");
+        assert_eq!(task.due_date, None);
     }
 
     #[test]
@@ -562,11 +660,11 @@ mod tests {
         }
         let january = DateTime::parse_from_rfc3339("2024-01-31T12:00:00+00:00").unwrap();
         assert_eq!(
-            parse_line("Budget next month", &january).unwrap().due_date,
+            parse_at("Budget next month", &january).due_date,
             Some(date("2024-02-29"))
         );
         assert_eq!(
-            parse_line("Budget in 2 months", &january).unwrap().due_date,
+            parse_at("Budget in 2 months", &january).due_date,
             Some(date("2024-03-31"))
         );
         let end = DateTime::parse_from_rfc3339("9999-12-31T23:59:00+00:00").unwrap();
@@ -586,21 +684,21 @@ mod tests {
     #[test]
     fn relative_time_rounds_up_and_uses_local_date() {
         let late = DateTime::parse_from_rfc3339("2026-09-04T23:59:45-08:00").unwrap();
-        let parsed = parse_line("Check oven in 1 minute", &late).unwrap();
+        let parsed = parse_at("Check oven in 1 minute", &late);
         assert_eq!(parsed.name, "Check oven");
         assert_eq!(parsed.due_date, Some(date("2026-09-05")));
         assert_eq!(parsed.due_time, Some(time("00:01")));
         let exact = DateTime::parse_from_rfc3339("2026-09-04T23:59:00-08:00").unwrap();
         assert_eq!(
-            parse_line("Check in 1 minute", &exact).unwrap().due_time,
+            parse_at("Check in 1 minute", &exact).due_time,
             Some(time("00:00"))
         );
         let fractional =
             DateTime::parse_from_rfc3339("2026-09-04T23:58:00.000000001-08:00").unwrap();
-        let rounded = parse_line("Check in 1 minute", &fractional).unwrap();
+        let rounded = parse_at("Check in 1 minute", &fractional);
         assert_eq!(rounded.due_date, Some(date("2026-09-05")));
         assert_eq!(rounded.due_time, Some(time("00:00")));
-        let clock = parse_line("Call 09:30", &late).unwrap();
+        let clock = parse_at("Call 09:30", &late);
         assert_eq!(clock.due_date, Some(date("2026-09-04")));
     }
 

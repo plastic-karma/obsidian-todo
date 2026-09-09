@@ -2416,6 +2416,191 @@ fn input_captures_dates_metadata_and_urls_in_both_store_versions() {
 }
 
 #[test]
+fn input_list_filters_all_states_without_writes_in_both_store_versions() {
+    for legacy in [false, true] {
+        let vault = fake_vault();
+        let root = initialize(vault.path());
+        if legacy {
+            legacy_store(&root);
+        }
+        for slug in ["personal", "work"] {
+            json_success(&root, &["project", "create", slug, "--name", slug]);
+        }
+        let home = json_success(
+            &root,
+            &["add", "Kitchen", "--project", "personal", "--tag", "chores"],
+        );
+        let done = json_success(
+            &root,
+            &[
+                "add",
+                "Finished",
+                "--project",
+                "personal",
+                "--tag",
+                "chores",
+                "--state",
+                "done",
+            ],
+        );
+        let shared = json_success(
+            &root,
+            &[
+                "add",
+                "Shared",
+                "--project",
+                "personal",
+                "--project",
+                "work",
+                "--tag",
+                "chores",
+                "--tag",
+                "Équipe/home",
+            ],
+        );
+        json_success(
+            &root,
+            &["add", "Office", "--project", "work", "--tag", "chores"],
+        );
+        json_success(
+            &root,
+            &["add", "Read", "--project", "personal", "--tag", "reading"],
+        );
+        let all = json_success(&root, &["list", "--all"]);
+        let before = store_bytes(&root);
+        let output = command()
+            .current_dir(&root)
+            .args(["input", "--format=json"])
+            .write_stdin("/list #personal @chores !open\r\n/list !done\n/list #personal #work @chores @Équipe/home !open !done #personal !open\n/list @missing\n/list")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        assert!(!output.stdout.contains(&0x1b));
+        let envelopes: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            envelopes,
+            [
+                serde_json::json!({"version": 1, "tasks": [home["task"], shared["task"]]}),
+                serde_json::json!({"version": 1, "tasks": [done["task"]]}),
+                serde_json::json!({"version": 1, "tasks": [shared["task"]]}),
+                serde_json::json!({"version": 1, "tasks": []}),
+                all,
+            ]
+        );
+        let human = command()
+            .current_dir(&root)
+            .arg("input")
+            .write_stdin("/list #personal @chores !open\n")
+            .output()
+            .unwrap();
+        assert_eq!(human.status.code(), Some(0));
+        assert!(human.stderr.is_empty());
+        assert_eq!(
+            String::from_utf8(human.stdout).unwrap(),
+            human_success(
+                &root,
+                &[
+                    "list",
+                    "--all",
+                    "--project",
+                    "personal",
+                    "--tag",
+                    "chores",
+                    "--state",
+                    "open"
+                ]
+            )
+        );
+        assert_eq!(store_bytes(&root), before);
+    }
+}
+
+#[test]
+fn input_command_errors_stop_mixed_streams_without_creating_command_tasks() {
+    let vault = fake_vault();
+    let root = initialize(vault.path());
+    let output = command()
+        .current_dir(&root)
+        .args(["input", "--format=json"])
+        .write_stdin("Saved @chores\n/list @chores !open\n/unknown\nNever saved\n")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let envelopes: Vec<Value> = serde_json::Deserializer::from_slice(&output.stdout)
+        .into_iter::<Value>()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(envelopes.len(), 2);
+    assert_eq!(envelopes[0]["task"]["name"], "Saved");
+    assert_eq!(
+        envelopes[1],
+        serde_json::json!({"version": 1, "tasks": [envelopes[0]["task"]]})
+    );
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "unknown_input_command");
+    assert_eq!(error["error"]["line"], 3);
+    assert_eq!(error["error"]["path"], "-");
+    assert_eq!(json_success(&root, &["list", "--all"]), envelopes[1]);
+    let before = store_bytes(&root);
+    for (line, exit, code) in [
+        ("/list extra", 2, "invalid_input_filter"),
+        ("/list !", 2, "invalid_input_filter"),
+        ("/list !unknown", 5, "unknown_state"),
+        ("/list #unknown", 3, "project_not_found"),
+        ("/list @bad,tag", 5, "invalid_tag"),
+    ] {
+        let output = command()
+            .current_dir(&root)
+            .args(["input", "--format=json"])
+            .write_stdin(format!("{line}\nNever saved\n"))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(exit), "{line}");
+        assert!(output.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["code"], code);
+        assert_eq!(error["error"]["line"], 1);
+        assert_eq!(error["error"]["path"], "-");
+        assert_eq!(store_bytes(&root), before);
+    }
+}
+
+#[test]
+fn input_list_validates_filtered_out_records_before_rendering() {
+    let vault = fake_vault();
+    let root = initialize(vault.path());
+    let task = json_success(&root, &["add", "Hidden open task"]);
+    fs::create_dir(root.join("Tasks/nested")).unwrap();
+    fs::copy(
+        root.join(task["task"]["path"].as_str().unwrap()),
+        root.join(format!("Tasks/nested/{}.md", task_id(&task))),
+    )
+    .unwrap();
+    let before = store_bytes(&root);
+    let output = command()
+        .current_dir(&root)
+        .args(["input", "--format=json"])
+        .write_stdin("/list !done\nNever saved\n")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "duplicate_task_id");
+    assert_eq!(store_bytes(&root), before);
+}
+
+#[test]
 fn input_failure_stops_at_that_line_and_retains_only_earlier_saves() {
     let vault = fake_vault();
     let root = initialize(vault.path());

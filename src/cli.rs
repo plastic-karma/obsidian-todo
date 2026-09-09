@@ -23,7 +23,8 @@ use obsidian_todo::store::{upgrade, Store};
 use obsidian_todo::validate::validate_store;
 
 use crate::output::{
-    human_issue, json_path, write_error, write_success, ColorChoice, CommandOutput, OutputFormat,
+    human_issue, json_path, task_list_output, write_error, write_success, ColorChoice,
+    CommandOutput, OutputFormat,
 };
 
 #[derive(Debug, Parser)]
@@ -103,9 +104,9 @@ pub enum Command {
     )]
     Add(AddArguments),
 
-    /// Enter tasks interactively, or read one task per line from piped stdin
+    /// Enter tasks or /list commands interactively or from piped stdin
     #[command(
-        after_help = "Enter saves one task; Tab completes #projects and @tags; Esc or Ctrl-C exits. Projects must exist; tags may be new. Piped input (or --format json) uses plain lines, stops at the first error, and retains earlier saves. JSON emits one task envelope per saved line.\n\nExamples:\n  otodo --root Todo input\n  printf '%s\\n' 'Call Plumber tom 9am #personal @chores' | otodo --root Todo input --format json"
+        after_help = "Enter submits a task or /list command; Tab completes /list, #projects, @tags, and !states; Esc or Ctrl-C exits. /list includes all states; filter with #project @tag !state. Repeated projects/tags require all values; repeated states match any. Projects and states must exist; tags may be new. PgUp/PgDn scroll list results. Piped input (or --format json) uses plain lines, stops at the first error, and retains earlier saves. JSON emits one task envelope per save or tasks envelope per /list.\n\nExamples:\n  otodo --root Todo input\n  printf '%s\\n' 'Call Plumber tom 9am #personal @chores' '/list #personal @chores !open' | otodo --root Todo input --format json"
     )]
     Input,
 
@@ -825,45 +826,6 @@ fn task_output(store: &Store, task: &Task, human: String) -> Result<CommandOutpu
     Ok(CommandOutput::new(
         human,
         json!({ "version": 1, "task": view }),
-    ))
-}
-
-fn task_list_output(store: &Store, tasks: &[Task]) -> Result<CommandOutput> {
-    let views = tasks
-        .iter()
-        .map(|task| TaskView::from_task(task, store))
-        .collect::<Result<Vec<_>>>()?;
-    let human = tasks
-        .iter()
-        .map(|task| {
-            let mut due = task.due_date.map_or_else(
-                || "-".to_owned(),
-                |date| date.format("%Y-%m-%d").to_string(),
-            );
-            if let Some(time) = task.due_time {
-                use std::fmt::Write as _;
-                write!(due, " {}", time.format("%H:%M")).expect("writing to String");
-            }
-            let recurring = if task.recurrence.is_some() {
-                " ↻"
-            } else {
-                ""
-            };
-            let projects = if task.projects.is_empty() {
-                "-".to_owned()
-            } else {
-                task.projects.join(",")
-            };
-            format!(
-                "{}  {:<10}  {}{}  [{}]  {}",
-                task.id, task.state, due, recurring, projects, task.name
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(CommandOutput::new(
-        human,
-        json!({ "version": 1, "tasks": views }),
     ))
 }
 

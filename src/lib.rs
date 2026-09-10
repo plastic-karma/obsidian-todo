@@ -10,6 +10,7 @@ pub mod input;
 pub mod model;
 pub mod recurrence;
 pub mod store;
+pub mod sync;
 pub mod validate;
 
 pub use commands::init::{initialize, InitOptions, InitPlan};

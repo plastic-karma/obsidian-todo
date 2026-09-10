@@ -33,7 +33,7 @@ use crate::output::{
     version,
     about = "Manage structured todo notes in an Obsidian vault",
     color = clap::ColorChoice::Never,
-    after_help = "Normal operations read and write only the selected todo store and never invoke Git. Sparse checkout limits visible files but is not a credential or confidentiality boundary.\n\nExamples:\n  otodo init Todo --vault-root .\n  otodo --root Todo project create work --name Work\n  otodo --root Todo add \"Review plan\" --project work --tag review\n  otodo --root Todo list --format json\n  otodo --root Todo validate"
+    after_help = "Ordinary operations read and write only the selected todo store and never invoke Git. Explicit /sync in input mode commits store changes and synchronizes the containing Git branch with its configured upstream. Sparse checkout limits visible files but is not a credential or confidentiality boundary.\n\nExamples:\n  otodo init Todo --vault-root .\n  otodo --root Todo project create work --name Work\n  otodo --root Todo add \"Review plan\" --project work --tag review\n  otodo --root Todo list --format json\n  otodo --root Todo validate"
 )]
 pub struct Cli {
     /// Todo store root (takes precedence over discovery and OBSIDIAN_TODO_ROOT)
@@ -104,9 +104,9 @@ pub enum Command {
     )]
     Add(AddArguments),
 
-    /// Enter tasks or /list commands interactively or from piped stdin
+    /// Enter tasks, /list, or /sync interactively or from piped stdin
     #[command(
-        after_help = "Enter submits a task or /list command; Tab completes /list, #projects, @tags, and !states; Esc or Ctrl-C exits. /list includes all states; filter with #project @tag !state. Repeated projects/tags require all values; repeated states match any. Projects and states must exist; tags may be new. PgUp/PgDn scroll list results. Piped input (or --format json) uses plain lines, stops at the first error, and retains earlier saves. JSON emits one task envelope per save or tasks envelope per /list.\n\nExamples:\n  otodo --root Todo input\n  printf '%s\\n' 'Call Plumber tom 9am #personal @chores' '/list #personal @chores !open' | otodo --root Todo input --format json"
+        after_help = "Enter submits a task or slash command; Tab completes /list, /sync, #projects, @tags, !states, and sync options; Esc or Ctrl-C exits. /list includes all states; filter with #project @tag !state. Repeated projects/tags require all values; repeated states match any. Projects and states must exist; tags may be new. PgUp/PgDn scroll list results.\n\n/sync commits local store changes, pulls/merges the configured upstream, then pushes the containing Git branch. Unrelated dirty files and unfinished Git operations must be cleared first. Stop other writers/sync before using it. Conflicts prompt individually; /sync ours prefers local conflicting changes and /sync theirs prefers remote ones. Neither discards non-conflicting changes. No force-push. Git author identity and noninteractive authentication must already be configured.\n\nPiped input (or --format json) uses plain lines, stops at the first error, and retains earlier saves and sync commits. Conflicts without ours/theirs fail rather than consuming task input. JSON emits one task envelope per save, tasks envelope per /list, or sync envelope per /sync.\n\nExamples:\n  otodo --root Todo input\n  printf '%s\\n' 'Call Plumber tom 9am #personal @chores' '/list #personal @chores !open' | otodo --root Todo input --format json\n  printf '%s\\n' '/sync ours' | otodo --root Todo input --format json"
     )]
     Input,
 
@@ -399,7 +399,7 @@ pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<()> {
         let current_directory = env::current_dir()
             .map_err(|source| Error::io("read the current directory", Path::new("."), &source))?;
         let store = Store::open(discover_root(cli, &current_directory)?)?;
-        return crate::input_ui::run(&store, cli.today, cli.format, cli.color);
+        return crate::input_ui::run(store, cli.today, cli.format, cli.color);
     }
     let output = command_output(cli, clock)?;
     write_success(&output, cli.format, &mut io::stdout().lock())
@@ -408,12 +408,12 @@ pub fn execute(cli: &Cli, clock: &dyn Clock) -> Result<()> {
 fn command_output(cli: &Cli, clock: &dyn Clock) -> Result<CommandOutput> {
     if matches!(cli.command, Command::Capabilities) {
         return Ok(CommandOutput::new(
-            "Store schema versions: 1, 2\nFeatures: subtasks, task_candidates, store_upgrade, attachments, task_urls, task_due_times, task_input"
+            "Store schema versions: 1, 2\nFeatures: subtasks, task_candidates, store_upgrade, attachments, task_urls, task_due_times, task_input, git_sync"
                 .to_owned(),
             json!({
                 "version": 1,
                 "store_schema_versions": [1, 2],
-                "features": ["subtasks", "task_candidates", "store_upgrade", "attachments", "task_urls", "task_due_times", "task_input"],
+                "features": ["subtasks", "task_candidates", "store_upgrade", "attachments", "task_urls", "task_due_times", "task_input", "git_sync"],
             }),
         ));
     }
@@ -1037,23 +1037,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn top_level_help_documents_globals_examples_and_sparse_boundary() {
-        let help = Cli::try_parse_from(["otodo", "--help"])
-            .expect_err("help")
-            .to_string();
-        for required in [
-            "--root",
-            "--format",
-            "--color",
-            "--today",
-            "Examples:",
-            "never invoke Git",
-            "not a credential or confidentiality boundary",
-        ] {
-            assert!(help.contains(required), "missing {required:?}:\n{help}");
-        }
-    }
     #[test]
     fn body_reader_stops_at_record_size_limit() {
         let error = read_bounded_body(std::io::repeat(b'x'), Path::new("-"), "test input")

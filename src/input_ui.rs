@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeSet, VecDeque};
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::ops::Range;
@@ -20,6 +21,7 @@ use obsidian_todo::error::{Error, ErrorKind, Result};
 use obsidian_todo::input::{parse_line, ParsedInput, ParsedTaskInput};
 use obsidian_todo::model::Task;
 use obsidian_todo::store::Store;
+use obsidian_todo::sync::{self, ConflictChoice, SyncConflict, SyncResult};
 
 use crate::output::{
     human_task_row, task_list_output, write_success, ColorChoice, CommandOutput, OutputFormat,
@@ -30,7 +32,7 @@ const MAX_INPUT_BYTES: usize = 16 * 1024;
 const INPUT_PROMPT: &str = "│ › ";
 
 pub fn run(
-    store: &Store,
+    store: Store,
     today: Option<NaiveDate>,
     format: OutputFormat,
     color: ColorChoice,
@@ -96,7 +98,7 @@ fn create_task(store: &Store, parsed: ParsedTaskInput) -> Result<Task> {
 }
 
 fn run_lines(
-    store: &Store,
+    mut store: Store,
     reference: Option<DateTime<Local>>,
     format: OutputFormat,
     mut reader: impl BufRead,
@@ -133,16 +135,33 @@ fn run_lines(
             let now = reference.unwrap_or_else(Local::now);
             let output = match parse_line(line, &now)? {
                 ParsedInput::Task(parsed) => {
-                    let task = create_task(store, parsed)?;
-                    let view = TaskView::from_task(&task, store)?;
+                    let task = create_task(&store, parsed)?;
+                    let view = TaskView::from_task(&task, &store)?;
                     CommandOutput::new(
                         format!("{} {}", task.id, task.name),
                         json!({ "version": 1, "task": view }),
                     )
                 }
                 ParsedInput::List(filter) => {
-                    let tasks = task::list(store, &filter, now.date_naive())?;
-                    task_list_output(store, &tasks)?
+                    let tasks = task::list(&store, &filter, now.date_naive())?;
+                    task_list_output(&store, &tasks)?
+                }
+                ParsedInput::Sync(choice) => {
+                    let result = sync::synchronize(store.root(), choice, |conflict| {
+                        Err(Error::usage(
+                            "sync_conflict",
+                            format!(
+                                "Conflict in {:?}; use the interactive TUI to choose per conflict, or /sync ours or /sync theirs",
+                                conflict.path
+                            ),
+                        )
+                        .with_field("input"))
+                    })?;
+                    store = Store::open(store.root())?;
+                    CommandOutput::new(
+                        sync_summary(&result),
+                        json!({ "version": 1, "sync": result }),
+                    )
                 }
             };
             write_success(&output, format, writer)?;
@@ -158,6 +177,16 @@ fn run_lines(
             }
         })?;
     }
+}
+
+fn sync_summary(result: &SyncResult) -> String {
+    format!(
+        "Synced {} with {}; {}local commit; {} conflict(s) resolved",
+        result.branch,
+        result.upstream,
+        if result.committed { "" } else { "no " },
+        result.conflicts_resolved
+    )
 }
 
 #[derive(Default)]
@@ -199,8 +228,14 @@ impl Catalog {
         let prefix = &editor.line[range.start..editor.cursor];
         let normalized = prefix.to_lowercase();
         let list_command = editor.line.split_whitespace().next() == Some("/list");
+        if editor.line[..range.start].split_whitespace().eq(["/sync"]) {
+            return ["ours", "theirs"]
+                .into_iter()
+                .filter(|option| option.starts_with(&normalized))
+                .collect();
+        }
         match prefix.as_bytes().first() {
-            Some(b'/') if editor.line[..range.start].trim().is_empty() => ["/list"]
+            Some(b'/') if editor.line[..range.start].trim().is_empty() => ["/list", "/sync"]
                 .into_iter()
                 .filter(|command| command.starts_with(&normalized))
                 .collect(),
@@ -411,17 +446,19 @@ fn terminal_error(source: io::Error) -> Error {
 }
 
 fn run_terminal(
-    store: &Store,
+    mut store: Store,
     reference: Option<DateTime<Local>>,
     color: ColorChoice,
 ) -> Result<usize> {
-    let mut catalog = Catalog::load(store)?;
+    let mut catalog = Catalog::load(&store)?;
     let mut terminal = Terminal::open(color).map_err(terminal_error)?;
     let mut editor = Editor::default();
     let mut status = Status::Ready;
     let mut created = 0;
     let mut results: Option<ListResults> = None;
     loop {
+        let mut sync_attempted = false;
+        let mut reload_failed = false;
         let now = reference.unwrap_or_else(Local::now);
         draw(
             &mut terminal,
@@ -531,7 +568,8 @@ fn run_terminal(
                             }
                         }
                         KeyCode::F(5) => {
-                            catalog = Catalog::load(store)?;
+                            store = Store::open(store.root())?;
+                            catalog = Catalog::load(&store)?;
                             editor.selected = 0;
                             status = Status::Info(
                                 "Reloaded projects, tags, and states from disk.".into(),
@@ -546,7 +584,7 @@ fn run_terminal(
                             let now = reference.unwrap_or_else(Local::now);
                             match parse_line(&editor.line, &now)? {
                                 ParsedInput::Task(parsed) => {
-                                    let task = create_task(store, parsed)?;
+                                    let task = create_task(&store, parsed)?;
                                     created += 1;
                                     status =
                                         Status::Saved(format!("{}  ·  {}", task.name, task.id));
@@ -556,7 +594,7 @@ fn run_terminal(
                                     results = None;
                                 }
                                 ParsedInput::List(filter) => {
-                                    let tasks = task::list(store, &filter, now.date_naive())?;
+                                    let tasks = task::list(&store, &filter, now.date_naive())?;
                                     status = Status::Info(format!(
                                         "Listed {} task(s); no tasks created.",
                                         tasks.len()
@@ -566,6 +604,43 @@ fn run_terminal(
                                         rows: tasks.iter().map(human_task_row).collect(),
                                         offset: 0,
                                     });
+                                }
+                                ParsedInput::Sync(choice) => {
+                                    sync_attempted = true;
+                                    status = Status::Info(
+                                        "Syncing: fetch, commit store changes, merge, push…".into(),
+                                    );
+                                    draw(
+                                        &mut terminal,
+                                        &editor,
+                                        &catalog,
+                                        &now,
+                                        &status,
+                                        created,
+                                        results.as_ref(),
+                                    )
+                                    .map_err(terminal_error)?;
+                                    let outcome =
+                                        sync::synchronize(store.root(), choice, |conflict| {
+                                            resolve_conflict(&mut terminal, conflict)
+                                        });
+                                    // Even an aborted merge can replace the config inode.
+                                    // Refresh before continuing, but never hide the sync error.
+                                    let refreshed = Store::open(store.root()).and_then(|fresh| {
+                                        Catalog::load(&fresh).map(|catalog| (fresh, catalog))
+                                    });
+                                    match refreshed {
+                                        Ok((fresh, refreshed_catalog)) => {
+                                            store = fresh;
+                                            catalog = refreshed_catalog;
+                                        }
+                                        Err(error) => {
+                                            reload_failed = true;
+                                            return Err(outcome.err().unwrap_or(error));
+                                        }
+                                    }
+                                    results = None;
+                                    status = Status::Info(sync_summary(&outcome?));
                                 }
                             }
                             editor.advance();
@@ -580,20 +655,154 @@ fn run_terminal(
         };
         if let Err(error) = result {
             // Publication or generation failures can be uncertain: do not invite an accidental retry.
-            if matches!(
-                error.kind(),
-                ErrorKind::Io | ErrorKind::Concurrent | ErrorKind::Unsupported
-            ) {
+            if reload_failed
+                || matches!(
+                    error.kind(),
+                    ErrorKind::Io | ErrorKind::Concurrent | ErrorKind::Unsupported
+                )
+            {
                 return Err(error);
             }
-            status = Status::Error(format!(
-                "{}: {} (not submitted; edit this line)",
-                error.code(),
-                error.message()
-            ));
+            status = Status::Error(if sync_attempted {
+                format!("{}: {}", error.code(), error.message())
+            } else {
+                format!(
+                    "{}: {} (not submitted; edit this line)",
+                    error.code(),
+                    error.message()
+                )
+            });
         }
     }
     Ok(created)
+}
+
+fn conflict_preview(bytes: Option<&[u8]>) -> Cow<'_, str> {
+    match bytes {
+        None => Cow::Borrowed("(deleted)"),
+        Some([]) => Cow::Borrowed("(empty file or removed text)"),
+        Some(bytes) => match std::str::from_utf8(bytes) {
+            Ok(text) if !bytes.contains(&0) => Cow::Borrowed(text),
+            _ => Cow::Owned(format!("(binary content: {} bytes)", bytes.len())),
+        },
+    }
+}
+
+fn from_column(value: &str, column: usize) -> &str {
+    let mut used = 0;
+    for (index, grapheme) in value.grapheme_indices(true) {
+        if used >= column {
+            return &value[index..];
+        }
+        used += grapheme.width();
+    }
+    ""
+}
+
+fn resolve_conflict(terminal: &mut Terminal, conflict: &SyncConflict) -> Result<ConflictChoice> {
+    let ours = conflict_preview(conflict.ours.as_deref());
+    let theirs = conflict_preview(conflict.theirs.as_deref());
+    let rows = std::iter::once(("OURS — local", Ink::Success))
+        .chain(ours.lines().map(|line| (line, Ink::Plain)))
+        .chain([("", Ink::Plain), ("THEIRS — remote", Ink::Date)])
+        .chain(theirs.lines().map(|line| (line, Ink::Plain)));
+    let row_count = rows.clone().count();
+    let mut offset = 0usize;
+    let mut column = 0usize;
+    loop {
+        let (width, height) = terminal::size().map_err(terminal_error)?;
+        let slots = usize::from(height.saturating_sub(7)).max(1);
+        offset = offset.min(row_count.saturating_sub(slots));
+        let mut screen = Screen {
+            output: &mut terminal.output,
+            width,
+            height,
+            color: terminal.color,
+        };
+        (|| -> io::Result<()> {
+            if screen.color {
+                queue!(screen.output, SetAttribute(Attribute::Reset))?;
+            }
+            queue!(screen.output, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
+            screen.row(0, &[(" Sync conflict ", Ink::Selected)])?;
+            screen.row(
+                1,
+                &[(conflict.path.to_string_lossy().as_ref(), Ink::Accent)],
+            )?;
+            screen.row(2, &[(&conflict.description, Ink::Muted)])?;
+            screen.row(
+                3,
+                &[
+                    ("O", Ink::Key),
+                    (" ours/local   ", Ink::Muted),
+                    ("T", Ink::Key),
+                    (" theirs/remote   ", Ink::Muted),
+                    ("Esc", Ink::Key),
+                    (" cancel sync", Ink::Muted),
+                ],
+            )?;
+            screen.row(
+                4,
+                &[(
+                    "↑/↓ PgUp/PgDn scroll · ←/→ pan · choices affect this conflict only",
+                    Ink::Muted,
+                )],
+            )?;
+            for (index, (text, ink)) in rows.clone().skip(offset).take(slots).enumerate() {
+                screen.row(5 + index as u16, &[(from_column(text, column), ink)])?;
+            }
+            screen.row(
+                height.saturating_sub(1),
+                &[(
+                    &format!(
+                        "Lines {}–{} / {} · column {}",
+                        offset + 1,
+                        (offset + slots).min(row_count),
+                        row_count,
+                        column + 1
+                    ),
+                    Ink::Muted,
+                )],
+            )?;
+            screen.output.flush()
+        })()
+        .map_err(terminal_error)?;
+        if let Event::Key(key) = event::read().map_err(terminal_error)? {
+            if key.kind == KeyEventKind::Release {
+                continue;
+            }
+            if key.code == KeyCode::Esc
+                || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'))
+            {
+                return Err(Error::usage(
+                    "sync_cancelled",
+                    "Sync cancelled; any local sync commit is retained",
+                ));
+            }
+            if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('o' | 'O') => return Ok(ConflictChoice::Ours),
+                KeyCode::Char('t' | 'T') => return Ok(ConflictChoice::Theirs),
+                KeyCode::Up => offset = offset.saturating_sub(1),
+                KeyCode::Down => offset = offset.saturating_add(1),
+                KeyCode::PageUp => offset = offset.saturating_sub(slots),
+                KeyCode::PageDown => offset = offset.saturating_add(slots),
+                KeyCode::Home => {
+                    offset = 0;
+                    column = 0;
+                }
+                KeyCode::End => offset = row_count.saturating_sub(slots),
+                KeyCode::Left => column = column.saturating_sub(8),
+                KeyCode::Right => column = column.saturating_add(8),
+                _ => {}
+            }
+        }
+    }
 }
 
 fn clipped(value: &str, width: usize) -> String {
@@ -882,6 +1091,37 @@ fn draw(
                 ],
             )?;
         }
+        Ok(ParsedInput::Sync(choice)) => {
+            screen.row(
+                6,
+                &[
+                    ("Sync Git branch", Ink::Accent),
+                    ("  commit store · pull/merge · push", Ink::Muted),
+                ],
+            )?;
+            screen.row(
+                7,
+                &[(
+                    match choice {
+                        None => "Conflicts: choose ours/local or theirs/remote for each conflict",
+                        Some(ConflictChoice::Ours) => {
+                            "Conflicts: prefer ours/local; preserve non-conflicting remote edits"
+                        }
+                        Some(ConflictChoice::Theirs) => {
+                            "Conflicts: prefer theirs/remote; preserve non-conflicting local edits"
+                        }
+                    },
+                    Ink::Date,
+                )],
+            )?;
+            screen.row(
+                8,
+                &[(
+                    "Stop other writers/sync first; containing branch is synchronized.",
+                    Ink::Muted,
+                )],
+            )?;
+        }
         Err(error) if !editor.line.trim().is_empty() => {
             screen.row(6, &[("Preview  ", Ink::Date), (error.message(), Ink::Date)])?
         }
@@ -905,6 +1145,10 @@ fn draw(
                     ("@tag ", Ink::Tag),
                     ("!open", Ink::Accent),
                 ],
+            )?;
+            screen.row(
+                8,
+                &[("Or   ", Ink::Muted), ("/sync [ours|theirs]", Ink::Accent)],
             )?;
         }
     }
@@ -1054,6 +1298,27 @@ mod tests {
             let mut editor = Editor::default();
             editor.insert(line).unwrap();
             assert!(catalog.suggestions(&editor).is_empty(), "{line}");
+        }
+    }
+
+    #[test]
+    fn sync_completion_replaces_options_without_touching_surrounding_text() {
+        let catalog = Catalog::default();
+        let mut editor = Editor::default();
+        editor.insert("  /SY").unwrap();
+        assert_eq!(catalog.suggestions(&editor), ["/sync"]);
+        editor.complete("/sync").unwrap();
+        assert_eq!(catalog.suggestions(&editor), ["ours", "theirs"]);
+        editor.insert("THx").unwrap();
+        editor.cursor -= 1;
+        assert_eq!(catalog.suggestions(&editor), ["theirs"]);
+        editor.complete("theirs").unwrap();
+        assert_eq!(editor.line, "  /sync theirs ");
+        assert!(catalog.suggestions(&editor).is_empty());
+        for line in ["Discuss /sync o", "/syncing o"] {
+            let mut editor = Editor::default();
+            editor.insert(line).unwrap();
+            assert!(catalog.suggestions(&editor).is_empty());
         }
     }
 

@@ -1295,7 +1295,7 @@ fn capabilities_bypasses_invalid_explicit_and_environment_roots() {
             serde_json::json!({
                 "version": 1,
                 "store_schema_versions": [1, 2],
-                "features": ["subtasks", "task_candidates", "store_upgrade", "attachments", "task_urls", "task_due_times", "task_input"],
+                "features": ["subtasks", "task_candidates", "store_upgrade", "attachments", "task_urls", "task_due_times", "task_input", "git_sync"],
             })
         );
     }

@@ -16,9 +16,9 @@ CLI executable name: `otodo`
 
 Build a local-first Rust CLI for managing structured todo notes stored inside a folder of an existing Obsidian vault. The entire vault may be a Git repository containing unrelated notes, daily notes, attachments, and Obsidian configuration. The todo system owns only its configured folder.
 
-The CLI must work when a client has a sparse checkout containing only the todo folder. It must not require the rest of the Obsidian vault, GitHub, an Obsidian installation, or network access.
+Ordinary CLI operations must work when a client has a sparse checkout containing only the todo folder. They must not require the rest of the Obsidian vault, Git, GitHub, an Obsidian installation, or network access.
 
-Git synchronization is deliberately external. On the primary desktop, the Obsidian Git plugin may commit, pull, merge or rebase, and push the whole vault. Other machines and agents may use ordinary Git, sparse checkout, branches, or pull requests. The CLI manages files and domain semantics only.
+Git synchronization may remain external: Obsidian Git and other clients may synchronize the whole vault. Explicit user-invoked `/sync [ours|theirs]` in `otodo input` is the sole CLI exception: it may use the containing Git worktree, Git metadata, and configured upstream under section 18.1. It does not change the store schema or make Git required application state. There is no automatic or background synchronization.
 
 The resulting files must remain useful without the CLI:
 
@@ -48,12 +48,13 @@ The implementation MUST:
 13. Detect concurrent changes instead of silently overwriting them.
 14. Perform single-file mutations using atomic replacement.
 15. Work when only the todo folder is materialized by Git sparse checkout.
-16. Never invoke Git or modify files outside the todo store during normal operation.
+16. Never invoke Git or modify files outside the todo store during ordinary operations, including discovery, initialization, and validation; only explicit `/sync` has the section 18.1 synchronization exception.
 17. Expose the domain and storage implementation as a Rust library reusable by a future desktop application.
 18. Support optional, identity-based parent relationships in v2 stores, with independent task lifecycle and explicit repair of broken relationships.
 19. Support legacy-v1 flat stores without reinterpreting their unknown properties, and provide a deliberate, fail-closed upgrade to v2.
 20. Provide rootless capability discovery and bounded compact task-candidate queries.
 21. Import and manage file attachments through ordinary Markdown body links in both store versions, without a schema upgrade or attachment frontmatter field.
+22. Offer explicit `/sync [ours|theirs]` with store-only automatic commits, whole-branch upstream synchronization, and visible conflict resolution without discarding nonconflicting text edits.
 
 ## 3. Non-goals
 
@@ -61,7 +62,7 @@ Neither supported store version introduces:
 
 - A hosted backend, daemon, web service, or account system.
 - GitHub Issues or GitHub Projects synchronization.
-- Automatic `git add`, commit, pull, rebase, merge, or push.
+- Git automation except the explicit `/sync` flow in section 18.1; no automatic/background synchronization, rebase, or repository initialization.
 - Branch management or pull-request creation.
 - A general-purpose TUI task manager or graphical desktop application. The focused input TUI in section 28 is authorized.
 - Notifications, alarms, or a background scheduler.
@@ -69,7 +70,7 @@ Neither supported store version introduces:
 - Assignments, priorities, dependencies, comments, or attachments as frontmatter domain fields. File attachments and body links are explicitly authorized by section 27 below. Subtasks are authorized only by the v2 parent contract below; v1 remains flat.
 - Full historical occurrence tracking for recurring tasks.
 - Arbitrary RFC 5545 recurrence features beyond the subset defined here.
-- Semantic three-way merging of conflicting task files.
+- Domain-semantic three-way merging of task metadata. Explicit `/sync` uses textual conflict hunks or file-level choices, not inferred domain repairs.
 - Mutable folder placement based on state, project, tags, or due date.
 - A local SQLite index or any other required derived database.
 - Project slug renaming. A project display name can change; its slug is a stable identifier.
@@ -102,7 +103,7 @@ MyVault/
 
 `MyVault/Todo` is the store root. `MyVault` is the vault and Git worktree root, but neither is required during normal CLI operation.
 
-Except for explicitly reading a user-supplied `--body-file` or attachment import source, the CLI MUST NOT read, create, modify, rename, or delete any path outside the store root. It MUST NOT modify `.obsidian/`, `.git/`, vault notes, or repository-level configuration.
+Except for explicitly reading a user-supplied `--body-file` or attachment import source, ordinary operations MUST NOT read, create, modify, rename, or delete any path outside the store root. They MUST NOT modify `.obsidian/`, `.git/`, vault notes, or repository-level configuration. Only explicit `/sync` may inspect and update the containing Git worktree and Git metadata and contact its configured upstream; its automatic staging/commit is restricted to the selected store, while branch synchronization may update already committed unrelated paths. `/sync` MUST NOT modify Git configuration.
 
 ### 4.2 Canonical state
 
@@ -114,7 +115,7 @@ The canonical current state consists only of:
 - Markdown task records under the configured tasks directory
 - Ordinary attachment files under fixed `Attachments/`, associated only by task body links
 
-Git history is an audit and synchronization mechanism, not required application state. The Obsidian Git plugin is free to group unrelated note and task changes in one commit. Therefore application behavior MUST NOT depend on commit boundaries, commit messages, author dates, branches, tags, or a reachable `.git` directory.
+Git history is an audit and synchronization mechanism, not required application state. The Obsidian Git plugin is free to group unrelated note and task changes in one commit. Ordinary application behavior MUST NOT depend on commit boundaries, commit messages, author dates, branches, tags, or a reachable `.git` directory. Explicit `/sync` uses the existing branch and upstream solely for synchronization.
 
 ### 4.3 Stable placement
 
@@ -1035,17 +1036,28 @@ An integration test MUST copy only the initialized store folder to a temporary d
 
 Sparse checkout is a convenience boundary, not security isolation. Repository credentials may still permit access to the rest of the vault. This must be documented in CLI help for initialization or integration guidance, but the CLI does not manage credentials.
 
-## 18. External synchronization and concurrency
+## 18. Synchronization and concurrency
 
 ### 18.1 Sync ownership
 
-The CLI MUST NOT run Git commands. Obsidian Git or another external tool may commit, pull, merge or rebase, and push independently during ordinary operations. The explicit schema upgrade/resume is an exception requiring quiescence under section 7.3.
+Only an explicit `/sync [ours|theirs]` input command MAY run Git. Ordinary operations, initialization, discovery, and validation MUST remain offline and Git-free. External tools may synchronize independently during ordinary operations; explicit schema upgrade/resume and `/sync` require users to quiesce all other writers and synchronization, including Obsidian Git. Advisory store locks cannot enforce this prerequisite.
 
 The CLI MUST tolerate commits that mix todo files with unrelated vault files. No functional behavior may require one operation per Git commit.
 
+The explicit synchronization contract is:
+
+1. Require an installed Git executable, an existing containing worktree, an attached non-unborn branch, and its configured upstream. Author identity and noninteractive authentication MUST already be configured when needed. Refuse pre-existing merge/rebase/cherry-pick/revert operations, unresolved conflicts, and any staged or unstaged tracked changes or untracked paths outside the selected store before mutation.
+2. Fetch the configured upstream, automatically stage and commit local changes only beneath the selected store if any, then merge the fetched upstream into the current branch. Fetch/merge/push synchronize the entire containing branch, including already committed unrelated vault paths; selecting a store is not a branch-content filter.
+3. Preserve nonconflicting text edits in every mode. `ours` means local, `theirs` means remote, and an explicit policy selects only conflicting hunks, not an entire text file or branch. Without a policy, ask the TUI resolver separately for each textual conflict hunk. Binary, deletion, and file-type conflicts use a whole-file choice; an absent side means deletion. File-mode conflicts choose the corresponding mode. Submodule or file/directory collisions that cannot be safely resolved at a single path MUST refuse with an actionable error and abort this invocation's merge rather than recursively delete data or publish synthetic conflict paths. No mode may silently infer domain repairs.
+4. Validate the merged store before pushing. Push explicitly to the configured upstream branch without force. Reload the store and input suggestion catalog after synchronization before further store operations; do not reuse stale configuration or records. A reload or catalog failure MUST NOT replace the original synchronization error. If the interactive session cannot reload valid state, it MUST exit rather than continue with stale metadata. Plain input MUST stop on the original synchronization failure before attempting further operations.
+5. Invoke Git through argument arrays, never shell interpolation. Capture subprocess output without leaking Git stdout, disable Git hooks and credential/editor prompts, and do not consume task stdin for Git or conflict prompts. SSH uses batch mode and ordinary SSH configuration/agents, not inherited `GIT_SSH_COMMAND` overrides. Never initialize repositories, force-push, stash, reset-hard, rebase, or modify Git configuration.
+6. Never hold store locks across Git changes or conflict prompts. Synchronization is not an atomic store transaction. On resolver cancellation/error, abort ONLY an active merge begun by this invocation, preserving any automatic local commit. Other failures may leave completed local steps; a failed push MUST retain local commits and merge results. Do not discard work to manufacture rollback or retry automatically.
+
+Section 28 specifies the input and resolver interaction; section 20 specifies success/error envelopes. This feature applies to both supported store schemas without new schema fields, dependencies in Rust, or persistent application metadata.
+
 ### 18.2 Advisory process lock
 
-Mutating CLI commands MUST acquire an advisory exclusive lock on the open `.todo/config.toml` file for the duration of the operation. Read-only scans SHOULD acquire a shared lock. This coordinates cooperating `otodo` processes without creating a lock file that Obsidian Git could commit.
+Ordinary mutating CLI commands MUST acquire an advisory exclusive lock on the open `.todo/config.toml` file for the duration of the operation. Read-only scans SHOULD acquire a shared lock. This coordinates cooperating `otodo` processes without creating a lock file that Obsidian Git could commit. Explicit `/sync` instead obeys the quiescence and lock-release boundary in section 18.1.
 
 Other editors and Git do not honor this lock, so it is not sufficient by itself.
 
@@ -1053,7 +1065,7 @@ After acquiring an operation lock, new clients MUST recheck on-disk config and s
 
 ### 18.3 Optimistic concurrency
 
-Before mutating an existing file, the CLI MUST:
+Before an ordinary mutation of an existing file, the CLI MUST:
 
 1. Read the complete source bytes and file metadata.
 2. Compute a cryptographic content hash.
@@ -1070,7 +1082,7 @@ These checks provide optimistic race detection, not a serializable filesystem sn
 
 ### 18.4 Atomic file replacement
 
-For a successful existing-file mutation:
+For a successful ordinary existing-file mutation (Git worktree updates during `/sync` follow section 18.1 instead):
 
 1. Create a uniquely named temporary file in the target's directory with create-new semantics.
 2. Apply restrictive initial permissions and preserve the target's relevant permissions.
@@ -1087,7 +1099,7 @@ V1 officially supports Linux and macOS. The implementation SHOULD remain portabl
 
 ### 18.5 Pulled conflicts
 
-A Git pull may leave conflict markers. The CLI must report those records as invalid and refuse normal mutation. V1 does not implement a merge resolver.
+A Git pull may leave conflict markers. The CLI must report those records as invalid and refuse normal mutation. `/sync` MUST refuse pre-existing conflicts; its resolver handles only conflicts from the merge begun by that invocation in either supported store version.
 
 Different tasks normally merge as different files. Two writers editing the same task remain an explicit Git/file conflict; no hidden last-writer policy is allowed.
 
@@ -1216,12 +1228,14 @@ List output:
 `otodo --format json capabilities` succeeds without a root, config, environment-selected store, or filesystem discovery and returns:
 
 ```json
-{"version":1,"store_schema_versions":[1,2],"features":["subtasks","task_candidates","store_upgrade","attachments","task_urls"]}
+{"version":1,"store_schema_versions":[1,2],"features":["subtasks","task_candidates","store_upgrade","attachments","task_urls","task_input","task_due_times","git_sync"]}
 ```
 
 This describes the executable, not whether the user's current store enables parent operations. Unsupported stores and legacy-v1 parent operations still fail explicitly; callers MUST NOT silently retry a rejected child creation as a root.
 
 `upgrade --to 2` JSON success is `{"version":1,"upgrade":{"from":1,"to":2,"dry_run":false,"status":"upgraded"}}`. `status` is `planned` for a valid dry-run, `resumed` for a completed intermediate-pair resume, or `already_current` for a coherent v2 no-op (`from:2`). A dry-run uses `dry_run:true`; failures use the normal error envelope and no success object.
+
+`/sync` JSON success is `{"version":1,"sync":{"branch":"main","upstream":"origin/main","committed":true,"conflicts_resolved":0}}`. `committed` indicates whether this invocation made an automatic local store commit; `conflicts_resolved` counts chosen textual hunks and whole-file conflicts. Branch/upstream names reflect the existing Git configuration. Failure emits no sync success envelope, even when completed local work is retained.
 
 Errors in JSON mode are a single JSON object on stderr:
 
@@ -1239,7 +1253,7 @@ Errors in JSON mode are a single JSON object on stderr:
 
 The stable scripting contract consists of documented JSON fields, error codes, and exit codes. Human wording and table formatting may evolve.
 
-Parent/version error codes:
+Stable feature error codes:
 
 | Code | Exit | Meaning |
 |---|---:|---|
@@ -1252,6 +1266,12 @@ Parent/version error codes:
 | `invalid_input_date` | 5 | The selected `--today` has no local midnight for input capture. |
 | `unknown_input_command` | 2 | A leading slash token is not a supported input command; includes `field: input`. |
 | `invalid_input_filter` | 2 | A `/list` argument is not a `#project`, `@tag`, or nonempty `!state` token; includes `field: input`. Project/tag validation and unknown configured states retain their existing error codes. |
+| `invalid_sync_option` | 2 | `/sync` has arguments other than zero arguments or one exact `ours`/`theirs` token; includes `field: input`. |
+| `sync_conflict` | 2 | Plain input/JSON cannot resolve a conflict without an explicit policy; stop input after safely aborting this invocation's active merge. |
+| `sync_cancelled` | 2 | The TUI resolver was cancelled with Escape/Ctrl-C; safely abort this invocation's active merge. |
+| `sync_precondition` | 5 | Synchronization preflight refused the repository state or prerequisites. |
+| `sync_unavailable` | 7 | Git executable is unavailable. |
+| `sync_failed` | 8 | Git subprocess or synchronization I/O failed; completed local work may remain. |
 | `missing_parent_reference` | 5 | A stored, well-typed parent ID has no physical task in this store. |
 | `self_parent_reference` | 5 | Canonical child and parent IDs are equal. |
 | `parent_cycle` | 5 | The task participates in a cycle of two or more nodes. |
@@ -1269,8 +1289,8 @@ Parent errors SHOULD include child `path` and `field: parent` when available. Ex
 | 3 | Store, task, or project not found |
 | 4 | Ambiguous identifier or ambiguous store discovery |
 | 5 | Validation or domain-invariant failure |
-| 6 | Concurrent modification or unresolved conflict |
-| 7 | Unsupported schema or recurrence feature |
+| 6 | Concurrent modification or unresolved stored conflict; input sync resolution errors use 2 as specified above |
+| 7 | Unsupported schema/recurrence feature or unavailable optional Git executable |
 | 8 | Filesystem or I/O failure |
 
 No expected user-data error should cause a panic or Rust backtrace by default.
@@ -1309,6 +1329,7 @@ Exact module splits may change when cohesion demands it, but these boundaries ar
 - **Store:** Contained path resolution, scanning, locks, hashes, and atomic writes.
 - **Validation:** Record and cross-record invariants.
 - **Commands:** Application operations over the library.
+- **Sync:** Explicit Git subprocess orchestration and typed conflict callbacks, separate from ordinary contained store operations and terminal presentation.
 - **CLI/output:** Argument parsing and human/JSON presentation only.
 
 `src/lib.rs` MUST expose enough typed API for a future desktop application to:
@@ -1330,8 +1351,8 @@ Engineering requirements:
 - Structured error enums with stable application error codes.
 - No panic on malformed config, YAML, UTF-8, dates, paths, or recurrence input.
 - Avoid unnecessary copies of bodies and complete file buffers where practical, but correctness and exact body preservation take priority.
-- No network dependency at runtime.
-- No Git library or Git executable invocation.
+- No network requirement for ordinary operations; only explicit `/sync` may contact the configured upstream through Git.
+- No Git library dependency. Git executable invocation is restricted to explicit `/sync`; no new Rust dependency is required.
 - All dependencies must have a clear purpose and compatible license.
 - Use an actively maintained argument parser with generated shell help; `clap` derive is acceptable.
 - Use typed date values rather than string arithmetic.
@@ -1349,9 +1370,9 @@ Requirements:
 - Bound parser recursion and reject YAML constructs capable of alias expansion abuse.
 - Produce useful errors for oversized or pathological records rather than exhausting memory where the selected parser permits limits.
 - Never construct shell commands from task data.
-- Body-file and attachment-source reading are explicitly user-requested and may access outside the store; no other operation may do so.
-- Do not invoke `$EDITOR`, hooks, plugins, or arbitrary commands in v1.
-- Do not expose unrelated vault files in JSON output or diagnostics.
+- Body-file and attachment-source reading may access explicitly selected external files. Only explicit `/sync` additionally accesses the containing Git worktree, metadata, and configured upstream under section 18.1.
+- Do not invoke `$EDITOR`, hooks, plugins, or arbitrary commands in either store version. Disable Git hooks and credential/editor prompts during explicit synchronization.
+- Do not expose unrelated vault files in ordinary JSON output or diagnostics. Explicit `/sync` may identify whole-branch conflicts and show their local/remote previews.
 - Resolve project links only against the configured in-store project directory.
 - Refuse managed symlink directories and symlink task/project files for mutation.
 - Preserve existing file permissions during replacement.
@@ -1409,7 +1430,7 @@ Use isolated temporary directories. Cover at least:
 16. Delete only a full-ID-selected task with `--yes`.
 17. Run normal operations with no Git executable available.
 18. Copy only the store folder into a directory with no vault, `.obsidian`, or `.git`; run all normal commands successfully with `--root`.
-19. Verify every command leaves unrelated vault files byte-identical.
+19. Verify every ordinary command leaves unrelated vault files byte-identical; `/sync` may change them only through the authorized whole-branch flow.
 20. Verify failed ordinary mutations leave no committed replacement and no persistent temporary file; explicit upgrade interruption follows section 7.3's fail-closed partial-state contract.
 21. Add/reparent/detach with full IDs under nested and terminal parents; verify independent metadata, stable paths, and unrelated task bytes.
 22. Refuse deletion with any direct child, including terminal children; allow explicit repair and later leaf deletion.
@@ -1418,6 +1439,7 @@ Use isolated temporary directories. Cover at least:
 25. Detect parent/ancestor changes, newly added children, and stale config/schema generations at the operation's snapshot boundaries.
 26. Exercise explicit v1/v2 support, no auto-upgrade, arbitrary v1 parent extras, collision refusal, dry-run, each resumable cutover state, unsupported/reversed pairs, unchanged record bytes, and custom Base preservation. Failed ordinary mutations remain no-write; an interrupted upgrade may leave only the documented fail-closed pair.
 27. Prove rootless capabilities ignores unusable store discovery inputs and unsupported versions still fail before mutation.
+28. Exercise `/sync` against isolated local remotes: store-only automatic commits, whole-branch fetch/merge/push, nonconflicting text preservation under each policy, per-hunk and file fallback choices, dirty-outside/pre-existing-operation refusal, resolver cancellation/noninteractive failure, merged-store validation, and retained local work after failed push.
 
 ### 23.3 CLI contract tests
 
@@ -1510,6 +1532,10 @@ Externally introduce an orphan, a self edge, and a cycle in otherwise readable r
 
 A new client edits a legacy v1 task containing arbitrary `parent` metadata without interpreting or losing it. Parent feature operations fail. After users explicitly handle every parent-key collision and quiesce writers, dry-run makes no changes, upgrade changes only config/schema, and a stopped intermediate cutover rejects normal writes until explicit resume completes. Every existing task/project and customized Base stays byte-identical. Newly launched old clients reject the completed v2 format; new clients reject stale generations. No claim is made that old already-running writers are safe without quiescence.
 
+### Scenario N: Explicit upstream synchronization
+
+With other writers and synchronization stopped, invoke `/sync` in a store beneath an existing clean-outside Git worktree with an attached branch and configured local test upstream. Only selected-store local changes enter the automatic commit, while committed unrelated branch changes are also merged/pushed. Both policies retain nonconflicting edits; interactive resolution chooses each conflict hunk with whole-file fallback where needed. Invalid merged stores are never pushed. Plain input without a policy stops on conflict without consuming the next task line; cancellation aborts only this invocation's active merge and retains its local commit. A rejected push retains local results. Ordinary operations still work with neither Git nor network.
+
 ## 25. Recommended implementation order
 
 The existing v1 implementation is the baseline; preserve its unrelated behavior rather than recreating the package. Implement the extension in dependency order:
@@ -1534,15 +1560,15 @@ The v2 extension with explicit legacy-v1 support is done when:
 - `cargo fmt --check` passes.
 - `cargo clippy --all-targets --all-features -- -D warnings` passes.
 - `cargo test --all-targets --all-features` passes.
-- The CLI demonstrably operates on an initialized store with no Git executable, no `.git`, no `.obsidian`, and no network.
-- No normal operation changes files outside the selected store; only explicitly supplied body files and attachment import sources may be read externally.
+- Ordinary commands demonstrably operate on an initialized store with no Git executable, no `.git`, no `.obsidian`, and no network.
+- No ordinary operation changes files outside the selected store; only explicitly supplied body files and attachment import sources may be read externally. Explicit `/sync` satisfies section 18.1's exceptional scope and conflict/failure guarantees.
 - Obsidian-created unknown properties survive known-field mutations.
 - Malformed or conflicted input produces an actionable error and no data loss.
 - JSON output and exit codes match this specification.
 - Legacy flat stores remain writable without interpreting their parent extras; v2 activation is explicit, fail-closed/resumable, and quiesced.
 - Subtask mutations, independent lifecycle/recurrence, graph repair, candidate discovery, and snapshot-race behavior satisfy the shared contract and conformance corpus.
 
-Any implementation that silently loses unknown properties, overwrites a concurrent edit, depends on Git history, mutates unrelated vault content, or accepts unsupported recurrence rules as if valid is incorrect.
+Any implementation that silently loses unknown properties, overwrites a detected concurrent edit, makes ordinary domain behavior depend on Git history, mutates unrelated vault content outside explicit `/sync` branch synchronization, or accepts unsupported recurrence rules as if valid is incorrect.
 
 ## 27. Ordinary file attachments (store schemas 1 and 2)
 
@@ -1569,7 +1595,7 @@ Attachment add/link/list/unlink results contain `version: 1` and an `attachments
 
 Attachment publications MUST use existing store locks, generation checks, and exclusive-create writes. Files publish before the task, and the task publishes once with its source snapshot and existing relationship checks. Failure before task publication MUST NOT create a task. Files may remain unreferenced after interruption or a later failed task write; no multi-file filesystem atomicity is promised. `attachment_source_invalid`, `attachment_too_large`, `unsafe_attachment_path`, and `attachments_disabled` from new-task imports guarantee that task publication did not occur. Clients MUST treat I/O and unrecognized errors as uncertain and MUST NOT blindly retry them.
 
-The explicit v1→v2 upgrader MUST preserve attachment bytes and task links through dry-run, upgrade, resume, and already-current no-op. Targets other than 2, including 3, remain unsupported. CLI Git operations remain forbidden. Desktop synchronization and sparse checkouts MUST include `Attachments/`. Documentation MUST explain Obsidian attachment-location settings without changing vault-wide preferences. File deletion, orphan cleanup, camera capture, and scanning are outside this release.
+The explicit v1→v2 upgrader MUST preserve attachment bytes and task links through dry-run, upgrade, resume, and already-current no-op. Targets other than 2, including 3, remain unsupported. Git operations remain forbidden except for explicit `/sync` under section 18.1. Synchronization and sparse checkouts MUST include `Attachments/`. Documentation MUST explain Obsidian attachment-location settings without changing vault-wide preferences. File deletion, orphan cleanup, camera capture, and scanning are outside this release.
 
 ## 28. One-line task and command input
 
@@ -1578,13 +1604,15 @@ otodo input
 otodo --format json input
 ```
 
-Human input with terminal stdin/stderr and a non-dumb `TERM` MUST open a focused terminal UI with an editable line, parsed preview, completion suggestions, list results, and save/error status. Other input, including JSON mode, MUST read stdin as one task or slash command per line without terminal control sequences. No editor, shell, subprocess, Git command, network request, history file, or hidden database may be invoked/created by this mode.
+Human input with terminal stdin/stderr and a non-dumb `TERM` MUST open a focused terminal UI with an editable line, parsed preview, completion suggestions, list results, and save/error status. Other input, including JSON mode, MUST read stdin as one task or slash command per line without terminal control sequences. No editor, shell, history file, or hidden database may be invoked/created. Subprocesses and network access are prohibited except for the explicit `/sync` Git flow in section 18.1.
 
 The TUI MUST use the terminal's ANSI palette and default background rather than hard-coded RGB colors or desktop-theme files. `--color never` MUST disable SGR styling; auto mode MUST also disable it when `NO_COLOR` is nonempty. `--color always` overrides `NO_COLOR` only for the human TUI; plain stdin and JSON MUST remain free of terminal controls. Selection and save/error meaning MUST remain explicit without color. Styling MUST NOT affect Unicode cell clipping or permit control characters from store content, and MUST reset before leaving the alternate screen.
 
 For task capture, `#slug` and `@tag` MUST be recognized only as whole whitespace-delimited metadata tokens and removed from the name. Projects MUST already exist, using existing slug/reference validation; tags MAY be new and MUST retain case, Unicode and nested `/` spelling. Repeated exact metadata values MUST be deduplicated. Name case and Unicode MUST remain unchanged, with redundant whitespace collapsed and existing name validation applied after removing metadata/date phrases. Default state, root-parent behavior, URL validation, locking, generation checks and contained create-new publication MUST use the normal task-creation operation for every task line.
 
-A first non-whitespace token beginning with `/` MUST dispatch a command, never create a task. The initial supported command is the exact lowercase token `/list`, optionally followed by whitespace-delimited `#project`, `@tag`, and `!state` filters. `/list` MUST include all tasks, including terminal states, unless excluded by explicit filters. Projects and tags combine with AND; repeated states form an OR set. Exact duplicates MUST be deduplicated. Project/tag spelling and configured state IDs MUST use existing list validation; unknown tags may yield no matches. `/list #personal @chores !open` selects open chores in personal. Commands MUST NOT parse dates or treat bare text as a name/query. Unknown slash commands and malformed arguments MUST fail without mutation; slashes and `!state` inside ordinary task names remain literal text. Listing MUST use the complete-store validation, locking, and deterministic sort of section 13.2 in both supported store versions, without changing ordinary `otodo list` defaults.
+A first non-whitespace token beginning with `/` MUST dispatch a command, never create a task. Supported commands are the exact lowercase tokens `/list` and `/sync`. `/list` optionally accepts whitespace-delimited `#project`, `@tag`, and `!state` filters. `/list` MUST include all tasks, including terminal states, unless excluded by explicit filters. Projects and tags combine with AND; repeated states form an OR set. Exact duplicates MUST be deduplicated. Project/tag spelling and configured state IDs MUST use existing list validation; unknown tags may yield no matches. `/list #personal @chores !open` selects open chores in personal. Commands MUST NOT parse dates or treat bare text as a name/query. Unknown slash commands and malformed arguments MUST fail without mutation; slashes and `!state` inside ordinary task names remain literal text. Listing MUST use the complete-store validation, locking, and deterministic sort of section 13.2 in both supported store versions, without changing ordinary `otodo list` defaults.
+
+`/sync` accepts no arguments or exactly one lowercase `ours` or `theirs` token; other arguments fail with `invalid_sync_option` (usage, `field: input`). It invokes section 18.1, without incrementing the created-task count. `ours` selects local conflict content and `theirs` selects remote conflict content while retaining all nonconflicting text edits. Without a policy, the TUI MUST show the path, conflict description, and both previews with scrolling, accept `o`/`t` per textual hunk or whole-file fallback, and cancel on Escape/Ctrl-C with `sync_cancelled`. Plain stdin and JSON cannot answer prompts: an unresolved conflict without a policy MUST produce `sync_conflict` and stop input after safely aborting this invocation's merge. Conflict handling MUST NOT consume subsequent task lines.
 
 Natural date recognition MUST be case-insensitive and support:
 
@@ -1596,8 +1624,10 @@ Natural date recognition MUST be case-insensitive and support:
 
 The last date and last time MUST win independently. Only contributing phrases and adjacent separator punctuation/whitespace are removed; superseded phrases remain name text. Invalid/unsupported phrases, including ISO date literals, MUST remain name text rather than being partially consumed. Resolved calendar overflow MUST fail. Dates/times embedded in metadata, URLs, emails, paths and identifiers MUST NOT be consumed. The first valid explicit absolute HTTP(S) URL MUST also populate `url`, preserving its spelling and retaining the URL in the title. Sentence punctuation and unbalanced closing delimiters are excluded from the captured field; balanced URL punctuation, query strings and fragments are retained. Invalid candidates remain name text; no bare-domain guessing occurs.
 
-Suggestions MUST use existing project slugs and tags across all tasks, including terminal tasks, with case-insensitive prefix matching and original spelling on acceptance. They MUST also complete `/list` in the first token and configured `!state` IDs in `/list` arguments. Up/Down selects and Tab accepts the whole token at the cursor without corrupting surrounding Unicode text. New saved tags MUST be immediately available; F5 explicitly refreshes the suggestion catalog from disk. Store locks MUST NOT remain held while waiting for keyboard input. Enter submits exactly the current line; failed validation retains the draft for correction. Successful `/list` commands MUST display results without incrementing the created count, and PgUp/PgDn MUST allow every result row to be reached. Successful submissions advance to the next queued draft or clear the line; list results remain visible when suggestions are not displayed until replaced by another successful command or task save. Multiline paste MUST queue drafts for individual Enter confirmation. Esc/Ctrl-C exits and discards unsaved drafts; Ctrl-D exits when all drafts are empty. Successful saves remain committed. Terminal raw mode, bracketed paste, cursor visibility and alternate-screen state MUST be restored on normal/error exits. I/O, concurrency and unsupported-generation errors MUST exit rather than invite an uncertain creation retry.
+Suggestions MUST use existing project slugs and tags across all tasks, including terminal tasks, with case-insensitive prefix matching and original spelling on acceptance. They MUST also complete `/list` and `/sync` in the first token, configured `!state` IDs in `/list` arguments, and `ours`/`theirs` as the first `/sync` argument. Up/Down selects and Tab accepts the whole token at the cursor without corrupting surrounding Unicode text. New saved tags MUST be immediately available; F5 explicitly refreshes the suggestion catalog from disk. Store locks MUST NOT remain held while waiting for keyboard input. Enter submits exactly the current line; failed validation retains the draft for correction. Successful `/list` commands MUST display results without incrementing the created count, and PgUp/PgDn MUST allow every result row to be reached. Successful submissions advance to the next queued draft or clear the line; list results remain visible when suggestions are not displayed until replaced by another successful command or task save. Multiline paste MUST queue drafts for individual Enter confirmation. Esc/Ctrl-C exits and discards unsaved drafts; Ctrl-D exits when all drafts are empty. Successful saves remain committed. Terminal raw mode, bracketed paste, cursor visibility and alternate-screen state MUST be restored on normal/error exits. I/O, concurrency and unsupported-generation errors MUST exit rather than invite an uncertain creation retry.
 
 Plain stdin MUST accept UTF-8 LF/CRLF lines and a final unterminated line, skip blank lines, and bound each raw line to 16 KiB. TUI input and queued paste together are bounded to 16 KiB. Pasted tabs MUST normalize to spaces and CRLF/CR to line breaks; other control characters MUST be rejected without losing the draft. Plain input MUST stop at the first failure; earlier saves remain durable and later lines are not processed. Parser/metadata errors MUST identify the stdin line in structured diagnostics. Each task save goes to stdout as an ID/name line or a version-1 `task` JSON envelope. Each `/list` success MUST use the ordinary human list output or a version-1 `tasks` JSON envelope, including an empty array when no tasks match. JSON mode is JSON Lines, one envelope per submitted nonblank line, with no summary document or progress noise. Human TUI exits with a created-task count on stdout; its interactive surface uses stderr.
 
-Rootless executable capabilities MUST include `task_input` and `task_due_times`. Tests MUST defend requested examples, URL/title preservation, metadata and date/time boundaries, precedence, local/DST arithmetic, Unicode completion/editing, rejected-draft preservation, partial-stream failure, both store versions, time lifecycle/clear invariants, and unchanged schema/configuration bytes. Slash-command coverage MUST defend combined filters, terminal-state inclusion, read-only behavior, unknown-command/filter failures, mixed capture/list streams, and complete-store validation before filtered results.
+Each `/sync` success MUST emit a human synchronization summary or the version-1 `sync` envelope in section 20.2. Git output MUST remain captured rather than become extra stdout or JSON Lines. No sync success envelope is emitted on cancellation/failure; earlier saved tasks and completed local commits remain durable under section 18.1.
+
+Rootless executable capabilities MUST include `task_input`, `task_due_times`, and `git_sync`. Tests MUST defend requested examples, URL/title preservation, metadata and date/time boundaries, precedence, local/DST arithmetic, Unicode completion/editing, rejected-draft preservation, partial-stream failure, both store versions, time lifecycle/clear invariants, and unchanged schema/configuration bytes. Slash-command coverage MUST defend combined list filters, terminal-state inclusion, read-only listing, unknown-command/filter failures, mixed capture/list/sync streams, complete-store validation before filtered results, and the synchronization guarantees in section 18.1.

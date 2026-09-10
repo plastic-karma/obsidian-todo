@@ -1,12 +1,13 @@
 # obsidian-todo
 
-`obsidian-todo` is a local-first Rust library and `otodo` CLI for managing structured tasks inside an existing Obsidian vault. Tasks and projects remain human-editable Markdown files with YAML front matter—no database, server, network access, or Git automation.
+`obsidian-todo` is a local-first Rust library and `otodo` CLI for managing structured tasks inside an existing Obsidian vault. Tasks and projects remain human-editable Markdown files with YAML front matter—no database or server. Ordinary commands are offline and Git-free; only explicit `/sync` in `input` invokes Git.
 
 ## Features
 
 - Workflow states, projects, tags, local due dates/times, and recurrence
 - Optional HTTP/HTTPS task links in both store versions
 - Interactive one-line task capture with natural dates, completion, and filtered `/list` commands
+- Explicit `/sync [ours|theirs]` to synchronize an existing Git branch with its upstream
 - Ordinary file attachments in v1 and v2 stores, with Markdown links and image embeds
 - Arbitrarily nested subtasks with stable full-ULID parent identity
 - Recursive task discovery and deterministic filtering and sorting
@@ -38,7 +39,7 @@ otodo --root Todo validate
 
 Use `--format json` for scripts and `--today YYYY-MM-DD` for deterministic date-sensitive commands. Run `otodo --help` or `otodo <command> --help` for all options.
 
-The store contains `.todo/config.toml`, `.todo/schema.json`, `Tasks/**/*.md`, `Projects/*.md`, `todos.base`, and imported files below `Attachments/`. Other vault content is left untouched.
+The store contains `.todo/config.toml`, `.todo/schema.json`, `Tasks/**/*.md`, `Projects/*.md`, `todos.base`, and imported files below `Attachments/`. Ordinary commands leave other vault content untouched. Explicit `/sync` synchronizes the whole containing Git branch, not just the store.
 
 ## Interactive input
 
@@ -65,9 +66,10 @@ redundant whitespace is collapsed.
 - `@tag` adds a tag. New tags and nested tags such as `@home/chores` are allowed.
   Multiple projects/tags are supported; repeated identical values are deduplicated.
   Metadata must be separate whitespace-delimited tokens.
-- Suggestions complete `/list` at the start of a line, `#projects`, `@tags`,
-  and configured `!states` in `/list` commands. Use **Up/Down** to select and
-  **Tab** to accept. Tags come from all tasks, including completed tasks and
+- Suggestions complete `/list` and `/sync` at the start of a line, `#projects`,
+  `@tags`, configured `!states` in `/list`, and `ours`/`theirs` in `/sync`.
+  Use **Up/Down** to select and **Tab** to accept. Tags come from all tasks,
+  including completed tasks and
   tasks saved in this session. **F5** reloads the suggestion catalog from disk.
 - **Enter** submits the current line: save a task or run a slash command.
   A rejected line stays editable. Multiline paste queues drafts for review:
@@ -105,7 +107,7 @@ for explicit `YYYY-MM-DD` dates. The first valid explicit HTTP(S) link is captur
 surrounding sentence punctuation is excluded from the field, but remains in the
 title. No links are fetched or opened.
 
-Slash commands query the store without creating tasks:
+`/list` queries the store without creating tasks:
 
 ```text
 /list
@@ -122,9 +124,91 @@ inside commands. Results use the ordinary list validation and sort order.
 **PgUp/PgDn** scroll results in the TUI; listing does not increase the saved count.
 
 Commands are lowercase, whole tokens at the beginning of the line (leading
-whitespace is allowed). Unknown slash commands and arguments other than
-`#project`, `@tag`, or `!state` are errors, never task titles. Slashes and `!state`
-inside ordinary task titles remain text.
+whitespace is allowed). Unknown slash commands are errors, never task titles.
+`/list` accepts only `#project`, `@tag`, or `!state` filters; `/sync` accepts only
+an optional `ours` or `theirs`. Slashes and `!state` inside ordinary task titles
+remain text.
+
+### Explicit Git synchronization
+
+In the input TUI, enter:
+
+```text
+/sync
+/sync ours
+/sync theirs
+```
+
+`/sync` fetches the configured upstream, stages and commits local changes **only
+beneath the selected store** if any, merges the upstream, validates the merged
+store, and pushes explicitly to that upstream branch. Fetch/merge/push synchronize
+the **whole containing branch**, including already committed unrelated vault
+paths. It is not a store-only publication filter. Ordinary commands—including
+discovery, `init`, and `validate`—remain offline and never invoke Git.
+
+Before syncing, stop all other writers and synchronization, including Obsidian
+Git. Have Git installed, an existing attached branch with commits and a configured
+upstream, and author identity/noninteractive authentication configured when
+needed. Sync refuses detached or unborn branches, missing upstreams, pre-existing
+merge/rebase/cherry-pick/revert operations or conflicts, and staged, unstaged, or
+untracked changes outside the selected store. It does not initialize Git, change
+Git configuration, force-push, stash, reset-hard, or rebase. Git hooks and
+credential/editor prompts are disabled; configure authentication beforehand.
+SSH runs in batch mode using SSH configuration/agents; `GIT_SSH_COMMAND`
+overrides are not used.
+Automatic sync commits are unsigned, and sync does not verify incoming commit
+signatures. Use your external Git workflow when signature enforcement is required.
+There is no automatic/background sync and no store schema change or hidden state.
+
+**Ours means local; theirs means remote.** Both policies preserve nonconflicting
+text edits and choose only conflicting hunks. With no policy, the TUI shows both
+previews and lets you choose `o` or `t` per hunk. **Up/Down/PgUp/PgDn** scroll
+both previews; **Left/Right** pan long lines. Binary, deletion, and file-type
+conflicts use a whole-file choice; an absent side means deletion. File-mode
+conflicts choose the local or remote mode. Submodule and file/directory collisions
+require manual resolution: sync aborts its merge rather than deleting a tree or
+publishing Git's temporary conflict paths. **Esc/Ctrl-C** cancels resolution.
+No store lock is held across Git changes or conflict prompts; writer quiescence
+is required, not enforced.
+
+Cancellation or resolver failure aborts only the active merge started by this
+invocation; any automatic local commit is retained. Sync is not transactional:
+other failures can leave completed local steps, and a failed push retains local
+commits and merge results. A failed validation can retain a completed fast-forward;
+it never authorizes a push. Inspect the reported error before retrying. Before
+accepting more TUI input, the store and suggestion catalog are reloaded, including
+after cancellation. If reload fails, the session exits rather than use stale data;
+the original sync failure takes precedence over any reload error. Plain input
+stops immediately on sync failure.
+
+Plain input and JSON cannot answer conflict prompts or use later task lines as
+answers. Without a policy, an unresolved conflict reports `sync_conflict` and
+stops input after aborting this invocation's merge. For scripted policy selection:
+
+```sh
+printf '%s\n' '/sync ours' | otodo --root Todo --format json input
+```
+
+Success is one JSON Lines envelope:
+
+```json
+{"version":1,"sync":{"branch":"main","upstream":"origin/main","committed":true,"conflicts_resolved":0}}
+```
+
+`committed` indicates an automatic local store commit, not a merge commit.
+`conflicts_resolved` counts chosen hunks or whole-file fallback conflicts.
+`capabilities` advertises `git_sync` without requiring Git or a store.
+
+| Error | Exit | Meaning |
+|---|---:|---|
+| `invalid_sync_option` | 2 | Invalid `/sync` arguments; `field: input` |
+| `sync_conflict` | 2 | Noninteractive conflict needs `ours` or `theirs` |
+| `sync_cancelled` | 2 | TUI conflict resolution cancelled |
+| `sync_precondition` | 5 | Unsafe repository state or missing prerequisites |
+| `sync_unavailable` | 7 | Git executable unavailable |
+| `sync_failed` | 8 | Git or synchronization I/O failure |
+
+### Plain input and JSON
 
 Pipes and `--format json` use plain stdin without the TUI:
 
@@ -136,11 +220,12 @@ printf '%s\n' \
   otodo --root Todo --format json input
 ```
 
-JSON output is one version-1 `task` envelope per saved task or `tasks` envelope
-per `/list`, including an empty array when nothing matches (JSON Lines).
+JSON output is one version-1 `task` envelope per saved task, `tasks` envelope
+per `/list` (including an empty array when nothing matches), or `sync` envelope
+per successful `/sync` (JSON Lines). Git output does not leak into this stream.
 Blank lines are skipped; LF, CRLF, and a final line without a newline work.
 The first invalid line stops piped input with an error on stderr; earlier saves
-remain committed and later lines are not processed. Input is UTF-8, bounded to
+remain durable and later lines are not processed. Input is UTF-8, bounded to
 16 KiB per raw line or queued paste. No history file is written. Terminal control
 sequences are used only for the human TUI, which requires terminal stdin/stderr
 and a non-dumb `TERM`.
@@ -300,4 +385,4 @@ Imports copy the original bytes into `Attachments/<fresh-ULID>/<sanitized-filena
 
 Manually copied files below `Attachments/` work as well. Use an explicit relative Markdown link such as `[Receipt](../Attachments/manual.pdf)` or `[[Attachments/manual.pdf|Receipt]]` (also `[[Todo/Attachments/manual.pdf]]` when `Todo` is the configured Obsidian link prefix); adjust `../` for nested task locations. Shortened links such as `[[manual.pdf]]` cannot identify attachments reliably: use an explicit path. Code examples are ignored. `validate` reports missing or unsupported attachment references without preventing ordinary task edits. If a customized task/project directory overlaps `Attachments/`, attachment operations are disabled until the directories are separated.
 
-To paste directly into this folder in Obsidian, open **Settings → Files and links → Default location for new attachments**, choose **In the folder specified below**, and select the vault-relative store folder, for example `Todo/Attachments`. This preference applies to the entire vault; OTodo never changes it. See [Obsidian's attachment documentation](https://help.obsidian.md/attachments). Ensure pasted links include an explicit path if Obsidian shortens them. Git/Obsidian Git synchronization and sparse checkouts must include `Attachments/` alongside task files. Git remains external to the CLI.
+To paste directly into this folder in Obsidian, open **Settings → Files and links → Default location for new attachments**, choose **In the folder specified below**, and select the vault-relative store folder, for example `Todo/Attachments`. This preference applies to the entire vault; OTodo never changes it. See [Obsidian's attachment documentation](https://help.obsidian.md/attachments). Ensure pasted links include an explicit path if Obsidian shortens them. Synchronization and sparse checkouts must include `Attachments/` alongside task files. Git may remain external, or you can invoke `/sync` explicitly under the safeguards above.

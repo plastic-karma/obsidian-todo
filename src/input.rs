@@ -10,13 +10,15 @@ use crate::{
     error::{Error, Result},
     model::{validate_name, validate_project_slug, validate_tag, validate_url},
     recurrence::validate_date_value,
+    sync::ConflictChoice,
 };
 
-/// A task or read-only command resolved without consulting the task store.
+/// A task or explicit input command resolved without consulting the task store.
 #[derive(Debug, Clone)]
 pub enum ParsedInput {
     Task(ParsedTaskInput),
     List(TaskFilter),
+    Sync(Option<ConflictChoice>),
 }
 
 /// A captured task with resolved metadata and local due date/time.
@@ -68,8 +70,8 @@ enum DateMeaning {
     Resolved(NaiveDate),
 }
 
-/// Parse a task capture or a leading `/list` command. List filters use `#project`,
-/// `@tag`, and `!state` tokens; unknown commands and bare arguments are errors.
+/// Parse a task capture, `/list` filters (`#project`, `@tag`, `!state`), or
+/// `/sync [ours|theirs]`. Unknown commands and malformed arguments are errors.
 /// Task captures recognize metadata, explicit web links and natural date/clock
 /// phrases. The injected timestamp determines today and relative clock values.
 pub fn parse_line<Tz: TimeZone>(line: &str, reference: &DateTime<Tz>) -> Result<ParsedInput> {
@@ -85,10 +87,25 @@ pub fn parse_line<Tz: TimeZone>(line: &str, reference: &DateTime<Tz>) -> Result<
     }
     let mut tokens = line.split_whitespace();
     if let Some(command) = tokens.next().filter(|token| token.starts_with('/')) {
+        if command == "/sync" {
+            let choice = match (tokens.next(), tokens.next()) {
+                (None, None) => None,
+                (Some("ours"), None) => Some(ConflictChoice::Ours),
+                (Some("theirs"), None) => Some(ConflictChoice::Theirs),
+                _ => {
+                    return Err(Error::usage(
+                        "invalid_sync_option",
+                        "Use /sync, /sync ours, or /sync theirs",
+                    )
+                    .with_field("input"));
+                }
+            };
+            return Ok(ParsedInput::Sync(choice));
+        }
         if command != "/list" {
             return Err(Error::usage(
                 "unknown_input_command",
-                format!("Unknown input command {command:?}; use /list"),
+                format!("Unknown input command {command:?}; use /list or /sync"),
             )
             .with_field("input"));
         }
@@ -535,7 +552,7 @@ mod tests {
     fn parse_at<Tz: TimeZone>(value: &str, reference: &DateTime<Tz>) -> ParsedTaskInput {
         match parse_line(value, reference).unwrap() {
             ParsedInput::Task(task) => task,
-            ParsedInput::List(_) => panic!("expected a task capture"),
+            ParsedInput::List(_) | ParsedInput::Sync(_) => panic!("expected a task capture"),
         }
     }
 
@@ -564,6 +581,35 @@ mod tests {
             parse_line("/list", &reference()).unwrap(),
             ParsedInput::List(_)
         ));
+    }
+
+    #[test]
+    fn sync_options_are_explicit_and_do_not_become_tasks() {
+        for (line, expected) in [
+            ("/sync", None),
+            ("  /sync ours  ", Some(ConflictChoice::Ours)),
+            ("/sync theirs", Some(ConflictChoice::Theirs)),
+        ] {
+            let ParsedInput::Sync(choice) = parse_line(line, &reference()).unwrap() else {
+                panic!("expected synchronization");
+            };
+            assert_eq!(choice, expected);
+        }
+        for line in [
+            "/sync both",
+            "/sync Ours",
+            "/sync ours theirs",
+            "/sync #work",
+        ] {
+            let error = parse_line(line, &reference()).unwrap_err();
+            assert_eq!(error.code(), "invalid_sync_option");
+            assert_eq!(error.field(), Some("input"));
+        }
+        assert_eq!(
+            parse_line("/syncing", &reference()).unwrap_err().code(),
+            "unknown_input_command"
+        );
+        assert_eq!(parse("Discuss /sync ours").name, "Discuss /sync ours");
     }
 
     #[test]

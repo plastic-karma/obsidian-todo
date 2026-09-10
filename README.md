@@ -6,7 +6,7 @@
 
 - Workflow states, projects, tags, local due dates/times, and recurrence
 - Optional HTTP/HTTPS task links in both store versions
-- Interactive one-line task capture with natural dates, completion, and filtered `/list` commands
+- Interactive one-line task capture with natural dates, completion, session history, and filtered `/list` commands
 - Explicit `/sync [ours|theirs]` to synchronize an existing Git branch with its upstream
 - Ordinary file attachments in v1 and v2 stores, with Markdown links and image embeds
 - Arbitrarily nested subtasks with stable full-ULID parent identity
@@ -69,11 +69,21 @@ redundant whitespace is collapsed.
 - Suggestions complete `/list` and `/sync` at the start of a line, `#projects`,
   `@tags`, configured `!states` and `due:` filters in `/list`, and
   `ours`/`theirs` in `/sync`.
-  Use **Up/Down** to select and **Tab** to accept. Tags come from all tasks,
+  Use **Up/Down** to select suggestions when not browsing history, **Shift-Tab**
+  to select in either mode, and **Tab** to accept. Tags come from all tasks,
   including completed tasks and
   tasks saved in this session. **F5** reloads the suggestion catalog from disk.
+- **Up/Down** recalls older/newer successful entries when no suggestions are
+  active, including both task captures and slash commands. Once browsing history,
+  arrows stay in history even when a recalled entry offers suggestions.
+  **Down** past the newest entry restores your original draft and cursor.
+  Recalled lines are editable but run only on **Enter**; editing them does not
+  change the saved history. Queued paste drafts remain queued.
+  History keeps the latest 100 entries in this session only, skips consecutive
+  identical entries and blank lines, and is discarded on exit.
 - **Enter** submits the current line: save a task or run a slash command.
-  A rejected line stays editable. Multiline paste queues drafts for review:
+  It ends history browsing even if submission fails, keeping a rejected line as
+  the current editable draft. Multiline paste queues drafts for review:
   press Enter for each, rather than submitting the entire paste immediately.
   Pasted tabs become spaces, and CRLF/CR become line breaks. Other control
   characters are rejected without changing the draft.

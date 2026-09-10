@@ -29,6 +29,7 @@ use crate::output::{
 
 // Bound a line and a queued paste independently of the potentially much larger record body.
 const MAX_INPUT_BYTES: usize = 16 * 1024;
+const MAX_HISTORY_ENTRIES: usize = 100;
 const INPUT_PROMPT: &str = "│ › ";
 
 pub fn run(
@@ -274,6 +275,11 @@ struct Editor {
     cursor: usize,
     queued: VecDeque<String>,
     selected: usize,
+    history: VecDeque<String>,
+    // The position just past the newest entry is the live draft.
+    history_index: usize,
+    history_draft: String,
+    history_draft_cursor: usize,
 }
 
 impl Editor {
@@ -380,8 +386,74 @@ impl Editor {
         Ok(())
     }
 
+    fn navigate(&mut self, key: KeyCode, catalog: &Catalog) -> Result<()> {
+        // Recalled commands and tags may offer completions; keep arrows in history.
+        if key != KeyCode::BackTab && self.history_index < self.history.len() {
+            return self.recall(key == KeyCode::Up);
+        }
+        let count = catalog.suggestions(self).len();
+        if count > 0 {
+            self.selected = if key == KeyCode::Down {
+                (self.selected + 1) % count
+            } else {
+                (self.selected + count - 1) % count
+            };
+            Ok(())
+        } else if key != KeyCode::BackTab {
+            self.recall(key == KeyCode::Up)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn recall(&mut self, older: bool) -> Result<()> {
+        let index = if older {
+            self.history_index.saturating_sub(1)
+        } else {
+            (self.history_index + 1).min(self.history.len())
+        };
+        if index == self.history_index {
+            return Ok(());
+        }
+        let line = self.history.get(index).unwrap_or(&self.history_draft);
+        if line.len() + self.queued.iter().map(String::len).sum::<usize>() > MAX_INPUT_BYTES {
+            return Err(input_too_large());
+        }
+        if self.history_index == self.history.len() {
+            self.history_draft = std::mem::take(&mut self.line);
+            self.history_draft_cursor = self.cursor;
+        }
+        if let Some(line) = self.history.get(index) {
+            self.line.clone_from(line);
+            self.cursor = self.line.len();
+        } else {
+            self.line = std::mem::take(&mut self.history_draft);
+            self.cursor = self.history_draft_cursor;
+        }
+        self.history_index = index;
+        self.selected = 0;
+        Ok(())
+    }
+
+    fn parse_submission(&mut self, reference: &DateTime<Local>) -> Result<ParsedInput> {
+        // Even a rejected attempt becomes the live draft, not a history selection.
+        self.history_index = self.history.len();
+        self.history_draft.clear();
+        self.history_draft_cursor = 0;
+        parse_line(&self.line, reference)
+    }
+
     fn advance(&mut self) {
-        self.line = self.queued.pop_front().unwrap_or_default();
+        let line = std::mem::replace(&mut self.line, self.queued.pop_front().unwrap_or_default());
+        if !line.trim().is_empty() && self.history.back() != Some(&line) {
+            if self.history.len() == MAX_HISTORY_ENTRIES {
+                self.history.pop_front();
+            }
+            self.history.push_back(line);
+        }
+        self.history_index = self.history.len();
+        self.history_draft.clear();
+        self.history_draft_cursor = 0;
         self.cursor = self.line.len();
         self.selected = 0;
     }
@@ -542,15 +614,7 @@ fn run_terminal(
                             Ok(())
                         }
                         KeyCode::Up | KeyCode::Down | KeyCode::BackTab => {
-                            let count = catalog.suggestions(&editor).len();
-                            if count > 0 {
-                                editor.selected = if key.code == KeyCode::Down {
-                                    (editor.selected + 1) % count
-                                } else {
-                                    (editor.selected + count - 1) % count
-                                };
-                            }
-                            Ok(())
+                            editor.navigate(key.code, &catalog)
                         }
                         KeyCode::PageUp | KeyCode::PageDown => {
                             if let Some(results) = &mut results {
@@ -588,7 +652,7 @@ fn run_terminal(
                         }
                         KeyCode::Enter => (|| {
                             let now = reference.unwrap_or_else(Local::now);
-                            match parse_line(&editor.line, &now)? {
+                            match editor.parse_submission(&now)? {
                                 ParsedInput::Task(parsed) => {
                                     let task = create_task(&store, parsed)?;
                                     created += 1;
@@ -964,7 +1028,7 @@ fn draw(
             ("Tab", Ink::Key),
             (" complete   ", Ink::Muted),
             ("↑/↓", Ink::Key),
-            (" select   ", Ink::Muted),
+            (" history/select   ", Ink::Muted),
             ("F5", Ink::Key),
             (" reload", Ink::Muted),
         ],
@@ -1217,6 +1281,8 @@ fn draw(
                     &format!("  {} / {}  ", editor.selected + 1, suggestions.len()),
                     Ink::Muted,
                 ),
+                ("Shift-Tab", Ink::Key),
+                (" select · ", Ink::Muted),
                 ("Tab", Ink::Key),
                 (" accept", Ink::Muted),
             ],
@@ -1402,6 +1468,170 @@ mod tests {
         assert_eq!(editor.line, "second #work");
         editor.advance();
         assert_eq!(editor.line, "third");
+    }
+
+    #[test]
+    fn rejected_recalled_submission_becomes_the_live_draft_before_parsing() {
+        let reference = Local.timestamp_opt(1_800_000_000, 0).unwrap();
+        let catalog = Catalog::default();
+        let mut editor = Editor::default();
+        editor.insert("/list").unwrap();
+        editor.advance();
+        editor.insert("Original draft\nQueued\n").unwrap();
+        editor.navigate(KeyCode::Up, &catalog).unwrap();
+        editor.insert(" invalid").unwrap();
+        editor.cursor = "/list ".len();
+        assert_eq!(
+            editor.parse_submission(&reference).unwrap_err().code(),
+            "invalid_input_filter"
+        );
+
+        editor.navigate(KeyCode::Down, &catalog).unwrap();
+        editor.insert("still ").unwrap();
+        assert_eq!(editor.line, "/list still invalid");
+        editor.navigate(KeyCode::Up, &catalog).unwrap();
+        assert_eq!(editor.line, "/list");
+        editor.navigate(KeyCode::Down, &catalog).unwrap();
+        editor.insert("!").unwrap();
+        assert_eq!(editor.line, "/list still !invalid");
+        assert_eq!(editor.queued, ["Queued"]);
+    }
+
+    #[test]
+    fn history_restores_unicode_drafts_and_keeps_saved_entries_unchanged() {
+        let mut editor = Editor::default();
+        editor.insert("Call Zoë tom 9am").unwrap();
+        editor.recall(true).unwrap();
+        editor.recall(false).unwrap();
+        assert_eq!(editor.line, "Call Zoë tom 9am");
+        editor.advance();
+        editor.insert("Review café").unwrap();
+        editor.advance();
+        editor.insert("Draft e\u{301} tail").unwrap();
+        editor.cursor = "Draft e\u{301}".len();
+
+        editor.recall(true).unwrap();
+        assert_eq!(editor.line, "Review café");
+        editor.insert(" revised").unwrap();
+        assert_eq!(editor.line, "Review café revised");
+        editor.recall(true).unwrap();
+        assert_eq!(editor.line, "Call Zoë tom 9am");
+        editor.recall(true).unwrap();
+        assert_eq!(editor.line, "Call Zoë tom 9am");
+        editor.recall(false).unwrap();
+        assert_eq!(editor.line, "Review café");
+        editor.recall(false).unwrap();
+        editor.insert("!").unwrap();
+        assert_eq!(editor.line, "Draft e\u{301}! tail");
+        editor.recall(false).unwrap();
+        assert_eq!(editor.line, "Draft e\u{301}! tail");
+    }
+
+    #[test]
+    fn arrows_browse_recalled_commands_and_tags_without_trapping_completion() {
+        let catalog = Catalog {
+            tags: BTreeSet::from(["@alpha".into(), "@beta".into()]),
+            ..Catalog::default()
+        };
+        let mut editor = Editor::default();
+        editor.insert("/list").unwrap();
+        editor.advance();
+        editor.insert("Latest @alpha").unwrap();
+        editor.advance();
+        editor.insert("New @").unwrap();
+        editor.navigate(KeyCode::Down, &catalog).unwrap();
+        editor
+            .complete(catalog.suggestions(&editor)[editor.selected])
+            .unwrap();
+        assert_eq!(editor.line, "New @beta ");
+
+        editor.navigate(KeyCode::Up, &catalog).unwrap();
+        assert_eq!(editor.line, "Latest @alpha");
+        editor.navigate(KeyCode::Up, &catalog).unwrap();
+        assert_eq!(editor.line, "/list");
+        editor.navigate(KeyCode::Down, &catalog).unwrap();
+        assert_eq!(editor.line, "Latest @alpha");
+        for _ in 0.."alpha".len() {
+            editor.backspace();
+        }
+        editor.navigate(KeyCode::BackTab, &catalog).unwrap();
+        editor
+            .complete(catalog.suggestions(&editor)[editor.selected])
+            .unwrap();
+        assert_eq!(editor.line, "Latest @beta ");
+        editor.navigate(KeyCode::Down, &catalog).unwrap();
+        assert_eq!(editor.line, "New @beta ");
+    }
+
+    #[test]
+    fn history_skips_blanks_and_adjacent_duplicates_and_evicts_oldest_entries() {
+        let mut editor = Editor::default();
+        editor.insert("Capture 0").unwrap();
+        editor.advance();
+        editor.insert("Capture 0").unwrap();
+        editor.advance();
+        editor.insert("  ").unwrap();
+        editor.advance();
+        editor.insert("Capture 1").unwrap();
+        editor.advance();
+        editor.recall(true).unwrap();
+        assert_eq!(editor.line, "Capture 1");
+        editor.recall(true).unwrap();
+        assert_eq!(editor.line, "Capture 0");
+        editor.recall(true).unwrap();
+        editor.recall(false).unwrap();
+        assert_eq!(editor.line, "Capture 1");
+        editor.recall(false).unwrap();
+        assert_eq!(editor.line, "");
+
+        for index in 2..=MAX_HISTORY_ENTRIES {
+            editor.insert(&format!("Capture {index}")).unwrap();
+            editor.advance();
+        }
+        for index in (1..=MAX_HISTORY_ENTRIES).rev() {
+            editor.recall(true).unwrap();
+            assert_eq!(editor.line, format!("Capture {index}"));
+        }
+        editor.recall(true).unwrap();
+        assert_eq!(editor.line, "Capture 1");
+        editor.recall(false).unwrap();
+        assert_eq!(editor.line, "Capture 2");
+    }
+
+    #[test]
+    fn oversized_history_recall_preserves_the_live_draft_and_paste_queue() {
+        let mut editor = Editor::default();
+        let long_line = "x".repeat(MAX_INPUT_BYTES);
+        editor.insert(&long_line).unwrap();
+        editor.advance();
+        editor.insert("Draft\nQueued\n").unwrap();
+        assert_eq!(editor.recall(true).unwrap_err().code(), "input_too_large");
+        editor.recall(false).unwrap();
+        editor.insert("!").unwrap();
+        assert_eq!(editor.line, "Draft!");
+        editor.advance();
+        assert_eq!(editor.line, "Queued");
+        editor.recall(true).unwrap();
+        assert_eq!(editor.line, "Draft!");
+        editor.recall(true).unwrap();
+        assert_eq!(editor.line, long_line);
+        editor.recall(false).unwrap();
+        editor.recall(false).unwrap();
+        assert_eq!(editor.line, "Queued");
+    }
+
+    #[test]
+    fn restoring_a_draft_cannot_overflow_a_newly_pasted_queue() {
+        let mut editor = Editor::default();
+        editor.insert("Saved").unwrap();
+        editor.advance();
+        editor.insert(&"x".repeat(MAX_INPUT_BYTES)).unwrap();
+        editor.recall(true).unwrap();
+        editor.insert("\nQueued\n").unwrap();
+        assert_eq!(editor.recall(false).unwrap_err().code(), "input_too_large");
+        assert_eq!(editor.line, "Saved");
+        editor.advance();
+        assert_eq!(editor.line, "Queued");
     }
 
     #[test]

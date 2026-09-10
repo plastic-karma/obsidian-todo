@@ -257,6 +257,12 @@ impl Catalog {
                 .map(String::as_str)
                 .filter(|value| value.starts_with(&normalized))
                 .collect(),
+            Some(b'd' | b'D') if list_command => {
+                ["due:today", "due:tomorrow", "due:overdue", "due:none"]
+                    .into_iter()
+                    .filter(|value| value.starts_with(&normalized))
+                    .collect()
+            }
             _ => Vec::new(),
         }
     }
@@ -1090,6 +1096,17 @@ fn draw(
                     (&filter.states.join(", "), Ink::Accent),
                 ],
             )?;
+            let due = if filter.no_due {
+                "none".to_owned()
+            } else if filter.overdue {
+                "overdue (nonterminal, before today)".to_owned()
+            } else {
+                filter
+                    .due_on
+                    .map(|date| date.to_string())
+                    .unwrap_or_else(|| "any".to_owned())
+            };
+            screen.row(8, &[("Due ", Ink::Muted), (&due, Ink::Date)])?;
         }
         Ok(ParsedInput::Sync(choice)) => {
             screen.row(
@@ -1143,7 +1160,8 @@ fn draw(
                     ("/list ", Ink::Accent),
                     ("#project ", Ink::Project),
                     ("@tag ", Ink::Tag),
-                    ("!open", Ink::Accent),
+                    ("!open ", Ink::Accent),
+                    ("due:today", Ink::Date),
                 ],
             )?;
             screen.row(
@@ -1188,6 +1206,7 @@ fn draw(
             Some(b'#') => ("Projects", Ink::Project),
             Some(b'@') => ("Tags", Ink::Tag),
             Some(b'!') => ("States", Ink::Accent),
+            Some(b'd') => ("Due filters", Ink::Date),
             _ => ("Commands", Ink::Accent),
         };
         screen.row(
@@ -1295,6 +1314,27 @@ mod tests {
             "/listing !op",
             "https://example.test/",
         ] {
+            let mut editor = Editor::default();
+            editor.insert(line).unwrap();
+            assert!(catalog.suggestions(&editor).is_empty(), "{line}");
+        }
+    }
+
+    #[test]
+    fn due_completion_is_list_only_and_preserves_surrounding_unicode() {
+        let catalog = Catalog::default();
+        let mut editor = Editor::default();
+        editor.insert("/list due:").unwrap();
+        assert_eq!(
+            catalog.suggestions(&editor),
+            ["due:today", "due:tomorrow", "due:overdue", "due:none"]
+        );
+        let mut editor = Editor::default();
+        editor.insert("  /list @Équipe/Été DUEx !open").unwrap();
+        editor.cursor = "  /list @Équipe/Été DUE".len();
+        editor.complete(catalog.suggestions(&editor)[3]).unwrap();
+        assert_eq!(editor.line, "  /list @Équipe/Été due:none !open");
+        for line in ["Discuss due:", "/listing due:", "/sync due:", "/list @due:"] {
             let mut editor = Editor::default();
             editor.insert(line).unwrap();
             assert!(catalog.suggestions(&editor).is_empty(), "{line}");

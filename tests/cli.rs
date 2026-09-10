@@ -2526,6 +2526,131 @@ fn input_list_filters_all_states_without_writes_in_both_store_versions() {
 }
 
 #[test]
+fn input_due_filters_compose_and_use_date_boundaries_in_both_store_versions() {
+    for legacy in [false, true] {
+        let vault = fake_vault();
+        let root = initialize(vault.path());
+        if legacy {
+            legacy_store(&root);
+        }
+        for slug in ["personal", "work"] {
+            json_success(&root, &["project", "create", slug, "--name", slug]);
+        }
+        for (name, due, state) in [
+            ("Past open", Some("2026-09-29"), "open"),
+            ("Past done", Some("2026-09-29"), "done"),
+            ("Today open", Some("2026-09-30"), "open"),
+            ("Today done", Some("2026-09-30"), "done"),
+            ("Tomorrow", Some("2026-10-01"), "open"),
+            ("Future", Some("2026-10-02"), "open"),
+            ("Undated open", None, "open"),
+            ("Undated done", None, "done"),
+        ] {
+            let mut args = vec![
+                "add",
+                name,
+                "--state",
+                state,
+                "--project",
+                "personal",
+                "--project",
+                "work",
+                "--tag",
+                "chores",
+                "--tag",
+                "Équipe/home",
+            ];
+            if let Some(due) = due {
+                args.extend(["--due-date", due, "--due-time", "00:00"]);
+            }
+            json_success(&root, &args);
+        }
+        json_success(
+            &root,
+            &[
+                "add",
+                "Other project",
+                "--project",
+                "personal",
+                "--tag",
+                "chores",
+                "--tag",
+                "Équipe/home",
+            ],
+        );
+        json_success(
+            &root,
+            &[
+                "add",
+                "Other tag",
+                "--project",
+                "personal",
+                "--project",
+                "work",
+                "--tag",
+                "chores",
+            ],
+        );
+        let before = store_bytes(&root);
+        let cases: &[(&str, &[&str])] = &[
+            ("/list due:today", &["Today open", "Today done"]),
+            ("/list due:tomorrow", &["Tomorrow"]),
+            ("/list due:overdue", &["Past open"]),
+            (
+                "/list due:none",
+                &["Other project", "Other tag", "Undated open", "Undated done"],
+            ),
+            ("/list #personal due:today @chores !done", &["Today done"]),
+            (
+                "/list due:tomorrow #personal #work @chores @Équipe/home !open !done",
+                &["Tomorrow"],
+            ),
+            ("/list !open @chores due:overdue #personal", &["Past open"]),
+            ("/list !done due:overdue", &[]),
+            (
+                "/list #personal #work @chores @Équipe/home !open due:none due:none",
+                &["Undated open"],
+            ),
+            ("/list due:none @missing", &[]),
+        ];
+        let input = cases
+            .iter()
+            .map(|(line, _)| *line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output = command()
+            .current_dir(&root)
+            .args(["input", "--format=json", "--today", "2026-09-30"])
+            .write_stdin(input)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        let envelopes: Vec<Value> = serde_json::Deserializer::from_slice(&output.stdout)
+            .into_iter::<Value>()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(envelopes.len(), cases.len());
+        for (envelope, (line, expected)) in envelopes.iter().zip(cases) {
+            assert_eq!(envelope["version"], 1);
+            let names: Vec<_> = envelope["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|task| task["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(names, *expected, "{line}");
+        }
+        assert_eq!(store_bytes(&root), before);
+    }
+}
+
+#[test]
 fn input_command_errors_stop_mixed_streams_without_creating_command_tasks() {
     let vault = fake_vault();
     let root = initialize(vault.path());
@@ -2555,6 +2680,9 @@ fn input_command_errors_stop_mixed_streams_without_creating_command_tasks() {
     for (line, exit, code) in [
         ("/list extra", 2, "invalid_input_filter"),
         ("/list !", 2, "invalid_input_filter"),
+        ("/list due:", 2, "invalid_input_filter"),
+        ("/list due:next-week", 2, "invalid_input_filter"),
+        ("/list due:today due:none", 2, "invalid_input_filter"),
         ("/list !unknown", 5, "unknown_state"),
         ("/list #unknown", 3, "project_not_found"),
         ("/list @bad,tag", 5, "invalid_tag"),

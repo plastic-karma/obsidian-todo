@@ -70,7 +70,7 @@ enum DateMeaning {
     Resolved(NaiveDate),
 }
 
-/// Parse a task capture, `/list` filters (`#project`, `@tag`, `!state`), or
+/// Parse a task capture, `/list` filters (`#project`, `@tag`, `!state`, `due:`), or
 /// `/sync [ours|theirs]`. Unknown commands and malformed arguments are errors.
 /// Task captures recognize metadata, explicit web links and natural date/clock
 /// phrases. The injected timestamp determines today and relative clock values.
@@ -113,6 +113,7 @@ pub fn parse_line<Tz: TimeZone>(line: &str, reference: &DateTime<Tz>) -> Result<
             include_terminal: true,
             ..TaskFilter::default()
         };
+        let mut due_filter = None;
         for token in tokens {
             let (values, value) = if let Some(project) = token.strip_prefix('#') {
                 validate_project_slug(project)?;
@@ -123,12 +124,33 @@ pub fn parse_line<Tz: TimeZone>(line: &str, reference: &DateTime<Tz>) -> Result<
             } else if let Some(state) = token.strip_prefix('!').filter(|state| !state.is_empty()) {
                 // Membership in the configured workflow is checked by task::list.
                 (&mut filter.states, state)
+            } else if let Some(due) = token.strip_prefix("due:") {
+                if due_filter == Some(due) {
+                    continue;
+                }
+                if due_filter.is_some() {
+                    return Err(Error::usage(
+                        "invalid_input_filter",
+                        "Use only one distinct due: filter per /list command",
+                    )
+                    .with_field("input"));
+                }
+                match due {
+                    "today" | "tomorrow" => {
+                        let days = u64::from(due == "tomorrow");
+                        filter.due_on = Some(resolve_date(
+                            DateMeaning::Days(days),
+                            reference.date_naive(),
+                        )?);
+                    }
+                    "overdue" => filter.overdue = true,
+                    "none" => filter.no_due = true,
+                    _ => return Err(invalid_list_filter(token)),
+                }
+                due_filter = Some(due);
+                continue;
             } else {
-                return Err(Error::usage(
-                    "invalid_input_filter",
-                    format!("Invalid list filter {token:?}; use #project, @tag, or !state"),
-                )
-                .with_field("input"));
+                return Err(invalid_list_filter(token));
             };
             if !values.iter().any(|existing| existing == value) {
                 values.push(value.to_owned());
@@ -137,6 +159,16 @@ pub fn parse_line<Tz: TimeZone>(line: &str, reference: &DateTime<Tz>) -> Result<
         return Ok(ParsedInput::List(filter));
     }
     parse_task_line(line, reference).map(ParsedInput::Task)
+}
+
+fn invalid_list_filter(token: &str) -> Error {
+    Error::usage(
+        "invalid_input_filter",
+        format!(
+            "Invalid list filter {token:?}; use #project, @tag, !state, or due:today/tomorrow/overdue/none"
+        ),
+    )
+    .with_field("input")
 }
 
 fn parse_task_line<Tz: TimeZone>(line: &str, reference: &DateTime<Tz>) -> Result<ParsedTaskInput> {
@@ -581,6 +613,24 @@ mod tests {
             parse_line("/list", &reference()).unwrap(),
             ParsedInput::List(_)
         ));
+    }
+
+    #[test]
+    fn list_due_dates_use_local_calendar_days_and_reject_overflow() {
+        let local = DateTime::parse_from_rfc3339("2028-02-28T23:30:00-08:00").unwrap();
+        for (line, expected) in [
+            ("/list due:today", "2028-02-28"),
+            ("/list due:tomorrow due:tomorrow", "2028-02-29"),
+        ] {
+            let ParsedInput::List(filter) = parse_line(line, &local).unwrap() else {
+                panic!("expected a list command");
+            };
+            assert_eq!(filter.due_on, Some(date(expected)));
+        }
+        let end = DateTime::parse_from_rfc3339("9999-12-31T12:00:00+00:00").unwrap();
+        let error = parse_line("/list due:tomorrow", &end).unwrap_err();
+        assert_eq!(error.code(), "invalid_date");
+        assert_eq!(error.field(), Some("due_date"));
     }
 
     #[test]

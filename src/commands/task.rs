@@ -61,6 +61,7 @@ pub struct TaskFilter {
     pub due_before: Option<NaiveDate>,
     pub due_after: Option<NaiveDate>,
     pub overdue: bool,
+    pub no_due: bool,
     pub recurring: bool,
     pub non_recurring: bool,
     pub parent: Option<String>,
@@ -686,6 +687,7 @@ fn matches_filter(task: &Task, filter: &TaskFilter, store: &Store, today: NaiveD
             .is_some_and(|date| task.due_date.is_none_or(|due| due <= date))
         || (filter.overdue
             && (task.terminal(store.config()) || task.due_date.is_none_or(|due| due >= today)))
+        || (filter.no_due && task.due_date.is_some())
         || (filter.recurring && task.recurrence.is_none())
         || (filter.non_recurring && task.recurrence.is_some())
     {
@@ -1056,6 +1058,54 @@ mod tests {
             fs::read(store.root().join(&task.path)).expect("unchanged undated"),
             before
         );
+    }
+
+    #[test]
+    fn no_due_filter_tracks_schedule_changes_and_intersects_other_filters() {
+        let (_temp, store) = store();
+        let undated = add(&store, &minimal("Undated")).unwrap();
+        let mut scheduled = minimal("Scheduled");
+        scheduled.due_date = Some(date("2026-09-09"));
+        scheduled.due_time = NaiveTime::from_hms_opt(9, 0, 0);
+        let scheduled = add(&store, &scheduled).unwrap();
+        let filter = TaskFilter {
+            no_due: true,
+            ..TaskFilter::default()
+        };
+        let ids = |filter: &TaskFilter| {
+            list(&store, filter, date("2026-09-09"))
+                .unwrap()
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&filter), [undated.id]);
+        assert!(ids(&TaskFilter {
+            query: Some("Scheduled".to_owned()),
+            ..filter.clone()
+        })
+        .is_empty());
+        edit(
+            &store,
+            &scheduled.id,
+            &EditTask {
+                clear_due_date: true,
+                ..EditTask::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ids(&TaskFilter {
+                query: Some("Scheduled".to_owned()),
+                ..filter.clone()
+            }),
+            [scheduled.id]
+        );
+        assert!(ids(&TaskFilter {
+            due_on: Some(date("2026-09-09")),
+            ..filter
+        })
+        .is_empty());
     }
 
     #[test]

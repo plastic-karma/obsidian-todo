@@ -67,7 +67,8 @@ redundant whitespace is collapsed.
   Multiple projects/tags are supported; repeated identical values are deduplicated.
   Metadata must be separate whitespace-delimited tokens.
 - Suggestions complete `/list` and `/sync` at the start of a line, `#projects`,
-  `@tags`, configured `!states` in `/list`, and `ours`/`theirs` in `/sync`.
+  `@tags`, configured `!states` and `due:` filters in `/list`, and
+  `ours`/`theirs` in `/sync`.
   Use **Up/Down** to select and **Tab** to accept. Tags come from all tasks,
   including completed tasks and
   tasks saved in this session. **F5** reloads the suggestion catalog from disk.
@@ -113,21 +114,40 @@ title. No links are fetched or opened.
 /list
 /list #personal @chores !open
 /list !open !active
+/list due:today
+/list due:tomorrow
+/list due:overdue
+/list due:none
+/list #personal @chores !open due:today
 ```
 
 Bare `/list` includes **all tasks, including completed and cancelled tasks**.
 The second example returns open tasks tagged `chores` in project `personal`.
 Projects and tags combine with AND; repeated states match any of those states.
 Repeated identical filters are deduplicated. Projects/states must exist; tags
-match exact spelling, including case and nested `/` names. Dates are not parsed
-inside commands. Results use the ordinary list validation and sort order.
+match exact spelling, including case and nested `/` names. Results use the
+ordinary list validation and sort order.
+
+Due filters combine with all other filters using AND:
+
+| Filter | Matches |
+|---|---|
+| `due:today` | Tasks due on the local current date |
+| `due:tomorrow` | Tasks due on the next local calendar date |
+| `due:overdue` | Nonterminal tasks with a due date before today |
+| `due:none` | Tasks with no due date, whether omitted or null |
+
+`--today YYYY-MM-DD` overrides today for these filters. Due times do not affect
+date matching. Use one distinct, lowercase `due:` selector per command; repeated
+identical selectors are harmless, but different selectors together are errors.
+Bare natural dates and other date expressions are not parsed inside commands.
 **PgUp/PgDn** scroll results in the TUI; listing does not increase the saved count.
 
 Commands are lowercase, whole tokens at the beginning of the line (leading
 whitespace is allowed). Unknown slash commands are errors, never task titles.
-`/list` accepts only `#project`, `@tag`, or `!state` filters; `/sync` accepts only
-an optional `ours` or `theirs`. Slashes and `!state` inside ordinary task titles
-remain text.
+`/list` accepts only `#project`, `@tag`, `!state`, and the four `due:` filters;
+`/sync` accepts only an optional `ours` or `theirs`. Slashes and `!state` inside
+ordinary task titles remain text.
 
 ### Explicit Git synchronization
 
